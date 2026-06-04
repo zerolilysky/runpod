@@ -18,3 +18,4 @@ P.CONFIG.update(
 STAGE = "check"   # "check" -> validate schema first; "run" -> full pipeline
 panel, schema, summary = P.data_check(P.CONFIG) if STAGE=="check" else (None,None,None)
 if STAGE=="run": display(P.run_grid(P.CONFIG))
+
