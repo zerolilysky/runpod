@@ -1,0 +1,39 @@
+# ===== IV-SURFACE — EXPANDING WINDOW WITH A 2-YEAR ROLLING CAP =====
+import sys, importlib
+sys.path.insert(0, r"C:\Users\<you>\Documents\claude_file\claude_cowork")  # EDIT
+import iv_surface_forecast_pipeline as P; importlib.reload(P)
+
+P.CONFIG.update(
+    data_dir         = ".",
+    force_rebuild    = False,
+    resample_monthly = False,            # keep all obs for training; portfolio is monthly
+
+    # ---- windowing: expanding, but capped to a trailing 2 years ----
+    window_scheme    = "expanding",      # paper scheme...
+    max_train_years  = 2,                # ...but never train on more than 2 trailing years
+    #                                      (None = pure expanding; uses ALL history)
+    oos_start        = "1998-01-01",     # >= max_train_years after data start
+    oos_end          = "2022-01-01",
+    embargo_months   = 1,
+    warmup_epochs    = 10,
+    transfer_epochs  = 5,
+
+    # ---- quick-test slice (None = full 1138-stock universe) ----
+    max_stocks         = 100,
+    subset_min_oos_obs = 6,
+
+    targets    = ["TRET_SP500_EX_F20D"],
+    models     = ["rf", "deepmlp", "cnn", "cnn1", "cnn4", "cnn5", "lstm"],
+    ensemble_K = 5,
+
+    surface_norm = "pixel_zscore",
+    use_cuda     = False,
+    n_cpus       = 20,
+    n_deciles    = 10,
+)
+
+STAGE = "check"   # "check" first, then "run"
+if STAGE == "check":
+    panel, schema, summary = P.data_check(P.CONFIG)
+else:
+    display(P.run_grid(P.CONFIG))     # ranked table incl. R2_is / R2_oos
