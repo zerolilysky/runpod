@@ -1,0 +1,61 @@
+# ====================== IV-SURFACE PIPELINE — CONTROL CELL ======================
+import sys, importlib
+from pathlib import Path
+
+# --- point this at the folder holding iv_surface_forecast_pipeline.py ----------
+PIPELINE_DIR = r"C:\Users\<you>\Documents\claude_file\claude_cowork"   # EDIT
+sys.path.insert(0, PIPELINE_DIR)
+
+import iv_surface_forecast_pipeline as P
+importlib.reload(P)          # so re-running the cell picks up any edits to the .py
+
+# --- all the knobs you'll normally touch, in one place -------------------------
+OVERRIDES = dict(
+    # data ---------------------------------------------------------------------
+    data_dir       = r"C:\path\to\your\pickles",   # folder of *_all_Count_w_fReturns.pickle
+    file_glob      = "*_all_Count_w_fReturns.pickle",
+    force_rebuild  = False,                          # True = re-read pickles, ignore cache
+
+    # what to predict / which models ------------------------------------------
+    targets        = ["TRET_SP500_EX_F20D"],         # add the other 3 when ready
+    primary_target = "TRET_SP500_EX_F20D",
+    models         = ["rf", "deepmlp", "cnn", "cnn1", "cnn4", "cnn5", "lstm"],
+    # models       = P.CONFIG["all_models"],          # uncomment for the full zoo
+
+    # windowing (paper = expanding) -------------------------------------------
+    window_scheme  = "expanding",                    # "expanding" | "rolling" | "single"
+    warmup_years   = 7,
+    roll_years     = 5,
+    oos_start      = "2003-01-01",
+    oos_end        = "2022-01-01",
+    embargo_months = 1,
+
+    # ensembling + training ----------------------------------------------------
+    ensemble_K     = 10,                             # paper sweeps 1..100
+    warmup_epochs  = 10,
+    transfer_epochs= 5,
+    batch_size     = 512,
+    lr             = 1e-3,
+
+    # compute (8 GB GPU / 20 CPU Dell) ----------------------------------------
+    use_cuda       = True,                           # False = CPU-only
+    use_amp        = True,
+    n_workers      = 16,                             # CPU process pool for rf
+    gpu_mem_fraction = 0.85,
+
+    # portfolio ---------------------------------------------------------------
+    n_deciles      = 10,
+    weighting      = "equal",                        # "equal" | "value"
+    tcost_bps      = 0.0,
+)
+P.CONFIG.update(OVERRIDES)
+
+# --- run ----------------------------------------------------------------------
+STAGE = "check"     # "check" -> validate data only ;  "run" -> full pipeline
+
+if STAGE == "check":
+    panel, schema, summary = P.data_check(P.CONFIG)
+else:
+    results = P.run_grid(P.CONFIG)
+    display(results)            # ranked portfolio summary (Jupyter)
+# outputs -> iv_surface_po/{results,figures};  CONFIG knobs are at the top of the .py
