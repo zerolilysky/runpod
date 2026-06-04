@@ -181,7 +181,10 @@ CONFIG: dict = {
     # "single"     : one train/test cut (fast smoke-test; least faithful).
     "window_scheme": "expanding",
     "warmup_years":  7,
-    "roll_years":    5,
+    "roll_years":    5,              # trailing window length for "rolling"
+    # Optional cap on the EXPANDING window: keep at most this many trailing
+    # years even in expanding mode (None -> pure paper expanding window).
+    "max_train_years": None,
     "oos_start":     "2003-01-01",   # first OOS month (after 7yr warm-up)
     "oos_end":       "2022-01-01",
     "val_frac":      0.15,           # chronological tail of TRAIN for early stop
@@ -839,7 +842,10 @@ def make_window_splits(dates: pd.DatetimeIndex, config: dict) -> List[dict]:
     removes the last `embargo_months` of training so no training target's
     holding window (length = horizon) overlaps the first OOS feature month.
 
-      * expanding : OOS month m trained on [start .. m-1-embargo].
+      * expanding : OOS month m trained on [start .. m-1-embargo]. If
+                    `max_train_years` is set, the lookback is CAPPED to that many
+                    years (a "capped expanding" window: expands until it reaches
+                    the cap, then rolls forward keeping at most `max_train_years`).
       * rolling   : OOS month m trained on [m-roll_years .. m-1-embargo].
       * single    : one cut at oos_start (everything >= oos_start is test).
     """
@@ -861,13 +867,17 @@ def make_window_splits(dates: pd.DatetimeIndex, config: dict) -> List[dict]:
         return splits
 
     roll = int(config["roll_years"]) * 12
+    cap = config.get("max_train_years")
+    cap_months = int(cap) * 12 if cap else None     # optional expanding cap
     for m in oos_months:
         train_hi = m - emb            # exclusive upper bound on train feature month
         if config["window_scheme"] == "rolling":
-            train_lo = m - roll
-            tr = (periods >= train_lo) & (periods < train_hi)
-        else:  # expanding
-            tr = periods < train_hi
+            tr = (periods >= (m - roll)) & (periods < train_hi)
+        else:  # expanding (optionally capped to a max trailing lookback)
+            if cap_months is not None:
+                tr = (periods >= (m - cap_months)) & (periods < train_hi)
+            else:
+                tr = periods < train_hi
         tr = np.asarray(tr)
         te = np.asarray(periods == m)
         if tr.sum() == 0 or te.sum() == 0:
@@ -2002,6 +2012,10 @@ def main():
     ap.add_argument("--targets", default=None, help="comma list")
     ap.add_argument("--window", default=None,
                     choices=["expanding", "rolling", "single"])
+    ap.add_argument("--max-train-years", type=int, default=None,
+                    help="cap the expanding window to this many trailing years")
+    ap.add_argument("--roll-years", type=int, default=None,
+                    help="trailing window length for --window rolling")
     ap.add_argument("--ensemble-k", type=int, default=None)
     ap.add_argument("--cuda", action="store_true", help="use a GPU (default: CPU-only)")
     ap.add_argument("--no-cuda", action="store_true", help="force CPU-only (default)")
@@ -2024,6 +2038,10 @@ def main():
         CONFIG["targets"] = [t.strip() for t in args.targets.split(",")]
     if args.window:
         CONFIG["window_scheme"] = args.window
+    if args.max_train_years is not None:
+        CONFIG["max_train_years"] = args.max_train_years
+    if args.roll_years is not None:
+        CONFIG["roll_years"] = args.roll_years
     if args.ensemble_k is not None:
         CONFIG["ensemble_K"] = args.ensemble_k
     if args.cuda:
