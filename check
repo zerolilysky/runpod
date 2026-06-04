@@ -59,3 +59,12 @@ else:
     results = P.run_grid(P.CONFIG)
     display(results)            # ranked portfolio summary (Jupyter)
 # outputs -> iv_surface_po/{results,figures};  CONFIG knobs are at the top of the .py
+
+
+
+# paper Figure 5 — Sharpe vs ensemble size for one model
+P.ensemble_size_sweep("cnn4", "TRET_SP500_EX_F20D", P.CONFIG, Ks=[1,5,10,25,50,100])
+
+# inspect any saved OOS prediction panel
+import pandas as pd
+pd.read_parquet("iv_surface_po/results/pred_TRET_SP500_EX_F20D_cnn4.parquet").head()
