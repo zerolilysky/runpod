@@ -151,6 +151,9 @@ CONFIG: dict = {
     # Portfolio is ALWAYS monthly: for each stock-month keep the LAST (month-end)
     # prediction before decile sorting, regardless of training frequency.
     "portfolio_monthly": True,
+    # TEST set keeps only ONE month-end obs per (stock, month) so OOS R2/IC are
+    # not inflated by multiple intra-month observations. Train/val keep all obs.
+    "test_one_per_month": True,
 
     # Quick testing on a subset: keep only the first N unique perm_IDs that have
     # ENOUGH data in the OOS window (see subset_min_oos_obs). None -> all stocks.
@@ -202,6 +205,13 @@ CONFIG: dict = {
     "ensemble_K": 10,                # number of random-init members (paper: 1..100)
     "ensemble_sweep": [1, 5, 10, 25, 50, 100],  # for the Sharpe-vs-K figure
 
+    # ----- retrain frequency -----------------------------------------
+    # How often to RETRAIN as the window walks forward. 1 = retrain every month
+    # (paper). k > 1 = retrain every k months and just PREDICT (with the held
+    # model + the scalers it was trained on) in the months between. Big compute
+    # saver; the prediction window still advances every month.
+    "refit_every": 1,
+
     # ----- common training -------------------------------------------
     "warmup_epochs":   10,           # paper warm-up epochs
     "transfer_epochs": 5,            # paper transfer-learning epochs
@@ -241,6 +251,13 @@ CONFIG: dict = {
     "use_cuda":   False,             # True (or --cuda) to use a GPU instead
     "use_amp":    True,              # honoured only on CUDA
     "n_cpus":     None,              # total cores to use; None -> os.cpu_count()
+    # Train several models concurrently in separate processes. On BIG datasets
+    # each worker holds the full panel + its feature tensor, so too many at once
+    # can exhaust RAM (BrokenProcessPool). `max_parallel_workers` caps that;
+    # set parallel_models=False to run one model at a time using ALL cores
+    # (slowest-per-model but the most memory-safe).
+    "parallel_models":      True,
+    "max_parallel_workers": 4,
     "n_workers":  1,                 # (GPU mode only) pool size for rf
     "torch_threads": None,           # None -> os.cpu_count()
     "gpu_mem_fraction": 0.85,        # cap to stay under 8 GB
@@ -682,18 +699,36 @@ def data_check(config: dict = CONFIG) -> Tuple[pd.DataFrame, Schema, dict]:
             .nunique().mean()),
     }
 
-    # --- per-target stats ------------------------------------------
+    # --- per-target stats + PORTFOLIO COVERAGE ---------------------
+    # For each target, after dropping NaN, how many UNIQUE stocks are available
+    # per month, and how many OOS months clear the decile threshold
+    # (2 x n_deciles). This is the number that decides whether a portfolio can
+    # be built -- NaN forward returns shrink it.
+    n_dec = int(config.get("n_deciles", 10))
+    need = 2 * n_dec
+    mper = pd.to_datetime(panel[schema.date_col]).dt.to_period("M")
+    oos_lo = pd.Period(pd.Timestamp(config["oos_start"]), "M")
+    oos_hi = pd.Period(pd.Timestamp(config["oos_end"]), "M")
     tgt_rows = []
     for t in schema.target_cols:
         v = pd.to_numeric(panel[t], errors="coerce")
+        ok = v.notna().to_numpy()
+        # unique stocks per month among non-NaN-target rows
+        sub = pd.DataFrame({"m": mper[ok], "id": panel.loc[ok, schema.id_col].values})
+        per_month = sub.groupby("m")["id"].nunique()
+        oos_months = per_month[(per_month.index >= oos_lo) & (per_month.index < oos_hi)]
         tgt_rows.append({
             "target": t,
             "n_obs": int(v.notna().sum()),
             "nan_frac": float(v.isna().mean()),
+            "xs_stocks_median": float(per_month.median()) if len(per_month) else 0.0,
+            "xs_stocks_min": int(per_month.min()) if len(per_month) else 0,
+            "oos_months_total": int(len(oos_months)),
+            "oos_months_ge_2deciles": int((oos_months >= need).sum()),
+            "decile_need": need,
             "mean": float(v.mean()), "std": float(v.std()),
-            "min": float(v.min()), "p1": float(v.quantile(0.01)),
-            "p50": float(v.median()), "p99": float(v.quantile(0.99)),
-            "max": float(v.max()),
+            "p1": float(v.quantile(0.01)), "p50": float(v.median()),
+            "p99": float(v.quantile(0.99)),
         })
     tgt_df = pd.DataFrame(tgt_rows)
     summary["targets"] = tgt_rows
@@ -773,6 +808,14 @@ def _print_data_check(summary: dict, schema: Schema) -> None:
     print(f"  surface NaN frac : {summary['surface_nan_frac']:.4f}   "
           f"neg frac : {summary['surface_neg_frac']:.4f}")
     print(f"  dup (id,date)    : {summary['duplicate_id_date']}")
+    print("  per-target portfolio coverage (after dropping NaN targets):")
+    for tr in summary.get("targets", []):
+        flag = "" if tr["oos_months_ge_2deciles"] >= max(1, tr["oos_months_total"] // 2) \
+            else "   <-- THIN: portfolios may be skipped"
+        print(f"    {tr['target']:<22} nan={tr['nan_frac']:.3f}  "
+              f"stocks/month med={tr['xs_stocks_median']:.0f} min={tr['xs_stocks_min']}  "
+              f"OOS months >= {tr['decile_need']} names: "
+              f"{tr['oos_months_ge_2deciles']}/{tr['oos_months_total']}{flag}")
     if summary["duplicate_id_date"] > 0:
         print("  !! WARNING: duplicate (id,date) rows detected.")
     if not summary["surface_reshape_ok"]:
@@ -833,6 +876,17 @@ def assemble_panel(panel: pd.DataFrame, schema: Schema, target: str,
 
 def month_end_index(dates: pd.DatetimeIndex) -> pd.PeriodIndex:
     return dates.to_period("M")
+
+
+def _month_end_flag(dates: pd.DatetimeIndex, ids: np.ndarray) -> np.ndarray:
+    """Boolean mask: True for the LAST observation of each (stock, month).
+    Used to keep one month-end obs per stock in the TEST set."""
+    df = pd.DataFrame({"id": ids, "date": pd.to_datetime(dates)})
+    df["_m"] = df["date"].dt.to_period("M")
+    keep_idx = df.groupby(["id", "_m"])["date"].idxmax().to_numpy()
+    flag = np.zeros(len(df), dtype=bool)
+    flag[keep_idx] = True
+    return flag
 
 
 def make_window_splits(dates: pd.DatetimeIndex, config: dict) -> List[dict]:
@@ -1380,9 +1434,24 @@ def run_model_target(panel: pd.DataFrame, schema: Schema, target: str,
     data = assemble_panel(panel, schema, target, config)
     X, y, dates, ids = data["X"], data["y"], data["dates"], data["ids"]
     in_shape = (1, data["surface_shape"][0], data["surface_shape"][1])
+    if len(dates) == 0:
+        return {"target": target, "model": model_name,
+                "error": f"no rows with a non-NaN '{target}' after assembly"}
+    dmin, dmax = dates.min().date(), dates.max().date()
     splits = make_window_splits(dates, config)
-    if not splits:
-        return {"target": target, "model": model_name, "error": "no splits"}
+    # TEST de-duplication: keep ONE month-end obs per (stock, month) in the test
+    # set so OOS metrics aren't inflated by multiple intra-month observations.
+    # Train/val keep every observation. (Default ON.)
+    if config.get("test_one_per_month", True) and splits:
+        me_flag = _month_end_flag(dates, ids)
+        for s in splits:
+            s["test_mask"] = np.asarray(s["test_mask"]) & me_flag
+    n_test = int(sum(int(s["test_mask"].sum()) for s in splits))
+    if not splits or n_test == 0:
+        return {"target": target, "model": model_name,
+                "error": (f"no OOS test rows: data spans {dmin}..{dmax} but the OOS "
+                          f"window is {config['oos_start'][:10]}..{config['oos_end'][:10]}. "
+                          f"Adjust oos_start/oos_end to overlap the data.")}
 
     K = int(config["ensemble_K"])
     base_seed = int(config["seed"])
@@ -1405,75 +1474,93 @@ def run_model_target(panel: pd.DataFrame, schema: Schema, target: str,
             configure_threads(config, divisor=(config["n_workers"] if force_cpu else 1))
         builders = _build_torch_modules()
         members = [None] * K           # persistent models across splits
-        first_split = True
+        refit_every = max(1, int(config.get("refit_every", 1)))
+        ps_ref = ts_ref = None         # scalers from the LAST refit (reused between)
+        first_refit = True
+        si = 0                         # index over processed OOS months
         for sp in splits:
             tr, te = sp["train_mask"], sp["test_mask"]
             Xtr_all, ytr_all = X[tr], y[tr]
             Xte = X[te]
             if len(Xtr_all) < 8 or len(Xte) == 0:
                 continue
-            ps = PixelScaler().fit(Xtr_all)
-            ts = TargetScaler().fit(ytr_all)
-            Xtr_s = ps.transform(Xtr_all); ytr_s = ts.transform(ytr_all)
-            Xte_s = ps.transform(Xte)
-            # chronological val tail for warm-up early stopping
-            n_tr = len(Xtr_s)
-            n_val = max(1, int(round(n_tr * config["val_frac"]))) if first_split else 0
-            n_sub = n_tr - n_val
-            Xsub, ysub = Xtr_s[:n_sub], ytr_s[:n_sub]
-            Xval, yval = Xtr_s[n_sub:], ytr_s[n_sub:]
-
+            do_refit = first_refit or (si % refit_every == 0)
+            if do_refit:
+                # (re)fit scalers + train/fine-tune the ensemble on this window
+                ps = PixelScaler().fit(Xtr_all)
+                ts = TargetScaler().fit(ytr_all)
+                Xtr_s = ps.transform(Xtr_all); ytr_s = ts.transform(ytr_all)
+                n_tr = len(Xtr_s)
+                n_val = max(1, int(round(n_tr * config["val_frac"]))) if first_refit else 0
+                n_sub = n_tr - n_val
+                Xsub, ysub = Xtr_s[:n_sub], ytr_s[:n_sub]
+                Xval, yval = Xtr_s[n_sub:], ytr_s[n_sub:]
+                is_k = np.zeros(len(Xtr_s), np.float64)
+                for k in range(K):
+                    seed = base_seed + k
+                    if members[k] is None:
+                        set_seed(seed)
+                        members[k] = builders[model_name](in_shape, {**config, "seed": seed})
+                    epochs = config["warmup_epochs"] if first_refit else config["transfer_epochs"]
+                    members[k] = _train_epochs(members[k], Xsub, ysub, Xval, yval,
+                                               epochs, config, device, seed,
+                                               early_stop=first_refit)
+                    is_k += ts.inverse(_predict(members[k], Xtr_s, device))
+                is_true, is_pred = ytr_all.copy(), is_k / K   # IS from last refit
+                ps_ref, ts_ref = ps, ts
+                first_refit = False
+            # predict this OOS month with the current (possibly held) ensemble,
+            # using the scalers the models were trained with (leak-free).
+            Xte_s = ps_ref.transform(Xte)
             preds_k = np.zeros(len(Xte_s), np.float64)
-            is_k = np.zeros(len(Xtr_s), np.float64)     # in-sample (this window)
             for k in range(K):
-                seed = base_seed + k
-                if members[k] is None:
-                    set_seed(seed)
-                    members[k] = builders[model_name](in_shape, {**config, "seed": seed})
-                epochs = config["warmup_epochs"] if first_split else config["transfer_epochs"]
-                members[k] = _train_epochs(members[k], Xsub, ysub, Xval, yval,
-                                           epochs, config, device, seed,
-                                           early_stop=first_split)
-                preds_k += ts.inverse(_predict(members[k], Xte_s, device))
-                is_k += ts.inverse(_predict(members[k], Xtr_s, device))
-            preds_k /= K; is_k /= K
+                preds_k += ts_ref.inverse(_predict(members[k], Xte_s, device))
+            preds_k /= K
             for j, gi in enumerate(np.where(te)[0]):
                 rows.append((dates[gi], ids[gi], float(y[gi]), float(preds_k[j])))
-            is_true, is_pred = ytr_all.copy(), is_k    # keep last window's IS
-            first_split = False
+            si += 1
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         del members
         gc.collect()
 
-    else:   # ---- RandomForest (sklearn), refit per window -------------
+    else:   # ---- RandomForest (sklearn) -----------------------------
         from sklearn.ensemble import RandomForestRegressor
+        refit_every = max(1, int(config.get("refit_every", 1)))
+        rf_models = None               # held between refits
+        first_refit = True
+        si = 0
+        n_est = max(1, int(config["rf_estimators"]))
+        rf_jobs = int(n_threads) if n_threads else (1 if force_cpu else -1)
         for sp in splits:
             tr, te = sp["train_mask"], sp["test_mask"]
             Xtr_all, ytr_all = X[tr], y[tr]
             Xte = X[te]
             if len(Xtr_all) < 8 or len(Xte) == 0:
                 continue
-            Xtr_f = Xtr_all.reshape(len(Xtr_all), -1)
             Xte_f = Xte.reshape(len(Xte), -1)
+            do_refit = first_refit or (si % refit_every == 0)
+            if do_refit:
+                Xtr_f = Xtr_all.reshape(len(Xtr_all), -1)
+                rf_models, is_k = [], np.zeros(len(Xtr_f), np.float64)
+                for k in range(K):
+                    rf = RandomForestRegressor(
+                        n_estimators=n_est, max_depth=config["rf_max_depth"],
+                        max_features=config["rf_max_features"],
+                        n_jobs=rf_jobs, random_state=base_seed + k)
+                    rf.fit(Xtr_f, ytr_all)
+                    rf_models.append(rf)
+                    is_k += rf.predict(Xtr_f)
+                is_true, is_pred = ytr_all.copy(), is_k / K
+                first_refit = False
             preds_k = np.zeros(len(Xte_f), np.float64)
-            is_k = np.zeros(len(Xtr_f), np.float64)     # in-sample (this window)
-            n_est = max(1, int(config["rf_estimators"]))
-            # threads for this model's RF: pinned budget, else all cores
-            rf_jobs = int(n_threads) if n_threads else (1 if force_cpu else -1)
-            for k in range(K):
-                rf = RandomForestRegressor(
-                    n_estimators=n_est, max_depth=config["rf_max_depth"],
-                    max_features=config["rf_max_features"],
-                    n_jobs=rf_jobs, random_state=base_seed + k)
-                rf.fit(Xtr_f, ytr_all)
+            for rf in rf_models:
                 preds_k += rf.predict(Xte_f)
-                is_k += rf.predict(Xtr_f)
-            preds_k /= K; is_k /= K
+            preds_k /= len(rf_models)
             for j, gi in enumerate(np.where(te)[0]):
                 rows.append((dates[gi], ids[gi], float(y[gi]), float(preds_k[j])))
-            is_true, is_pred = ytr_all.copy(), is_k
+            si += 1
 
     if not rows:
         return {"target": target, "model": model_name, "error": "no OOS rows"}
@@ -1538,8 +1625,9 @@ def _to_monthly_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
     """Collapse predictions to ONE row per (stock, month): the last (month-end)
     observation. This is where sub-monthly training data becomes a monthly
     portfolio (resample to monthly only at portfolio construction)."""
-    df = pred_df.copy()
+    df = pred_df.copy().reset_index(drop=True)       # ensure unique index for .loc
     df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["id"])
     df["_m"] = df["date"].dt.to_period("M")
     idx = df.groupby(["id", "_m"])["date"].idxmax()
     out = df.loc[idx].copy()
@@ -1557,9 +1645,14 @@ def build_portfolio(pred_df: pd.DataFrame, target: str, config: dict,
 
     monthly = []
     prev_long, prev_short = set(), set()
+    n_dates_seen = 0
+    max_names = 0
+    need = n_dec * 2
     for dt, g in pred_df.groupby("date"):
+        n_dates_seen += 1
         g = g.dropna(subset=["y_pred", "y_true"])
-        if len(g) < n_dec * 2:
+        max_names = max(max_names, len(g))
+        if len(g) < need:
             continue
         ranks = g["y_pred"].rank(method="first")
         q_hi = ranks.quantile(1 - 1.0 / n_dec)
@@ -1593,7 +1686,11 @@ def build_portfolio(pred_df: pd.DataFrame, target: str, config: dict,
         prev_long, prev_short = cur_long, cur_short
 
     if not monthly:
-        return {"error": "insufficient cross-section for portfolios"}
+        msg = (f"insufficient cross-section: {n_dates_seen} portfolio dates, "
+               f"max {max_names} names on any date but need >= {need} "
+               f"(n_deciles={n_dec}). Lower n_deciles or check coverage.")
+        logging.warning("build_portfolio[%s]: %s", target, msg)
+        return {"error": msg}
     pf = pd.DataFrame(monthly).sort_values("date").reset_index(drop=True)
 
     def _stats(col):
@@ -1724,29 +1821,65 @@ def run_grid(config: dict = CONFIG) -> pd.DataFrame:
                  f"CPU-distributed over {n_cpus} cores" if cpu_mode else "GPU mode")
     results: List[dict] = []
 
-    if cpu_mode and len(tasks) > 1:
-        # ---- distributed: every model trains concurrently across cores ----
+    def _run_sequential(task_list):
+        """Run tasks one at a time in THIS process (memory-safe; each model uses
+        all cores). Used as the default and as the pool fallback."""
+        _pin_blas_threads(n_cpus)
+        out = []
+        for t in task_list:
+            try:
+                out.append(run_model_target(panel, schema, t["target"], t["model"],
+                                            config, force_cpu=True, n_threads=n_cpus))
+            except Exception as exc:
+                logging.error("task %s failed: %s", t, exc, exc_info=True)
+                out.append({"target": t["target"], "model": t["model"], "error": str(exc)})
+        return out
+
+    if cpu_mode and len(tasks) > 1 and config.get("parallel_models", True):
+        # ---- distributed: train several models concurrently across cores ----
+        # Memory-safe: cap concurrent workers (each worker holds the full panel
+        # + its feature tensor) so big real datasets don't OOM -> BrokenPool.
         max_workers, threads_per = plan_cpu_allocation(len(tasks), n_cpus)
+        cap = int(config.get("max_parallel_workers", 4) or max_workers)
+        if cap < max_workers:                     # give freed cores back as threads
+            threads_per = max(threads_per, n_cpus // max(1, cap))
+            max_workers = cap
         logging.info("CPU schedule: %d concurrent workers x %d thread(s)/model "
-                     "(%d tasks, %d cores)", max_workers, threads_per,
-                     len(tasks), n_cpus)
+                     "(%d tasks, %d cores; cap=%s)", max_workers, threads_per,
+                     len(tasks), n_cpus, config.get("max_parallel_workers"))
         _pin_blas_threads(threads_per)            # children inherit via spawn
         import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures import (ProcessPoolExecutor, as_completed,
+                                        BrokenProcessPool)
         ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-            # panel=None -> each worker reloads from the disk cache (avoids
-            # pickling the full panel to every process).
-            futs = [ex.submit(_cpu_worker, (None, None, t, config, threads_per))
-                    for t in tasks]
-            for fut in as_completed(futs):
-                results.append(fut.result())
+        done_keys = set()
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+                # panel=None -> each worker reloads from the disk cache (avoids
+                # pickling the full panel to every process).
+                fut2task = {ex.submit(_cpu_worker, (None, None, t, config, threads_per)): t
+                            for t in tasks}
+                for fut in as_completed(fut2task):
+                    t = fut2task[fut]
+                    try:
+                        results.append(fut.result())
+                        done_keys.add((t["target"], t["model"]))
+                    except Exception as exc:
+                        logging.error("worker for %s died: %s", t, exc)
+        except BrokenProcessPool as exc:
+            logging.error("Process pool broke (likely OOM): %s. Falling back to "
+                          "SEQUENTIAL for the remaining tasks.", exc)
+        remaining = [t for t in tasks if (t["target"], t["model"]) not in done_keys]
+        if remaining:
+            logging.warning("Running %d task(s) sequentially after pool issues. "
+                            "Lower max_parallel_workers if this recurs.", len(remaining))
+            results.extend(_run_sequential(remaining))
     elif cpu_mode:
-        # single task -> give it every core
-        t = tasks[0]
-        _pin_blas_threads(n_cpus)
-        results.append(run_model_target(panel, schema, t["target"], t["model"],
-                                        config, force_cpu=True, n_threads=n_cpus))
+        # sequential in-process (1 task, or parallel_models=False) -> all cores each
+        if len(tasks) > 1:
+            logging.info("Sequential CPU mode: %d tasks, each using %d cores.",
+                         len(tasks), n_cpus)
+        results.extend(_run_sequential(tasks))
     else:
         # ---- GPU mode: neural sequential on GPU, rf fans out on CPU pool ----
         cpu_tasks = [t for t in tasks if t["model"] in SKLEARN_MODELS]
@@ -1775,21 +1908,27 @@ def run_grid(config: dict = CONFIG) -> pd.DataFrame:
     # ---- portfolios + analysis for every successful run ----------
     portfolio_rows = []
     nav_store = {}
+    skip_reasons = []
     for r in results:
+        tag = f"{r.get('target')}/{r.get('model')}"
         if "error" in r and r.get("pred_path") is None:
+            skip_reasons.append(f"{tag}: model error -> {r['error']}")
             continue
         pp = r.get("pred_path")
         if not pp or not (os.path.exists(pp) or os.path.exists(pp.replace(".parquet", ".csv"))):
+            skip_reasons.append(f"{tag}: no prediction file written")
             continue
         try:
             pred_df = (pd.read_parquet(pp) if os.path.exists(pp)
                        else pd.read_csv(pp.replace(".parquet", ".csv")))
             pred_df["date"] = pd.to_datetime(pred_df["date"])
-        except Exception:
+        except Exception as exc:
+            skip_reasons.append(f"{tag}: could not read predictions ({exc})")
             continue
         wl = build_mktcap_lookup(panel, schema) if config["weighting"] == "value" else None
         pf = build_portfolio(pred_df, r["target"], config, wl)
         if "error" in pf:
+            skip_reasons.append(f"{tag}: {pf['error']}")
             continue
         portfolio_rows.append({
             "target": r["target"], "model": r["model"],
@@ -1815,7 +1954,7 @@ def run_grid(config: dict = CONFIG) -> pd.DataFrame:
         pf_df = pf_df.sort_values(["target", "sharpe_HL"], ascending=[True, False])
         pf_df.to_csv(os.path.join(config["output_dir"], "portfolio_summary.csv"), index=False)
 
-    finalize_and_report(res_df, pf_df, nav_store, config)
+    finalize_and_report(res_df, pf_df, nav_store, config, skip_reasons)
     return pf_df
 
 
@@ -1823,14 +1962,17 @@ def run_grid(config: dict = CONFIG) -> pd.DataFrame:
 # Section 12 - Reporting + visualisation + benchmark comparison
 # ======================================================================
 def finalize_and_report(res_df: pd.DataFrame, pf_df: pd.DataFrame,
-                        nav_store: dict, config: dict) -> None:
+                        nav_store: dict, config: dict,
+                        skip_reasons: Optional[List[str]] = None) -> None:
     line = "=" * 86
     print("\n" + line)
     print("  IV-SURFACE FORECAST RESULTS  (OOS %s .. %s, ranked by H-L Sharpe)"
           % (config["oos_start"][:7], config["oos_end"][:7]))
     print(line)
     if pf_df is None or pf_df.empty:
-        print("  No portfolios produced.")
+        print("  No portfolios produced. Per-model reason:")
+        for s in (skip_reasons or ["(no diagnostics captured)"]):
+            print(f"    - {s}")
     else:
         cols = ["model", "sharpe_HL", "sharpe_HL_net", "cagr_HL", "maxdd_HL",
                 "sharpe_long", "avg_turnover", "IC", "rankIC", "R2_is", "R2_oos"]
@@ -2017,6 +2159,8 @@ def main():
     ap.add_argument("--roll-years", type=int, default=None,
                     help="trailing window length for --window rolling")
     ap.add_argument("--ensemble-k", type=int, default=None)
+    ap.add_argument("--refit-every", type=int, default=None,
+                    help="retrain every k months (1=every month, paper)")
     ap.add_argument("--cuda", action="store_true", help="use a GPU (default: CPU-only)")
     ap.add_argument("--no-cuda", action="store_true", help="force CPU-only (default)")
     ap.add_argument("--n-cpus", type=int, default=None,
@@ -2044,6 +2188,8 @@ def main():
         CONFIG["roll_years"] = args.roll_years
     if args.ensemble_k is not None:
         CONFIG["ensemble_K"] = args.ensemble_k
+    if args.refit_every is not None:
+        CONFIG["refit_every"] = args.refit_every
     if args.cuda:
         CONFIG["use_cuda"] = True
     if args.no_cuda:
