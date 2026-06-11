@@ -1,39 +1,19 @@
-# ===== IV-SURFACE — EXPANDING WINDOW WITH A 2-YEAR ROLLING CAP =====
-import sys, importlib
-sys.path.insert(0, r"C:\Users\<you>\Documents\claude_file\claude_cowork")  # EDIT
-import iv_surface_forecast_pipeline as P; importlib.reload(P)
+from iv_cnn_runner import run
 
-P.CONFIG.update(
-    data_dir         = ".",
-    force_rebuild    = False,
-    resample_monthly = False,            # keep all obs for training; portfolio is monthly
+# default: 20D rebalance (month-end test rows), monthly refit, expanding window
+res = run()
 
-    # ---- windowing: expanding, but capped to a trailing 2 years ----
-    window_scheme    = "expanding",      # paper scheme...
-    max_train_years  = 2,                # ...but never train on more than 2 trailing years
-    #                                      (None = pure expanding; uses ALL history)
-    oos_start        = "1998-01-01",     # >= max_train_years after data start
-    oos_end          = "2022-01-01",
-    embargo_months   = 1,
-    warmup_epochs    = 10,
-    transfer_epochs  = 5,
+# weekly rebalance -> target switches to TRET_SP500_EX_F5D automatically
+res = run(rebalance="5D")
 
-    # ---- quick-test slice (None = full 1138-stock universe) ----
-    max_stocks         = 100,
-    subset_min_oos_obs = 6,
+# full control
+res = run(rebalance="20D",
+          refit_months=1,            # 1=monthly retrain; 3, 12... to lighten
+          window="exp",              # or "roll6", "roll8", ...
+          test_start="2015-01",      # year int or "YYYY-MM"
+          test_end="2024-12",
+          seeds=3)                   # ensemble size
 
-    targets    = ["TRET_SP500_EX_F20D"],
-    models     = ["rf", "deepmlp", "cnn", "cnn1", "cnn4", "cnn5", "lstm"],
-    ensemble_K = 5,
-
-    surface_norm = "pixel_zscore",
-    use_cuda     = False,
-    n_cpus       = 20,
-    n_deciles    = 10,
-)
-
-STAGE = "check"   # "check" first, then "run"
-if STAGE == "check":
-    panel, schema, summary = P.data_check(P.CONFIG)
-else:
-    display(P.run_grid(P.CONFIG))     # ranked table incl. R2_is / R2_oos
+res["summary"]              # IC, IC_t, H-L Sharpe, long-only Sharpe, n_periods
+res["predictions"].head()   # per stock-date predictions; also saved as
+                            # predictions_20D.csv next to the data
