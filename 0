@@ -208,7 +208,8 @@ def train_cnn_dm_tanh(Xtr, ytr, seeds=3, epochs=25, patience=3,
 def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
         rebalance="20D", refit_months=1, window="exp",
         test_start=None, test_end=None, seeds=3, train_weekly=True,
-        save_csv=True, verbose=True, oos_start=None):
+        save_csv=True, verbose=True, oos_start=None,
+        require_months=None, balanced_panel=False):
     """
     Walk-forward evaluation. Returns dict with `predictions` (DataFrame),
     `summary` (dict) and writes predictions_<rebalance>.csv next to the data.
@@ -216,6 +217,11 @@ def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
     out-of-sample window. Diagnostics go to iv_runner.log.
     """
     _setup_log(data_dir)
+    log.info("=" * 64)
+    log.info("NEW RUN | rebalance=%s refit_months=%s window=%s "
+             "test_start=%s test_end=%s seeds=%s",
+             rebalance, refit_months, window, test_start, test_end, seeds)
+    log.info("=" * 64)
     assert rebalance in ("20D", "5D"), "rebalance must be '20D' or '5D'"
     horizon_days = 20 if rebalance == "20D" else 5
     target = f"TRET_SP500_EX_F{horizon_days}D"
@@ -228,15 +234,53 @@ def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
               "available: " + ", ".join(c for c in df.columns if "TRET" in str(c).upper()))
     y = pd.to_numeric(df[tcol], errors="coerce").values.astype(np.float32)
     ok = np.isfinite(y)
+    if balanced_panel:
+        n_all = df["_m"].nunique()
+        cov = df.groupby("perm_ID")["_m"].nunique()
+        keep_ids = set(cov[cov == n_all].index)
+        ok &= df["perm_ID"].isin(keep_ids).values
+        log.warning("balanced_panel=True: %d/%d stocks kept. This filter uses "
+                    "FUTURE information (survivorship bias) - results are "
+                    "diagnostics only, do not report them as a backtest.",
+                    len(keep_ids), int(cov.shape[0]))
+    if require_months:
+        N = int(require_months)
+        pres = (df.drop_duplicates(["perm_ID", "_m"])
+                  .assign(v=1)
+                  .pivot_table(index="perm_ID", columns="_m", values="v",
+                               fill_value=0))
+        pres = pres.reindex(columns=pd.period_range(
+            df["_m"].min(), df["_m"].max(), freq="M"), fill_value=0)
+        roll = (pres.T.rolling(N, min_periods=N).sum().T == N)   # trailing N
+        flag = roll.stack()
+        idx = pd.MultiIndex.from_arrays([df["perm_ID"], df["_m"]])
+        good = flag.reindex(idx).fillna(False).values.astype(bool)
+        before = int(ok.sum())
+        ok &= good
+        log.info("require_months=%d (point-in-time): %d -> %d usable rows "
+                 "(%.0f%% kept)", N, before, int(ok.sum()),
+                 100 * ok.sum() / max(before, 1))
+        if ok.sum() < 0.3 * before:
+            log.warning("SUGGESTION: filter removed >70%% of rows - consider "
+                        "a smaller require_months or check for data gaps")
     if ok.mean() < 0.5:
         log.warning("only %.0f%% of target values are finite; check %s",
                     100 * ok.mean(), tcol)
     test_grid = df["is_me"].values if rebalance == "20D" else np.ones(len(df), bool)
-    ts = test_start or oos_start or int(df["date"].dt.year.quantile(0.5))
-    ts = f"{ts}-01" if isinstance(ts, int) else str(ts)
-    te_ = test_end or df["date"].max()
-    te_ = f"{te_}-12" if isinstance(te_, int) else str(te_)
-    months = pd.period_range(ts, te_, freq="M")
+    def _to_month(v, default_ts):
+        if v is None:
+            return default_ts
+        if isinstance(v, int):
+            return pd.Period(f"{v}-01", "M") if default_ts.month == 1 \
+                   else pd.Period(f"{v}-12", "M")
+        return pd.Period(pd.Timestamp(str(v)), "M")   # accepts "YYYY", "YYYY-MM",
+                                                      # "YYYY-MM-DD", Timestamps
+    mid = int(df["date"].dt.year.quantile(0.5))
+    ts_default = pd.Period(f"{test_start or oos_start or mid}-01", "M") \
+        if isinstance(test_start or oos_start or mid, int) else None
+    start_m = _to_month(test_start or oos_start or mid, pd.Period(f"{mid}-01", "M"))
+    end_m = _to_month(test_end, pd.Period(df["date"].max(), "M"))
+    months = pd.period_range(start_m, end_m, freq="M")
     if len(months) == 0:
         _hint(f"empty test window {ts}..{te_}",
               "check test_start/test_end against the data range "
@@ -267,8 +311,10 @@ def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
                             "use window='exp'", mper, int(tr.sum()))
                 continue
             predictor = train_cnn_dm_tanh(S[tr], y[tr], seeds=seeds)
+            log.debug("refit %s: fresh random-init ensemble (no warm start); "
+                      "scalers re-fit on current training window", mper)
             if verbose:
-                print(f"  refit {mper}: ntr={tr.sum():,} "
+                print(f"  refit {mper}: ntr={tr.sum():,} fresh ensemble "
                       f"({time.time()-t0:.0f}s elapsed)", flush=True)
         preds[te] = predictor(S[te])
     # ---------------- evaluation ----------------
@@ -319,9 +365,11 @@ def main():
     ap.add_argument("--test-start", default=None)
     ap.add_argument("--test-end", default=None)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--require-months", type=int, default=None)
     a = ap.parse_args()
     run(a.data_dir, a.pattern, a.rebalance, a.refit_months, a.window,
-        a.test_start, a.test_end, a.seeds)
+        a.test_start, a.test_end, a.seeds,
+        require_months=a.require_months)
 
 
 if __name__ == "__main__":
