@@ -1,2078 +1,328 @@
 # ======================================================================
-# iv_surface_forecast_pipeline.py
+# iv_cnn_runner.py
 # ----------------------------------------------------------------------
-# Cross-sectional monthly stock-return forecasting from OptionMetrics
-# implied-volatility (IV) SURFACES, treated as 10 x 18 "images".
+# Walk-forward return forecasting from IV surfaces (10x18) on weekly
+# per-stock pickle files, with a CNN (per-image demeaning + tanh-bounded
+# output). Data files are loaded from the CURRENT WORKING DIRECTORY by
+# default, so the notebook/script just needs to sit next to the pickles.
 #
-# This adapts the univariate VIX time-series pipeline
-# (vix_multimodel_forecast_pipeline.py) to the methodology of
+# Key settings (all arguments of run()):
+#   rebalance     : "20D" (default) -> target *_EX_F20D, one test obs per
+#                   stock-month (last available trading day of the month);
+#                   "5D" -> target *_EX_F5D, every weekly obs is a test obs,
+#                   portfolio formed every week.
+#   refit_months  : how often to retrain (1 = monthly, 3 = quarterly, ...).
+#   window        : "exp" expanding (default) or "rollN" (e.g. "roll6").
+#   oos_start     : first out-of-sample year.
 #
-#   Kelly, Kuznetsov, Malamud & Xu (2026),
-#   "Deep Learning from Implied Volatility Surfaces", SSRN 4531181.
+# Leak control: training uses only observations whose forward-return
+# window closes BEFORE the test period starts (embargo = horizon);
+# all scalers are fit on the training window only; weekly rows are used
+# for training, evaluation only on the rebalance-grid rows.
 #
-# Paper recap (what we replicate):
-#   * Input  : OptionMetrics IvyDB IV surface on the last business day of
-#              month t, reshaped to a 10 x 18 image
-#              (delta in [-0.5,0.5], maturities ~20..730 days, ATM re-stacked).
-#   * Target : next-month stock total/excess return R_{i,t+1}.
-#   * Models : convolutional nets CNN1 / CNN4 / CNN5 (1/4/5 conv blocks,
-#              3x3 conv -> 2x2 maxpool -> BatchNorm -> ReLU, filters
-#              16/32/64/128, global-average-pool, single linear head).
-#   * Ensemble: K random initialisations (K = 1..100), predictions averaged.
-#   * Training: EXPANDING window. 7-year warm-up (1996-2002, 10 epochs),
-#               then transfer-learning month-by-month (5 epochs/refit).
-#               Adam, lr=1e-3, batch=512, Xavier init, MSE loss.
-#   * Portfolio: each month sort stocks into deciles by predicted return,
-#                equal-weight, long top decile / short bottom decile (H-L),
-#                1-month holding. Report annualised Sharpe, ranked.
-#                Size groups via NYSE breakpoints (mega/large/small/micro).
+# Notebook usage (data pickles in the same folder as the notebook):
+#   from iv_cnn_runner import run
+#   res = run()                                  # 20D, monthly refit
+#   res = run(rebalance="5D", refit_months=3)    # weekly rebalance
+#   res["predictions"].head(); res["summary"]
 #
-# Extensions in this file (the model "zoo" requested):
-#   rf, deepmlp, cnn, cnn1, cnn4, cnn5, lstm, autoformer, esn,
-#   cnn-lstm, cnn-autoformer, cnn-esn.
-#   NOTE: the deep MLP keeps the name "deepmlp" everywhere (never "dp").
-#
-# YOUR DATA (auto-detected by the data-check stage):
-#   per-stock pickle files such as  <something>_all_Count_w_fReturns.pickle
-#   with id columns        : perm_id / perm_ID , date , trade_id
-#   with target columns    : TRET_F50, TRET_F20D,
-#                            TRET_SP500_EX_F50, TRET_SP500_EX_F20D, ...
-#   with 180 surface cells : reshaped to (10, 18).
-#   Primary target         : TRET_SP500_EX_F20D (next ~month excess return).
-#
-# NO LOOK-AHEAD (strictly enforced):
-#   * features = month-end IV surface at t; target = forward return realised
-#     at t+h.  Train/test are split BY THE REALISED TARGET DATE.
-#   * a purge/embargo of `horizon` months is applied around the test start so
-#     that no training target's holding window overlaps the test features.
-#   * per-pixel feature scalers and the target scaler are fit on TRAIN ONLY
-#     and merely applied to validation/test.
-#   * the validation tail for early stopping is the chronological end of the
-#     current training window (never future data).
-#
-# DELL / WINDOWS / 8GB-GPU FRIENDLY:
-#   * CONFIG["use_cuda"] = False (or --no-cuda) -> pure CPU.
-#   * GPU (neural) models run sequentially with small batches + AMP so they
-#     fit in 8 GB of VRAM; CPU models (rf) fan out over a process pool
-#     across the 20 cores (CONFIG["n_workers"]).
-#   * spawn context, __main__ guard, torch lazily imported.
-#
-# EFFICIENCY:
-#   * surfaces are reshaped/standardised with fully-vectorised numpy;
-#   * the (target x model) grid runs in parallel where memory-safe;
-#   * everything is cached to parquet/pickle between stages.
+# CLI usage:
+#   python iv_cnn_runner.py --rebalance 20D --refit-months 1
 # ======================================================================
 from __future__ import annotations
-
-import argparse
-import gc
-import glob
-import json
-import logging
-import math
-import os
-import random
-import sys
-import time
-import warnings
-from itertools import product
-from typing import Dict, List, Optional, Sequence, Tuple
-
+import argparse, glob, logging, os, time
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
-warnings.filterwarnings("ignore")
+log = logging.getLogger("iv_runner")
 
-# torch is imported lazily inside functions/workers so the data-check and
-# RandomForest stages do not require torch to be installed.
-
-# ======================================================================
-# Section 0 - Global constants & CONFIG
-# ======================================================================
-MONTHS_ANN = 12.0          # monthly -> annual factor for Sharpe
-EPS = 1e-10
-
-WORK = "iv_surface_po"
-os.makedirs(WORK, exist_ok=True)
-
-CONFIG: dict = {
-    # ----- data ------------------------------------------------------
-    # Folder that holds the per-stock pickle files. Default "." == the folder
-    # the notebook/script lives in (the pickles sit next to it).
-    "data_dir":   ".",
-    "file_glob":  "*_all_Count_w_fReturns.pickle",
-    "combined_cache": os.path.join(WORK, "cache", "iv_panel.parquet"),
-
-    # Column-name CANDIDATES. The data-check stage picks whichever exists
-    # (case-insensitive), so small naming differences are tolerated.
-    "id_candidates":    ["perm_ID", "perm_id", "permno", "PERMNO", "permID"],
-    "date_candidates":  ["date", "Date", "DATE", "month_end", "eom"],
-    "trade_id_candidates": ["trade_id", "tradeid", "trade_ID"],
-
-    # ---- IV surface --------------------------------------------------
-    # The surface lives in ONE column holding a length-180 list/array
-    # ("ImpliedVolatility"). Reshaped to (n_tau, n_delta) = (10, 18):
-    #   axis 0 = maturity (days): [30,60,91,122,152,182,273,365,547,730]
-    #   axis 1 = 18 delta buckets.
-    # (If instead the data has 180 separate numeric columns, that is also
-    #  auto-detected via `surface_prefix` / the 180-numeric-column fallback.)
-    "surface_list_candidates": ["ImpliedVolatility", "implied_volatility",
-                                 "impliedvol", "iv_surface", "vol_surface",
-                                 "surface", "IV"],
-    "surface_shape": (10, 18),               # (maturity, delta)
-    "maturity_grid": [30, 60, 91, 122, 152, 182, 273, 365, 547, 730],
-    "surface_prefix": ("iv_", "surf_", "vs_", "IV_"),
-
-    # Targets (all four supported; FIRST is primary for portfolio sorting).
-    # NOTE: horizons are F5D (~1 week) and F20D (~1 month) -- there is no F50.
-    "targets": [
-        "TRET_SP500_EX_F20D",   # primary: ~1-month forward EXCESS return
-        "TRET_F20D",            # ~1-month forward raw total return
-        "TRET_SP500_EX_F5D",    # ~1-week forward excess return
-        "TRET_F5D",             # ~1-week forward raw return
-    ],
-    "primary_target": "TRET_SP500_EX_F20D",
-    # forward-return horizon of each target IN TRADING DAYS (for purge/embargo).
-    "target_horizon_days": {
-        "TRET_F20D": 20, "TRET_SP500_EX_F20D": 20,
-        "TRET_F5D": 5, "TRET_SP500_EX_F5D": 5,
-    },
-
-    # ---- monthly handling & testing subset --------------------------
-    # Data is monthly but stocks have different available dates within a month
-    # (338 months across 1046 unique dates). Collapse to ONE month-end obs per
-    # stock-month. NOTE: the raw data is ~weekly (~4 obs per stock-month), so
-    # collapsing here would DISCARD ~3/4 of the training observations.
-    #   resample_monthly = False -> keep ALL obs for training/prediction; the
-    #                               portfolio still aggregates to month-end.
-    #   resample_monthly = True  -> collapse to one month-end obs per stock-month
-    #                               (closest to the paper, but less training data).
-    "resample_monthly": False,
-    # Portfolio is ALWAYS monthly: for each stock-month keep the LAST (month-end)
-    # prediction before decile sorting, regardless of training frequency.
-    "portfolio_monthly": True,
-
-    # Quick testing on a subset: keep only the first N unique perm_IDs that have
-    # ENOUGH data in the OOS window (see subset_min_oos_obs). None -> all stocks.
-    "max_stocks": None,
-    # When subsetting, a stock must have >= this many observations inside
-    # [oos_start, oos_end) to be eligible (avoids picking stocks that are absent
-    # during the test period).
-    "subset_min_oos_obs": 6,
-
-    # ---- surface standardisation (the IV "picture") -----------------
-    # How to standardise the 10x18 surface. All options are LEAK-FREE.
-    #   "pixel_zscore" : per-cell z-score using TRAIN statistics (paper-faithful;
-    #                    preserves surface shape). [default]
-    #   "xs_zscore"    : per-DATE cross-sectional z-score of each cell across
-    #                    stocks (standard in cross-sectional ML; causal by date).
-    #   "log_pixel"    : log(IV) then per-cell train z-score (IV is positive,
-    #                    log stabilises the right tail).
-    #   "none"         : raw IV (not recommended).
-    "surface_norm": "pixel_zscore",
-    "xs_min_stocks": 5,              # skip xs-zscore on dates with too few stocks
-
-    # optional auxiliary columns that are NOT surface cells (market cap etc.)
-    "mktcap_candidates": ["mktcap", "market_cap", "me", "ME", "siz", "size"],
-
-    # ----- split / windowing (follow the paper) ----------------------
-    # "expanding"  : 7yr warm-up then add one month at a time (paper main).
-    # "rolling"    : fixed `roll_years`-year window (paper robustness).
-    # "single"     : one train/test cut (fast smoke-test; least faithful).
-    "window_scheme": "expanding",
-    "warmup_years":  7,
-    "roll_years":    5,              # trailing window length for "rolling"
-    # Optional cap on the EXPANDING window: keep at most this many trailing
-    # years even in expanding mode (None -> pure paper expanding window).
-    "max_train_years": None,
-    "oos_start":     "2003-01-01",   # first OOS month (after 7yr warm-up)
-    "oos_end":       "2022-01-01",
-    "val_frac":      0.15,           # chronological tail of TRAIN for early stop
-    "embargo_months": 1,             # purge around test start (>= ceil(h/21))
-
-    # ----- experiment grid -------------------------------------------
-    # First-pass default = light subset + paper-faithful CNNs.
-    # Full zoo is available; switch via --models or CONFIG["models"].
-    "models": ["rf", "deepmlp", "cnn", "cnn1", "cnn4", "cnn5", "lstm"],
-    "all_models": ["rf", "deepmlp", "cnn", "cnn1", "cnn4", "cnn5",
-                   "lstm", "autoformer", "esn",
-                   "cnn-lstm", "cnn-autoformer", "cnn-esn"],
-
-    # ----- ensembling -------------------------------------------------
-    "ensemble_K": 10,                # number of random-init members (paper: 1..100)
-    "ensemble_sweep": [1, 5, 10, 25, 50, 100],  # for the Sharpe-vs-K figure
-
-    # ----- common training -------------------------------------------
-    "warmup_epochs":   10,           # paper warm-up epochs
-    "transfer_epochs": 5,            # paper transfer-learning epochs
-    "batch_size":      512,          # paper batch size
-    "lr":              1e-3,
-    "weight_decay":    1e-5,
-    "patience":        5,
-    "seed":            42,
-
-    # ----- per-model hyper-parameters --------------------------------
-    "rf_estimators": 300, "rf_max_depth": None, "rf_max_features": "sqrt",
-    "deepmlp_hidden": (256, 128, 64), "deepmlp_dropout": 0.10,
-    "cnn_filters": (16, 32), "cnn_dropout": 0.10,
-    # paper CNNs: filters per block 16,32,64,128 (CNN1 uses just the first)
-    "paper_filters": (16, 32, 64, 128),
-    "lstm_hidden": 32, "lstm_layers": 1, "lstm_dropout": 0.10,
-    # Sequence models read the surface along the MATURITY axis. With this flag
-    # the sequence is ordered long->short maturity, so the SHORTEST maturity
-    # (30d) is the LATEST timestep (per your spec). CNNs ignore this (image).
-    "seq_reverse_maturity": True,
-    "af_d_model": 32, "af_heads": 4, "af_layers": 2, "af_ff": 64,
-    "af_dropout": 0.10, "af_moving_avg": 3,
-    "esn_reservoir": 200, "esn_spectral_radius": 0.9, "esn_sparsity": 0.1,
-    "esn_leak": 1.0, "esn_ridge": 1e-2,
-
-    # ----- portfolio --------------------------------------------------
-    "n_deciles": 10,
-    "weighting": "equal",            # "equal" or "value" (needs mktcap)
-    "size_groups": True,             # mega/large/small/micro/non-micro splits
-    "tcost_bps": 0.0,                # round-trip cost per unit turnover (bps)
-
-    # ----- compute ----------------------------------------------------
-    # CPU-only distributed by default (no GPU assumed). When use_cuda=False
-    # ALL models train concurrently across processes with this CPU budget:
-    #   * if  #tasks >= n_cpus  -> one model per core (1 thread each), queued;
-    #   * if  #tasks <  n_cpus  -> cores split evenly (n_cpus // #tasks each).
-    "use_cuda":   False,             # True (or --cuda) to use a GPU instead
-    "use_amp":    True,              # honoured only on CUDA
-    "n_cpus":     None,              # total cores to use; None -> os.cpu_count()
-    "n_workers":  1,                 # (GPU mode only) pool size for rf
-    "torch_threads": None,           # None -> os.cpu_count()
-    "gpu_mem_fraction": 0.85,        # cap to stay under 8 GB
-
-    # ----- io ---------------------------------------------------------
-    "cache_dir":  os.path.join(WORK, "cache"),
-    "output_dir": os.path.join(WORK, "results"),
-    "fig_dir":    os.path.join(WORK, "figures"),
-    "log_file":   os.path.join(WORK, "pipeline.log"),
-    "force_rebuild": False,
-    "save_predictions": True,
-}
-
-os.makedirs(CONFIG["cache_dir"], exist_ok=True)
-os.makedirs(CONFIG["output_dir"], exist_ok=True)
-os.makedirs(CONFIG["fig_dir"], exist_ok=True)
-
-
-def _configure_logging(level: int = logging.INFO) -> None:
-    root = logging.getLogger()
-    if any(isinstance(h, logging.FileHandler) for h in root.handlers):
+def _setup_log(data_dir=None, level=logging.DEBUG):
+    if log.handlers:
         return
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] [%(processName)s] %(message)s",
-        handlers=[logging.FileHandler(CONFIG["log_file"]), logging.StreamHandler()],
-    )
-
-
-_configure_logging()
-
-
-# ======================================================================
-# Section 1 - Reproducibility / device helpers
-# ======================================================================
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
+    log.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
+    log.addHandler(sh)
     try:
-        import torch
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        d = Path(data_dir) if data_dir else Path.cwd()
+        fh = logging.FileHandler(d / "iv_runner.log"); fh.setFormatter(fmt)
+        log.addHandler(fh)
     except Exception:
         pass
 
+def _hint(msg, suggestion):
+    log.error(msg)
+    log.error("SUGGESTION: " + suggestion)
+    raise RuntimeError(f"{msg} | {suggestion}")
 
-def resolve_device(config: dict):
-    import torch
-    if config.get("use_cuda", True) and torch.cuda.is_available():
-        return torch.device("cuda:0")
-    return torch.device("cpu")
-
-
-def configure_threads(config: dict, divisor: int = 1) -> None:
-    import torch
-    n = config.get("torch_threads") or (os.cpu_count() or 1)
-    n = max(1, int(n) // max(1, divisor))
-    try:
-        torch.set_num_threads(n)
-    except Exception:
-        pass
+N_CELLS, SHAPE = 180, (10, 18)
+ATM_CELLS = [0, 17]
 
 
-def _maybe_cap_gpu_memory(config: dict) -> None:
-    """Keep peak VRAM under the 8 GB budget on the Dell box."""
-    try:
-        import torch
-        if torch.cuda.is_available() and config.get("use_cuda", True):
-            frac = float(config.get("gpu_mem_fraction", 0.85))
-            torch.cuda.set_per_process_memory_fraction(frac, 0)
-    except Exception:
-        pass
-
-
-# ======================================================================
-# Section 2 - Data loading (robust to naming differences)
-# ======================================================================
-def _ci_lookup(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
-    """Case-insensitive: return the actual column matching any candidate."""
-    lower = {c.lower(): c for c in columns}
-    for cand in candidates:
-        if cand.lower() in lower:
-            return lower[cand.lower()]
+# ---------------------------- data -----------------------------------
+def _ci(cols, names):
+    low = {c.lower(): c for c in cols}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
     return None
 
 
-def list_data_files(config: dict) -> List[str]:
-    pat = os.path.join(config["data_dir"], config["file_glob"])
-    files = sorted(glob.glob(pat))
-    return files
-
-
-def _read_one(path: str) -> pd.DataFrame:
-    if path.endswith((".pickle", ".pkl")):
-        df = pd.read_pickle(path)
-    elif path.endswith(".parquet"):
-        df = pd.read_parquet(path)
-    elif path.endswith(".csv"):
-        df = pd.read_csv(path)
-    else:
-        raise ValueError(f"Unsupported file type: {path}")
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
-    return df
-
-
-def _cache_path_for(config: dict) -> str:
-    """Cache filename keyed to the data folder + file set, so switching data
-    (or adding files) auto-invalidates the cache instead of serving a stale
-    panel. `--force-rebuild` still overrides."""
-    import hashlib
-    files = list_data_files(config)
-    key = "|".join([os.path.abspath(config.get("data_dir", "."))] +
-                   [os.path.basename(f) for f in files])
-    h = hashlib.md5(key.encode()).hexdigest()[:10]
-    base = config["combined_cache"]
-    return base.replace(".parquet", f"_{h}.parquet")
-
-
-def load_raw_panel(config: dict = CONFIG) -> pd.DataFrame:
-    """
-    Load and concatenate all per-stock files into a single tidy panel.
-    Cached to parquet (falls back to pickle). Does NOT rename columns; the
-    data-check stage resolves the canonical names.
-    """
-    cache = _cache_path_for(config)
-    cache_pkl = cache.replace(".parquet", ".pkl")
-    if not config.get("force_rebuild", False):
-        if os.path.exists(cache):
-            try:
-                return pd.read_parquet(cache)
-            except Exception:
-                pass
-        if os.path.exists(cache_pkl):
-            return pd.read_pickle(cache_pkl)
-
-    files = list_data_files(config)
+def load_panel(data_dir=None, pattern="*_all_Count_w_fReturns.pickle"):
+    """Load all weekly per-stock pickles found in `data_dir`
+    (default: current working directory, then the directory of this file)."""
+    dirs = [Path(data_dir)] if data_dir else [Path.cwd(), Path(__file__).parent]
+    files = []
+    for d in dirs:
+        files = sorted(glob.glob(str(d / pattern)))
+        if files:
+            break
     if not files:
-        raise FileNotFoundError(
-            f"No files matched {os.path.join(config['data_dir'], config['file_glob'])}. "
-            f"Set CONFIG['data_dir'] / CONFIG['file_glob'] to your OptionMetrics files."
-        )
-    logging.info("Loading %d data file(s) ...", len(files))
-    frames = []
-    for f in files:
-        d = _read_one(f)
-        d["_src_file"] = os.path.basename(f)
-        frames.append(d)
-    panel = pd.concat(frames, axis=0, ignore_index=True)
-    logging.info("Combined panel: %d rows x %d cols", len(panel), panel.shape[1])
-
-    os.makedirs(os.path.dirname(cache), exist_ok=True)
-    try:
-        panel.to_parquet(cache)
-    except Exception as exc:
-        logging.warning("parquet unavailable (%s) -> pickle cache", exc)
-        panel.to_pickle(cache_pkl)
-    return panel
-
-
-# ======================================================================
-# Section 3 - DATA CHECK & SUMMARY  (run BEFORE any training)
-# ----------------------------------------------------------------------
-# Resolves canonical column names, locates the 180 surface cells, verifies
-# they reshape to 10x18, summarises coverage / missingness / target stats,
-# and writes a JSON + CSV + a few diagnostic figures. Designed to surface
-# any naming / formatting / shape mismatch loudly and early.
-# ======================================================================
-class Schema:
-    """Resolved column layout for the panel."""
-    def __init__(self):
-        self.id_col: str = ""
-        self.date_col: str = ""
-        self.trade_id_col: Optional[str] = None
-        self.mktcap_col: Optional[str] = None
-        self.surface_list_col: Optional[str] = None   # single list-valued column
-        self.surface_cols: List[str] = []             # OR 180 separate columns
-        self.target_cols: List[str] = []
-        self.surface_shape: Tuple[int, int] = (10, 18)
-
-    def to_dict(self) -> dict:
-        return {
-            "id_col": self.id_col, "date_col": self.date_col,
-            "trade_id_col": self.trade_id_col, "mktcap_col": self.mktcap_col,
-            "surface_list_col": self.surface_list_col,
-            "n_surface_cols": len(self.surface_cols),
-            "surface_cols_head": self.surface_cols[:6],
-            "surface_cols_tail": self.surface_cols[-3:],
-            "target_cols": self.target_cols,
-            "surface_shape": list(self.surface_shape),
-        }
-
-
-def _detect_surface_list_col(panel: pd.DataFrame, config: dict) -> Optional[str]:
-    """Find a single column whose cells are length-180 lists/arrays
-    (e.g. 'ImpliedVolatility'). Returns the column name or None."""
-    n_cells = int(np.prod(config["surface_shape"]))
-    # prefer a named candidate
-    cand = _ci_lookup(list(panel.columns), config.get("surface_list_candidates", []))
-    cols_to_try = ([cand] if cand else []) + [c for c in panel.columns if c != cand]
-    for c in cols_to_try:
-        if c is None:
-            continue
-        s = panel[c].dropna()
-        if len(s) == 0:
-            continue
-        v = s.iloc[0]
-        if isinstance(v, (list, tuple, np.ndarray)):
-            try:
-                if len(np.ravel(np.asarray(v, dtype=float))) == n_cells:
-                    return c
-            except Exception:
-                continue
-    return None
-
-
-def _detect_surface_cols(panel: pd.DataFrame, config: dict,
-                         reserved: Sequence[str]) -> List[str]:
-    """Locate the 180 IV-surface columns (when stored as separate columns)."""
-    n_cells = int(np.prod(config["surface_shape"]))
-    cols = list(panel.columns)
-
-    # 1) prefix-based detection
-    prefs = tuple(p.lower() for p in config["surface_prefix"])
-    pref_cols = [c for c in cols if str(c).lower().startswith(prefs)]
-    if len(pref_cols) == n_cells:
-        return pref_cols
-
-    # 2) numeric grid-like names, e.g. "0_0","d3_t11","(0,0)" -> sort stably
-    def _is_num(c):
-        return pd.api.types.is_numeric_dtype(panel[c])
-    numeric_cols = [c for c in cols if c not in reserved and _is_num(c)]
-    # drop obvious non-surface numerics (mktcap, ids accidentally numeric)
-    numeric_cols = [c for c in numeric_cols if c not in reserved]
-    if len(numeric_cols) == n_cells:
-        return numeric_cols
-    # 3) if MORE than n_cells numeric cols, take the densest contiguous block
-    if len(numeric_cols) > n_cells:
-        logging.warning("Found %d numeric non-id/target cols; expected %d surface "
-                        "cells. Taking the first %d. VERIFY column ordering!",
-                        len(numeric_cols), n_cells, n_cells)
-        return numeric_cols[:n_cells]
-    raise ValueError(
-        f"Could not locate {n_cells} surface columns "
-        f"(found {len(pref_cols)} by prefix, {len(numeric_cols)} numeric). "
-        f"Set CONFIG['surface_prefix'] or pre-name surface columns iv_000..iv_179."
-    )
-
-
-def resolve_schema(panel: pd.DataFrame, config: dict = CONFIG) -> Schema:
-    s = Schema()
-    s.surface_shape = tuple(config["surface_shape"])
-    cols = list(panel.columns)
-
-    s.id_col = _ci_lookup(cols, config["id_candidates"])
-    s.date_col = _ci_lookup(cols, config["date_candidates"])
-    s.trade_id_col = _ci_lookup(cols, config["trade_id_candidates"])
-    s.mktcap_col = _ci_lookup(cols, config["mktcap_candidates"])
-    if s.id_col is None:
-        raise ValueError(f"No id column found among {config['id_candidates']}. "
-                         f"Columns: {cols[:20]}...")
-    if s.date_col is None:
-        raise ValueError(f"No date column found among {config['date_candidates']}.")
-
-    # targets: keep whichever of the requested targets are present (ci)
-    s.target_cols = []
-    for t in config["targets"]:
-        actual = _ci_lookup(cols, [t])
-        if actual is not None:
-            s.target_cols.append(actual)
-    if not s.target_cols:
-        raise ValueError(f"None of the requested targets {config['targets']} found.")
-
-    # Surface: prefer a single length-180 list column ("ImpliedVolatility");
-    # otherwise fall back to 180 separate numeric columns.
-    s.surface_list_col = _detect_surface_list_col(panel, config)
-    if s.surface_list_col is None:
-        reserved = [c for c in [s.id_col, s.date_col, s.trade_id_col, s.mktcap_col,
-                                "_src_file"] if c]
-        reserved += s.target_cols
-        reserved += [c for c in cols
-                     if str(c).upper().startswith(("TRET", "RET_F", "FRET"))]
-        s.surface_cols = _detect_surface_cols(panel, config, reserved)
-    return s
-
-
-def extract_surface_matrix(panel: pd.DataFrame, schema: Schema) -> np.ndarray:
-    """Return the (N, 180) IV-surface matrix, whether the surface is stored as
-    one length-180 list column or as 180 separate columns. Row order matches
-    `panel`."""
-    n_cells = int(np.prod(schema.surface_shape))
-    if schema.surface_list_col is not None:
-        col = panel[schema.surface_list_col].values
-        out = np.full((len(col), n_cells), np.nan, dtype=np.float32)
-        for i, v in enumerate(col):
-            if v is None:
-                continue
-            a = np.ravel(np.asarray(v, dtype=np.float32))
-            if a.size == n_cells:
-                out[i] = a
-        return out
-    return panel[schema.surface_cols].to_numpy(dtype=np.float32)
-
-
-def apply_stock_subset(panel: pd.DataFrame, schema: Schema, config: dict) -> pd.DataFrame:
-    """Keep the first `max_stocks` perm_IDs (sorted) that ALSO have enough data
-    in the OOS window, so the testing slice isn't polluted by stocks that are
-    absent during the test period."""
-    n = config.get("max_stocks")
-    if not n:
-        return panel
-    d = pd.to_datetime(panel[schema.date_col])
-    oos_lo = pd.Timestamp(config["oos_start"])
-    oos_hi = pd.Timestamp(config["oos_end"])
-    in_oos = (d >= oos_lo) & (d < oos_hi)
-    min_obs = int(config.get("subset_min_oos_obs", 1))
-    oos_counts = panel.loc[in_oos, schema.id_col].value_counts()
-    eligible = sorted(oos_counts[oos_counts >= min_obs].index.tolist())
-    n_total = panel[schema.id_col].nunique()
-    if not eligible:
-        logging.warning("No stocks have >= %d OOS obs; falling back to first %d ids.",
-                        min_obs, int(n))
-        eligible = sorted(panel[schema.id_col].dropna().unique())
-    keep = eligible[: int(n)]
-    sub = panel[panel[schema.id_col].isin(keep)].copy()
-    logging.info("Stock subset: first %d of %d perm_IDs with >=%d OOS obs "
-                 "-> %d kept, %d rows (of %d total stocks)",
-                 int(n), len(eligible), min_obs, len(keep), len(sub), n_total)
-    return sub
-
-
-def apply_surface_norm(S: np.ndarray, month_codes: np.ndarray,
-                       config: dict) -> np.ndarray:
-    """Standardise the (N,180) surface per the `surface_norm` policy. All modes
-    are leak-free (per-DATE transforms use only that date's cross-section; the
-    per-cell train z-score is applied later by PixelScaler)."""
-    mode = config.get("surface_norm", "pixel_zscore")
-    if mode in ("none", "pixel_zscore"):
-        return S                                   # PixelScaler does train z-score
-    if mode.startswith("log"):
-        S = np.log(np.clip(S, 1e-6, None)).astype(np.float32)
-        if mode == "log_pixel":
-            return S
-    if mode in ("xs_zscore", "log_xs"):
-        min_n = int(config.get("xs_min_stocks", 5))
-        df = pd.DataFrame(S)
-        df["_m"] = month_codes
-
-        def _z(block):
-            if len(block) < min_n:
-                return block
-            mu = block.mean(axis=0)
-            sd = block.std(axis=0).replace(0.0, 1.0)
-            return (block - mu) / sd
-        S = (df.groupby("_m", group_keys=False)
-             .apply(lambda g: _z(g.drop(columns="_m")))
-             .to_numpy(dtype=np.float32))
-    return S
-
-
-def resample_to_monthly(panel: pd.DataFrame, schema: Schema) -> pd.DataFrame:
-    """Collapse to ONE observation per (stock, calendar-month): the last
-    available date in that month (month-end IV, per the paper). The date is
-    then snapped to the month-end timestamp so all stocks in a month align."""
-    df = panel.copy()
-    df[schema.date_col] = pd.to_datetime(df[schema.date_col])
-    df["_m"] = df[schema.date_col].dt.to_period("M")
-    # keep the row with the latest date in each (stock, month)
-    idx = df.groupby([schema.id_col, "_m"])[schema.date_col].idxmax()
-    last = df.loc[idx].copy()
-    last[schema.date_col] = last["_m"].dt.to_timestamp("M")   # snap to month-end
-    last = (last.drop(columns=["_m"])
-            .sort_values([schema.date_col, schema.id_col])
-            .reset_index(drop=True))
-    return last
-
-
-def data_check(config: dict = CONFIG) -> Tuple[pd.DataFrame, Schema, dict]:
-    """
-    Full data-check + summary. Returns (panel, schema, summary_dict) and writes
-    a JSON report, a per-target stats CSV, and diagnostic figures.
-    """
-    panel = load_raw_panel(config)
-    schema = resolve_schema(panel, config)
-
-    # --- normalise date & sort -------------------------------------
-    panel[schema.date_col] = pd.to_datetime(panel[schema.date_col])
-    panel = panel.sort_values([schema.date_col, schema.id_col]).reset_index(drop=True)
-
-    # --- optional testing subset (first N perm_IDs) ----------------
-    n_dates_raw = int(panel[schema.date_col].nunique())
-    panel = apply_stock_subset(panel, schema, config)
-
-    # --- monthly resample (optional; default OFF so training keeps all obs) --
-    resampled = bool(config.get("resample_monthly", False))
-    if resampled:
-        before = len(panel)
-        panel = resample_to_monthly(panel, schema)
-        logging.info("Monthly resample (training): %d -> %d rows (%d unique dates "
-                     "-> %d months)", before, len(panel), n_dates_raw,
-                     panel[schema.date_col].dt.to_period("M").nunique())
-    else:
-        logging.info("No training resample: keeping all %d obs (~%.1f per "
-                     "stock-month); portfolio still aggregates to month-end.",
-                     len(panel),
-                     len(panel) / max(1, panel[schema.id_col].nunique()
-                                      * panel[schema.date_col].dt.to_period("M").nunique()))
-
-    n_cells = int(np.prod(schema.surface_shape))
-    surf = extract_surface_matrix(panel, schema).astype(np.float64)
-    found = (1 if schema.surface_list_col else len(schema.surface_cols))
-    reshape_ok = (surf.shape[1] == n_cells)
-
-    summary = {
-        "schema": schema.to_dict(),
-        "surface_storage": ("list_column:" + schema.surface_list_col
-                            if schema.surface_list_col else "separate_columns"),
-        "n_rows": int(len(panel)),
-        "n_stocks": int(panel[schema.id_col].nunique()),
-        "date_min": str(panel[schema.date_col].min().date()),
-        "date_max": str(panel[schema.date_col].max().date()),
-        "n_months": int(panel[schema.date_col].dt.to_period("M").nunique()),
-        "n_unique_dates": int(panel[schema.date_col].nunique()),
-        "resampled_for_training": resampled,
-        "surface_norm": config.get("surface_norm"),
-        "maturity_grid": config.get("maturity_grid"),
-        "surface_cells_expected": n_cells,
-        "surface_cells_found": int(surf.shape[1]),
-        "surface_reshape_ok": bool(reshape_ok),
-        "surface_nan_frac": float(np.isnan(surf).mean()),
-        "surface_neg_frac": float((surf < 0).mean()),   # IV should be >= 0
-        "duplicate_id_date": int(panel.duplicated(
-            [schema.id_col, schema.date_col]).sum()),
-        "avg_stocks_per_month": float(
-            panel.groupby(panel[schema.date_col].dt.to_period("M"))[schema.id_col]
-            .nunique().mean()),
-    }
-
-    # --- per-target stats ------------------------------------------
-    tgt_rows = []
-    for t in schema.target_cols:
-        v = pd.to_numeric(panel[t], errors="coerce")
-        tgt_rows.append({
-            "target": t,
-            "n_obs": int(v.notna().sum()),
-            "nan_frac": float(v.isna().mean()),
-            "mean": float(v.mean()), "std": float(v.std()),
-            "min": float(v.min()), "p1": float(v.quantile(0.01)),
-            "p50": float(v.median()), "p99": float(v.quantile(0.99)),
-            "max": float(v.max()),
-        })
-    tgt_df = pd.DataFrame(tgt_rows)
-    summary["targets"] = tgt_rows
-
-    # --- write reports ---------------------------------------------
-    with open(os.path.join(config["output_dir"], "data_check.json"), "w") as fh:
-        json.dump(summary, fh, indent=2, default=str)
-    tgt_df.to_csv(os.path.join(config["output_dir"], "target_stats.csv"), index=False)
-
-    # --- figures ---------------------------------------------------
-    try:
-        _data_check_figures(panel, schema, config)
-    except Exception as exc:
-        logging.warning("data-check figures skipped: %s", exc)
-
-    # --- loud console banner ---------------------------------------
-    _print_data_check(summary, schema)
-    return panel, schema, summary
-
-
-def _data_check_figures(panel: pd.DataFrame, schema: Schema, config: dict) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    # (a) stocks per month
-    counts = (panel.groupby(panel[schema.date_col].dt.to_period("M"))
-              [schema.id_col].nunique())
-    fig, ax = plt.subplots(figsize=(9, 3.2))
-    ax.plot(counts.index.to_timestamp(), counts.values, lw=1.2)
-    ax.set_title("Stocks with IV-surface + return data per month")
-    ax.set_ylabel("# firms"); ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(config["fig_dir"], "coverage_stocks_per_month.png"), dpi=130)
-    plt.close(fig)
-
-    # (b) mean IV surface (sanity that the (maturity x delta)=10x18 reshape works)
-    surf = extract_surface_matrix(panel, schema).astype(np.float64)
-    mean_img = np.nanmean(surf, axis=0).reshape(schema.surface_shape)
-    fig, ax = plt.subplots(figsize=(6, 3.6))
-    im = ax.imshow(mean_img, aspect="auto", cmap="viridis")
-    ax.set_title(f"Mean IV surface (reshaped {schema.surface_shape}: maturity x delta)")
-    ax.set_xlabel("delta bucket (18)")
-    ax.set_ylabel("maturity (10)")
-    mg = config.get("maturity_grid")
-    if mg and len(mg) == schema.surface_shape[0]:
-        ax.set_yticks(range(len(mg))); ax.set_yticklabels(mg, fontsize=7)
-    fig.colorbar(im, ax=ax, fraction=0.046)
-    fig.tight_layout()
-    fig.savefig(os.path.join(config["fig_dir"], "mean_iv_surface.png"), dpi=130)
-    plt.close(fig)
-
-
-def _print_data_check(summary: dict, schema: Schema) -> None:
-    line = "=" * 78
-    print("\n" + line)
-    print("  DATA CHECK & SUMMARY")
-    print(line)
-    print(f"  id column        : {schema.id_col}")
-    print(f"  date column      : {schema.date_col}")
-    print(f"  trade_id column  : {schema.trade_id_col}")
-    print(f"  mktcap column    : {schema.mktcap_col}")
-    print(f"  surface storage  : {summary.get('surface_storage')}")
-    print(f"  surface cells    : {summary['surface_cells_found']} "
-          f"(expected {summary['surface_cells_expected']}) "
-          f"-> reshape_ok={summary['surface_reshape_ok']}  shape="
-          f"{tuple(schema.surface_shape)} (maturity x delta)")
-    print(f"  maturity grid    : {summary.get('maturity_grid')}")
-    print(f"  surface norm     : {summary.get('surface_norm')}")
-    print(f"  targets found    : {schema.target_cols}")
-    print(f"  rows / stocks    : {summary['n_rows']:,} / {summary['n_stocks']:,}")
-    print(f"  unique dates     : {summary.get('n_unique_dates')} over "
-          f"{summary['n_months']} months  | resampled_for_training="
-          f"{summary.get('resampled_for_training')}")
-    print(f"  date range       : {summary['date_min']} .. {summary['date_max']}")
-    print(f"  avg stocks/month : {summary['avg_stocks_per_month']:.0f}")
-    print(f"  surface NaN frac : {summary['surface_nan_frac']:.4f}   "
-          f"neg frac : {summary['surface_neg_frac']:.4f}")
-    print(f"  dup (id,date)    : {summary['duplicate_id_date']}")
-    if summary["duplicate_id_date"] > 0:
-        print("  !! WARNING: duplicate (id,date) rows detected.")
-    if not summary["surface_reshape_ok"]:
-        print("  !! WARNING: surface columns do not match 10x18 - FIX BEFORE TRAINING.")
-    if summary["surface_nan_frac"] > 0.05:
-        print("  !! WARNING: >5% of surface cells are NaN.")
-    print(line + "\n")
-
-
-# ======================================================================
-# Section 4 - Surface tensors + leak-free panel assembly
-# ======================================================================
-def assemble_panel(panel: pd.DataFrame, schema: Schema, target: str,
-                   config: dict) -> dict:
-    """
-    Build the model-ready arrays for ONE target with no look-ahead:
-      X     : (N, 1, n_maturity, n_delta) = (N,1,10,18) IV-surface images
-      y     : (N,) forward return (already realised at feature_date + horizon)
-      dates : (N,) FEATURE date (month-end t at which the surface is observed)
-      ids   : (N,) stock id
-    Rows with NaN target are dropped. Surface NaNs are imputed by the
-    per-cell cross-sectional median WITHIN each month (causal: uses only that
-    month's cross-section, never future data).
-    """
-    shape = schema.surface_shape
-    n_cells = int(np.prod(shape))
-
-    # extract the (N,180) surface for the WHOLE (already monthly) panel, then
-    # drop rows with a missing target.
-    S_all = extract_surface_matrix(panel, schema)            # (N,180) float32
-    keep = pd.to_numeric(panel[target], errors="coerce").notna().to_numpy()
-    S = S_all[keep]
-    sub = panel.loc[keep, [schema.id_col, schema.date_col, target]].reset_index(drop=True)
-
-    dcodes = pd.to_datetime(sub[schema.date_col]).dt.to_period("M").astype(str).values
-    # causal NaN imputation: fill each surface cell with that month's median
-    if np.isnan(S).any():
-        tmp = pd.DataFrame(S)
-        tmp["_m"] = dcodes
-        med = tmp.groupby("_m").transform(lambda c: c.fillna(c.median()))
-        S = np.nan_to_num(med.to_numpy(dtype=np.float32), nan=0.0)
-
-    # leak-free surface standardisation (per the surface_norm policy)
-    S = apply_surface_norm(S, dcodes, config)
-
-    X = S.reshape(-1, 1, shape[0], shape[1]).astype(np.float32)
-    y = pd.to_numeric(sub[target], errors="coerce").to_numpy(dtype=np.float32)
-    dates = pd.DatetimeIndex(pd.to_datetime(sub[schema.date_col]).values)
-    ids = sub[schema.id_col].to_numpy()
-
-    mktcap = None
-    if schema.mktcap_col is not None:
-        mktcap = pd.to_numeric(panel.loc[keep, schema.mktcap_col],
-                               errors="coerce").to_numpy(dtype=np.float64)
-    return {"X": X, "y": y, "dates": dates, "ids": ids, "mktcap": mktcap,
-            "n_features": n_cells, "surface_shape": shape}
-
-
-def month_end_index(dates: pd.DatetimeIndex) -> pd.PeriodIndex:
-    return dates.to_period("M")
-
-
-def make_window_splits(dates: pd.DatetimeIndex, config: dict) -> List[dict]:
-    """
-    Produce a list of {train_mask, test_mask, test_period} dicts implementing
-    the chosen window scheme. The split is BY FEATURE month; the embargo
-    removes the last `embargo_months` of training so no training target's
-    holding window (length = horizon) overlaps the first OOS feature month.
-
-      * expanding : OOS month m trained on [start .. m-1-embargo]. If
-                    `max_train_years` is set, the lookback is CAPPED to that many
-                    years (a "capped expanding" window: expands until it reaches
-                    the cap, then rolls forward keeping at most `max_train_years`).
-      * rolling   : OOS month m trained on [m-roll_years .. m-1-embargo].
-      * single    : one cut at oos_start (everything >= oos_start is test).
-    """
-    periods = month_end_index(dates)
-    uniq = pd.PeriodIndex(sorted(periods.unique()))
-    oos_start = pd.Period(pd.Timestamp(config["oos_start"]), "M")
-    oos_end = pd.Period(pd.Timestamp(config["oos_end"]), "M")
-    emb = int(config["embargo_months"])
-    splits: List[dict] = []
-
-    oos_months = [p for p in uniq if (p >= oos_start and p < oos_end)]
-
-    if config["window_scheme"] == "single":
-        train_cut = oos_start - emb
-        tr = np.asarray(periods < train_cut)
-        te = np.asarray((periods >= oos_start) & (periods < oos_end))
-        splits.append({"train_mask": tr, "test_mask": te,
-                       "test_period": "ALL"})
-        return splits
-
-    roll = int(config["roll_years"]) * 12
-    cap = config.get("max_train_years")
-    cap_months = int(cap) * 12 if cap else None     # optional expanding cap
-    for m in oos_months:
-        train_hi = m - emb            # exclusive upper bound on train feature month
-        if config["window_scheme"] == "rolling":
-            tr = (periods >= (m - roll)) & (periods < train_hi)
-        else:  # expanding (optionally capped to a max trailing lookback)
-            if cap_months is not None:
-                tr = (periods >= (m - cap_months)) & (periods < train_hi)
-            else:
-                tr = periods < train_hi
-        tr = np.asarray(tr)
-        te = np.asarray(periods == m)
-        if tr.sum() == 0 or te.sum() == 0:
-            continue
-        splits.append({"train_mask": tr, "test_mask": te,
-                       "test_period": str(m)})
-    return splits
-
-
-# ======================================================================
-# Section 5 - Standardisers (fit on TRAIN only -> no leakage)
-# ======================================================================
-class PixelScaler:
-    """Per-pixel standardisation of (N,1,H,W) surfaces using train stats."""
-    def fit(self, X: np.ndarray):
-        self.mu_ = X.mean(axis=0, keepdims=True)
-        self.sd_ = X.std(axis=0, keepdims=True)
-        self.sd_[self.sd_ < EPS] = 1.0
-        return self
-
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        return ((X - self.mu_) / self.sd_).astype(np.float32)
-
-
-class TargetScaler:
-    def fit(self, y: np.ndarray):
-        self.mu_ = float(np.mean(y))
-        self.sd_ = float(np.std(y))
-        if self.sd_ < EPS:
-            self.sd_ = 1.0
-        return self
-
-    def transform(self, y: np.ndarray) -> np.ndarray:
-        return ((y - self.mu_) / self.sd_).astype(np.float32)
-
-    def inverse(self, y: np.ndarray) -> np.ndarray:
-        return (np.asarray(y) * self.sd_ + self.mu_).astype(np.float32)
-
-
-# ======================================================================
-# Section 6 - Torch model zoo
-# ----------------------------------------------------------------------
-# All models map an IV-surface image (B,1,H,W) -> scalar prediction.
-# Sequence models read the image as a length-H sequence of W-dim vectors
-# (delta dimension = "time", maturity dimension = features), unless a CNN
-# front-end produces the sequence (hybrids).
-# ======================================================================
-def _build_torch_modules():
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    def xavier_init(m):
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.Conv1d)):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    # ---------------- deepmlp (NAME KEPT AS "deepmlp") ----------------
-    class DeepMLPRegressor(nn.Module):
-        def __init__(self, in_shape, cfg):
+        _hint(f"no files matching {pattern} in {dirs}",
+              "put the pickle files in the same folder as the notebook, or pass "
+              "data_dir='...'; if the filenames differ, pass pattern='*.pickle'")
+    df = pd.concat([pd.read_pickle(f) for f in files], ignore_index=True)
+    idc = _ci(df.columns, ["perm_ID", "perm_id", "permno", "permID"])
+    dtc = _ci(df.columns, ["date", "Date", "DATE"])
+    ivc = _ci(df.columns, ["ImpliedVolatility", "implied_volatility", "iv_surface"])
+    if not (idc and dtc and ivc):
+        _hint(f"required columns not found; have {list(df.columns)[:15]}",
+              "need an id column (perm_ID/permno), a date column, and a length-180 "
+              "surface column (ImpliedVolatility); rename columns or extend the "
+              "candidate lists in load_panel()")
+    df = df.rename(columns={idc: "perm_ID", dtc: "date", ivc: "ImpliedVolatility"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = (df.dropna(subset=["ImpliedVolatility"])
+            .drop_duplicates(["perm_ID", "date"])
+            .sort_values(["perm_ID", "date"]).reset_index(drop=True))
+    S = np.full((len(df), N_CELLS), np.nan, np.float32)
+    for i, v in enumerate(df["ImpliedVolatility"].values):
+        a = np.ravel(np.asarray(v, dtype=np.float32))
+        if a.size == N_CELLS:
+            S[i] = a
+    ok = np.isfinite(S).all(1)
+    n_bad = int((~ok).sum())
+    if n_bad:
+        log.warning("dropped %d rows with malformed/NaN surfaces (%.1f%%)",
+                    n_bad, 100 * n_bad / len(ok))
+        if n_bad > 0.2 * len(ok):
+            log.warning("SUGGESTION: >20%% bad surfaces - check that the surface "
+                        "column holds length-180 numeric arrays")
+    df, S = df[ok].reset_index(drop=True), S[ok]
+    if len(df) == 0:
+        _hint("no valid rows after surface cleaning",
+              "verify the surface column contains 180 finite values per row")
+    df["_m"] = df["date"].dt.to_period("M")
+    last = df.groupby(["perm_ID", "_m"])["date"].transform("max")
+    df["is_me"] = (df["date"] == last)          # last available day of month
+    print(f"loaded {len(files)} files -> {len(df):,} rows, "
+          f"{df['perm_ID'].nunique()} stocks, "
+          f"{df['date'].min().date()}..{df['date'].max().date()}")
+    return df, S
+
+
+# ---------------------------- model ----------------------------------
+def train_cnn_dm_tanh(Xtr, ytr, seeds=3, epochs=25, patience=3,
+                      winsorize=True, lr=1e-3, batch=1024, device=None):
+    """Train the CNN ensemble (per-image demeaning + tanh-bounded output).
+    Returns a predictor: predict(Xte) -> predictions in target units."""
+    import torch, torch.nn as nn, torch.nn.functional as F
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if winsorize:
+        lo, hi = np.quantile(ytr, [0.01, 0.99])
+        ytr = np.clip(ytr, lo, hi).astype(np.float32)
+    dm = lambda A: A - A.mean(1, keepdims=True)         # per-image demean
+    Xtr = dm(Xtr)
+    mu, sd = Xtr.mean(0), Xtr.std(0); sd[sd < 1e-8] = 1
+    Xtr = (Xtr - mu) / sd
+    ymu, ysd = float(ytr.mean()), float(ytr.std() + 1e-8)
+    ys_all = (ytr - ymu) / ysd
+    cap = float(np.quantile(np.abs(ys_all), 0.99))
+    nval = max(50, int(0.15 * len(Xtr)))
+    t = lambda A: torch.from_numpy(np.ascontiguousarray(A)).view(-1, 1, *SHAPE).to(dev)
+    Xs_t, Xv_t = t(Xtr[:-nval]), t(Xtr[-nval:])
+    ys_t = torch.from_numpy(ys_all[:-nval]).to(dev)
+    yv_t = torch.from_numpy(ys_all[-nval:]).to(dev)
+
+    class CNN4(nn.Module):
+        def __init__(s):
             super().__init__()
-            in_dim = int(np.prod(in_shape))
-            hs = cfg["deepmlp_hidden"]
-            layers, d = [], in_dim
-            for h in hs:
-                layers += [nn.Linear(d, h), nn.ReLU(),
-                           nn.Dropout(cfg["deepmlp_dropout"])]
-                d = h
-            self.body = nn.Sequential(*layers)
-            self.head = nn.Linear(d, 1)
-            self.apply(xavier_init)
+            L, c = [], 1
+            for f in (16, 32, 64, 128):
+                L += [nn.Conv2d(c, f, 3, padding=1),
+                      nn.MaxPool2d(2, ceil_mode=True),
+                      nn.BatchNorm2d(f), nn.ReLU()]
+                c = f
+            s.net = nn.Sequential(*L)
+            s.gap = nn.AdaptiveAvgPool2d(1)
+            s.head = nn.Linear(c, 1)
+        def forward(s, x):
+            return s.head(s.gap(s.net(x)).flatten(1)).squeeze(-1)
 
-        def forward(self, x):
-            x = x.flatten(1)
-            return self.head(self.body(x)).squeeze(-1)
-
-    # ---------------- generic 2D CNN ----------------------------------
-    class CNNRegressor(nn.Module):
-        def __init__(self, in_shape, cfg):
-            super().__init__()
-            chs = cfg["cnn_filters"]
-            layers, c_in = [], in_shape[0]
-            for c in chs:
-                layers += [nn.Conv2d(c_in, c, 3, padding=1),
-                           nn.BatchNorm2d(c), nn.ReLU(),
-                           nn.MaxPool2d(2, ceil_mode=True),
-                           nn.Dropout(cfg["cnn_dropout"])]
-                c_in = c
-            self.net = nn.Sequential(*layers)
-            self.gap = nn.AdaptiveAvgPool2d(1)
-            self.head = nn.Linear(c_in, 1)
-            self.apply(xavier_init)
-
-        def forward(self, x):
-            x = self.net(x)
-            x = self.gap(x).flatten(1)
-            return self.head(x).squeeze(-1)
-
-    # ---------------- paper CNN1 / CNN4 / CNN5 ------------------------
-    class PaperCNN(nn.Module):
-        """i conv blocks: 3x3 conv -> 2x2 maxpool -> BatchNorm -> ReLU,
-        filters 16/32/64/128, then global-average-pool + single linear node.
-        Matches Kelly et al. (2026) Fig. 3/4."""
-        def __init__(self, in_shape, cfg, depth):
-            super().__init__()
-            filters = list(cfg["paper_filters"])
-            # CNN1 uses 1 block (16); CNN4 uses 16/32/64/128; CNN5 repeats last.
-            if depth <= len(filters):
-                fs = filters[:depth]
-            else:
-                fs = filters + [filters[-1]] * (depth - len(filters))
-            blocks, c_in = [], in_shape[0]
-            for c in fs:
-                blocks += [nn.Conv2d(c_in, c, 3, padding=1),
-                           nn.MaxPool2d(2, ceil_mode=True),
-                           nn.BatchNorm2d(c), nn.ReLU()]
-                c_in = c
-            self.net = nn.Sequential(*blocks)
-            self.gap = nn.AdaptiveAvgPool2d(1)
-            self.head = nn.Linear(c_in, 1)
-            self.apply(xavier_init)
-
-        def forward(self, x):
-            x = self.net(x)
-            x = self.gap(x).flatten(1)
-            return self.head(x).squeeze(-1)
-
-    def _seq_from_surface(x, reverse):
-        """(B,1,maturity,delta) -> (B, maturity, delta) sequence. If reverse,
-        order long->short maturity so the SHORTEST maturity is the LAST step."""
-        seq = x.squeeze(1)              # (B, n_maturity, n_delta)
-        if reverse:
-            seq = torch.flip(seq, dims=[1])
-        return seq
-
-    # ---------------- LSTM (sequence over the MATURITY axis) ----------
-    class LSTMRegressor(nn.Module):
-        def __init__(self, in_shape, cfg):
-            super().__init__()
-            _, H, W = in_shape         # H = maturity steps, W = delta features
-            self.rev = bool(cfg.get("seq_reverse_maturity", True))
-            self.lstm = nn.LSTM(W, cfg["lstm_hidden"], cfg["lstm_layers"],
-                                batch_first=True,
-                                dropout=cfg["lstm_dropout"] if cfg["lstm_layers"] > 1 else 0.0)
-            self.head = nn.Linear(cfg["lstm_hidden"], 1)
-            self.apply(xavier_init)
-
-        def forward(self, x):
-            seq = _seq_from_surface(x, self.rev)   # short maturity = last step
-            out, _ = self.lstm(seq)
-            return self.head(out[:, -1, :]).squeeze(-1)
-
-    # ---------------- Autoformer pieces -------------------------------
-    class SeriesDecomp(nn.Module):
-        """Moving-average trend/seasonal decomposition (Wu et al. 2021)."""
-        def __init__(self, kernel):
-            super().__init__()
-            self.kernel = kernel
-            self.avg = nn.AvgPool1d(kernel, stride=1, padding=0)
-
-        def forward(self, x):                     # x: (B,L,D)
-            pad = (self.kernel - 1) // 2
-            front = x[:, :1, :].repeat(1, pad, 1)
-            end = x[:, -1:, :].repeat(1, self.kernel - 1 - pad, 1)
-            xp = torch.cat([front, x, end], dim=1)
-            trend = self.avg(xp.transpose(1, 2)).transpose(1, 2)
-            return x - trend, trend               # seasonal, trend
-
-    class AutoCorrelation(nn.Module):
-        """Simplified auto-correlation attention (FFT-based time-delay agg)."""
-        def __init__(self, d_model, n_heads, dropout=0.1, factor=1):
-            super().__init__()
-            self.h = n_heads
-            self.dk = d_model // n_heads
-            self.factor = factor
-            self.q = nn.Linear(d_model, d_model)
-            self.k = nn.Linear(d_model, d_model)
-            self.v = nn.Linear(d_model, d_model)
-            self.out = nn.Linear(d_model, d_model)
-            self.drop = nn.Dropout(dropout)
-
-        def forward(self, x):
-            B, L, _ = x.shape
-            q = self.q(x).view(B, L, self.h, self.dk)
-            k = self.k(x).view(B, L, self.h, self.dk)
-            v = self.v(x).view(B, L, self.h, self.dk)
-            # auto-correlation via FFT along time
-            qf = torch.fft.rfft(q.permute(0, 2, 3, 1).contiguous(), dim=-1)
-            kf = torch.fft.rfft(k.permute(0, 2, 3, 1).contiguous(), dim=-1)
-            corr = torch.fft.irfft(qf * torch.conj(kf), n=L, dim=-1)  # (B,h,dk,L)
-            corr = corr.mean(dim=2)                                   # (B,h,L) lag weights
-            top = max(1, int(self.factor * math.log(max(L, 2))))
-            w, idx = torch.topk(corr, top, dim=-1)                    # (B,h,top)
-            w = torch.softmax(w, dim=-1)
-            vp = v.permute(0, 2, 3, 1)                                # (B,h,dk,L)
-            agg = torch.zeros_like(vp)
-            ar = torch.arange(L, device=x.device).view(1, 1, 1, L)
-            for i in range(top):
-                shift = idx[:, :, i]                                  # (B,h)
-                # vectorised time-delay roll per (B,h) via gather
-                sh = shift.view(B, self.h, 1, 1)
-                gidx = ((ar - sh) % L).expand(B, self.h, self.dk, L)
-                rolled = torch.gather(vp, -1, gidx)
-                agg = agg + rolled * w[:, :, i].view(B, self.h, 1, 1)
-            agg = agg.permute(0, 3, 1, 2).contiguous().view(B, L, -1)
-            return self.drop(self.out(agg))
-
-    class AutoformerEncoderLayer(nn.Module):
-        def __init__(self, d_model, n_heads, d_ff, kernel, dropout):
-            super().__init__()
-            self.attn = AutoCorrelation(d_model, n_heads, dropout)
-            self.decomp1 = SeriesDecomp(kernel)
-            self.decomp2 = SeriesDecomp(kernel)
-            self.conv1 = nn.Conv1d(d_model, d_ff, 1)
-            self.conv2 = nn.Conv1d(d_ff, d_model, 1)
-            self.drop = nn.Dropout(dropout)
-            self.act = nn.GELU()
-
-        def forward(self, x):
-            x = x + self.drop(self.attn(x))
-            x, _ = self.decomp1(x)
-            y = self.drop(self.act(self.conv1(x.transpose(1, 2))))
-            y = self.drop(self.conv2(y).transpose(1, 2))
-            x, _ = self.decomp2(x + y)
-            return x
-
-    class AutoformerRegressor(nn.Module):
-        def __init__(self, in_shape, cfg, seq_dim=None):
-            super().__init__()
-            _, H, W = in_shape
-            in_dim = seq_dim if seq_dim is not None else W
-            self.rev = bool(cfg.get("seq_reverse_maturity", True))
-            d = cfg["af_d_model"]
-            self.embed = nn.Linear(in_dim, d)
-            k = cfg["af_moving_avg"] | 1   # force odd
-            self.layers = nn.ModuleList([
-                AutoformerEncoderLayer(d, cfg["af_heads"], cfg["af_ff"], k,
-                                       cfg["af_dropout"])
-                for _ in range(cfg["af_layers"])])
-            self.norm = nn.LayerNorm(d)
-            self.head = nn.Linear(d, 1)
-            self.apply(xavier_init)
-
-        def _forward_seq(self, seq):     # seq already correctly ordered
-            x = self.embed(seq)
-            for lyr in self.layers:
-                x = lyr(x)
-            return self.head(self.norm(x).mean(dim=1)).squeeze(-1)
-
-        def forward(self, x):
-            return self._forward_seq(_seq_from_surface(x, self.rev))
-
-    # ---------------- Echo State Network ------------------------------
-    class ESNRegressor(nn.Module):
-        """Reservoir computing: fixed random recurrent reservoir, trainable
-        linear readout (trained by SGD inside the unified loop)."""
-        def __init__(self, in_shape, cfg, seq_dim=None):
-            super().__init__()
-            _, H, W = in_shape
-            in_dim = seq_dim if seq_dim is not None else W
-            self.rev = bool(cfg.get("seq_reverse_maturity", True))
-            n = cfg["esn_reservoir"]
-            self.leak = cfg["esn_leak"]
-            self.n = n
-            g = torch.Generator().manual_seed(cfg.get("seed", 42))
-            Win = (torch.rand(n, in_dim, generator=g) - 0.5) * 2.0
-            W = torch.rand(n, n, generator=g) - 0.5
-            mask = (torch.rand(n, n, generator=g) < cfg["esn_sparsity"]).float()
-            W = W * mask
-            # scale to desired spectral radius
+    nets = []
+    idx = torch.arange(len(Xs_t))
+    for k in range(seeds):
+        torch.manual_seed(42 + k)
+        net = CNN4().to(dev)
+        opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-5)
+        best, bst, wait = 1e18, None, 0
+        for _ in range(epochs):
+            net.train()
+            perm = idx[torch.randperm(len(idx))]
+            for s0 in range(0, len(perm), batch):
+                b = perm[s0:s0 + batch]
+                if len(b) < 2:
+                    continue
+                opt.zero_grad()
+                o = torch.tanh(net(Xs_t[b])) * cap
+                F.mse_loss(o, ys_t[b]).backward()
+                opt.step()
+            net.eval()
             with torch.no_grad():
-                ev = torch.linalg.eigvals(W).abs().max().item()
-                if ev > 0:
-                    W = W * (cfg["esn_spectral_radius"] / ev)
-            self.register_buffer("Win", Win)
-            self.register_buffer("Wres", W)
-            self.readout = nn.Linear(n, 1)
-            nn.init.xavier_uniform_(self.readout.weight); nn.init.zeros_(self.readout.bias)
-
-        def _run(self, seq):                         # seq already ordered
-            B, L, _ = seq.shape
-            h = torch.zeros(B, self.n, device=seq.device)
-            for t in range(L):
-                pre = seq[:, t, :] @ self.Win.t() + h @ self.Wres.t()
-                h = (1 - self.leak) * h + self.leak * torch.tanh(pre)
-            return self.readout(h).squeeze(-1)
-
-        def forward(self, x):
-            return self._run(_seq_from_surface(x, self.rev))
-
-    # ---------------- CNN front-end for hybrids -----------------------
-    class CNNFront(nn.Module):
-        """Conv2d feature extractor producing a (B, maturity, C) sequence for
-        the temporal heads (collapsing the delta axis by mean). Reverses the
-        maturity order so the shortest maturity is the last step."""
-        def __init__(self, in_shape, cfg):
-            super().__init__()
-            self.rev = bool(cfg.get("seq_reverse_maturity", True))
-            chs = cfg["cnn_filters"]
-            layers, c_in = [], in_shape[0]
-            for c in chs:
-                layers += [nn.Conv2d(c_in, c, 3, padding=1),
-                           nn.BatchNorm2d(c), nn.ReLU()]
-                c_in = c
-            self.net = nn.Sequential(*layers)
-            self.out_ch = c_in
-
-        def forward(self, x):
-            f = self.net(x)                          # (B,C,maturity,delta)
-            seq = f.mean(dim=3).transpose(1, 2)      # (B, maturity, C)
-            if self.rev:
-                seq = torch.flip(seq, dims=[1])      # short maturity = last step
-            return seq
-
-    class CNNLSTM(nn.Module):
-        def __init__(self, in_shape, cfg):
-            super().__init__()
-            self.front = CNNFront(in_shape, cfg)
-            self.lstm = nn.LSTM(self.front.out_ch, cfg["lstm_hidden"],
-                                cfg["lstm_layers"], batch_first=True,
-                                dropout=cfg["lstm_dropout"] if cfg["lstm_layers"] > 1 else 0.0)
-            self.head = nn.Linear(cfg["lstm_hidden"], 1)
-            self.apply(xavier_init)
-
-        def forward(self, x):
-            seq = self.front(x)
-            out, _ = self.lstm(seq)
-            return self.head(out[:, -1, :]).squeeze(-1)
-
-    class CNNAutoformer(nn.Module):
-        def __init__(self, in_shape, cfg):
-            super().__init__()
-            self.front = CNNFront(in_shape, cfg)
-            self.af = AutoformerRegressor(in_shape, cfg, seq_dim=self.front.out_ch)
-
-        def forward(self, x):
-            seq = self.front(x)
-            return self.af._forward_seq(seq)
-
-    class CNNESN(nn.Module):
-        def __init__(self, in_shape, cfg):
-            super().__init__()
-            self.front = CNNFront(in_shape, cfg)
-            self.esn = ESNRegressor(in_shape, cfg, seq_dim=self.front.out_ch)
-
-        def forward(self, x):
-            seq = self.front(x)          # already maturity-ordered by the front
-            return self.esn._run(seq)
-
-    return {
-        "deepmlp": lambda s, c: DeepMLPRegressor(s, c),
-        "cnn":     lambda s, c: CNNRegressor(s, c),
-        "cnn1":    lambda s, c: PaperCNN(s, c, depth=1),
-        "cnn4":    lambda s, c: PaperCNN(s, c, depth=4),
-        "cnn5":    lambda s, c: PaperCNN(s, c, depth=5),
-        "lstm":    lambda s, c: LSTMRegressor(s, c),
-        "autoformer": lambda s, c: AutoformerRegressor(s, c),
-        "esn":     lambda s, c: ESNRegressor(s, c),
-        "cnn-lstm": lambda s, c: CNNLSTM(s, c),
-        "cnn-autoformer": lambda s, c: CNNAutoformer(s, c),
-        "cnn-esn": lambda s, c: CNNESN(s, c),
-    }
-
-
-TORCH_MODELS = ["deepmlp", "cnn", "cnn1", "cnn4", "cnn5", "lstm",
-                "autoformer", "esn", "cnn-lstm", "cnn-autoformer", "cnn-esn"]
-SKLEARN_MODELS = ["rf"]
-
-
-# ======================================================================
-# Section 7 - Training utilities (warm-up + transfer learning, ensembling)
-# ======================================================================
-def _iter_batches(n: int, bs: int, shuffle: bool, generator=None):
-    import torch
-    idx = torch.randperm(n, generator=generator) if shuffle else torch.arange(n)
-    batches, s = [], 0
-    while s < n:
-        e = min(s + bs, n)
-        batches.append(idx[s:e]); s = e
-    if len(batches) >= 2 and len(batches[-1]) == 1:   # avoid singleton (BatchNorm)
-        last = batches.pop()
-        batches[-1] = torch.cat([batches[-1], last])
-    return batches
-
-
-def _train_epochs(model, Xtr, ytr, Xvl, yvl, n_epochs, config, device, seed,
-                  early_stop: bool):
-    """Train `model` for n_epochs on (Xtr,ytr). If early_stop, keep the best
-    state on the chronological validation tail (Xvl,yvl)."""
-    import torch
-    import torch.nn.functional as F
-    import torch.optim as optim
-
-    amp = bool(config.get("use_amp", True)) and device.type == "cuda"
-    bs = config["batch_size"]
-    model.to(device)
-    Xtr_t = torch.from_numpy(Xtr).to(device)
-    ytr_t = torch.from_numpy(ytr).to(device)
-    has_val = early_stop and len(Xvl) > 0
-    if has_val:
-        Xvl_t = torch.from_numpy(Xvl).to(device)
-        yvl_t = torch.from_numpy(yvl).to(device)
-
-    try:
-        opt = optim.AdamW(model.parameters(), lr=config["lr"],
-                          weight_decay=config["weight_decay"],
-                          fused=(device.type == "cuda"))
-    except Exception:
-        opt = optim.AdamW(model.parameters(), lr=config["lr"],
-                          weight_decay=config["weight_decay"])
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    rng = torch.Generator(device="cpu").manual_seed(seed)
-
-    best_val = float("inf"); best_state = None; wait = 0
-    n = len(Xtr_t)
-    for _ in range(n_epochs):
-        model.train()
-        for idx in _iter_batches(n, bs, shuffle=True, generator=rng):
-            idx = idx.to(device)
-            opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp):
-                pred = model(Xtr_t[idx])
-                loss = F.mse_loss(pred, ytr_t[idx])
-            scaler.scale(loss).backward()
-            scaler.step(opt); scaler.update()
-        if has_val:
-            model.eval()
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp):
-                vloss = F.mse_loss(model(Xvl_t), yvl_t).item()
-            if np.isfinite(vloss) and vloss < best_val - 1e-9:
-                best_val = vloss
-                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                wait = 0
+                v = F.mse_loss(torch.tanh(net(Xv_t)) * cap, yv_t).item()
+            if v < best - 1e-7:
+                best, wait = v, 0
+                bst = {a: b_.clone() for a, b_ in net.state_dict().items()}
             else:
                 wait += 1
-            if wait >= config["patience"]:
-                break
-    if has_val and best_state is not None:
-        model.load_state_dict(best_state)
-    return model
+                if wait >= patience:
+                    break
+        if bst:
+            net.load_state_dict(bst)
+        net.eval()
+        nets.append(net)
+
+    def predict(Xte):
+        Xte_ = (dm(Xte) - mu) / sd
+        Xte_t = t(Xte_)
+        p = np.zeros(len(Xte_), np.float64)
+        with torch.no_grad():
+            for net in nets:
+                p += (torch.tanh(net(Xte_t)) * cap).cpu().numpy()
+        return p / len(nets) * ysd + ymu
+    return predict
 
 
-def _predict(model, X, device, bs=4096):
-    import torch
-    model.eval()
-    outs = []
-    with torch.no_grad():
-        for s in range(0, len(X), bs):
-            xb = torch.from_numpy(X[s:s + bs]).to(device)
-            outs.append(model(xb).detach().cpu().numpy().reshape(-1))
-    return np.concatenate(outs) if outs else np.empty((0,), np.float32)
-
-
-# ======================================================================
-# Section 8 - Metrics (regression + cross-sectional IC)
-# ======================================================================
-def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    y_true = np.asarray(y_true, np.float64).reshape(-1)
-    y_pred = np.asarray(y_pred, np.float64).reshape(-1)
-    err = y_true - y_pred
-    mae = float(np.abs(err).mean())
-    rmse = float(np.sqrt((err ** 2).mean()))
-    ss_res = float((err ** 2).sum())
-    ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
-    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
-    return {"MAE": mae, "RMSE": rmse, "R2": r2, "n_test": int(len(y_true))}
-
-
-def information_coefficients(pred_df: pd.DataFrame) -> Dict[str, float]:
-    """Mean monthly Pearson IC and Spearman rank-IC of predictions vs realised."""
-    ics, rics = [], []
-    for _, g in pred_df.groupby("date"):
-        if len(g) < 5:
-            continue
-        a, b = g["y_pred"].values, g["y_true"].values
-        if np.std(a) < EPS or np.std(b) < EPS:
-            continue
-        ics.append(np.corrcoef(a, b)[0, 1])
-        ra = pd.Series(a).rank().values
-        rb = pd.Series(b).rank().values
-        rics.append(np.corrcoef(ra, rb)[0, 1])
-    return {"IC": float(np.mean(ics)) if ics else float("nan"),
-            "ICIR": float(np.mean(ics) / (np.std(ics) + EPS)) if ics else float("nan"),
-            "rankIC": float(np.mean(rics)) if rics else float("nan")}
-
-
-# ======================================================================
-# Section 9 - Per-(target, model) OOS runner
-# ----------------------------------------------------------------------
-# Produces an out-of-sample prediction panel [date, id, y_true, y_pred(_k)]
-# following the chosen window scheme with strict leak-free scaling.
-# Neural models use warm-up + transfer learning with PERSISTENT weights across
-# months (paper). RF refits per window. Ensemble = mean over K seeds.
-# ======================================================================
-def run_model_target(panel: pd.DataFrame, schema: Schema, target: str,
-                     model_name: str, config: dict, force_cpu: bool = False,
-                     n_threads: Optional[int] = None) -> dict:
+# ------------------------- walk-forward ------------------------------
+def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
+        rebalance="20D", refit_months=1, window="exp",
+        test_start=None, test_end=None, seeds=3, train_weekly=True,
+        save_csv=True, verbose=True, oos_start=None):
+    """
+    Walk-forward evaluation. Returns dict with `predictions` (DataFrame),
+    `summary` (dict) and writes predictions_<rebalance>.csv next to the data.
+    test_start / test_end: year (2018) or "YYYY-MM" strings bounding the
+    out-of-sample window. Diagnostics go to iv_runner.log.
+    """
+    _setup_log(data_dir)
+    assert rebalance in ("20D", "5D"), "rebalance must be '20D' or '5D'"
+    horizon_days = 20 if rebalance == "20D" else 5
+    target = f"TRET_SP500_EX_F{horizon_days}D"
+    grp = "M" if rebalance == "20D" else "W"
+    df, S = load_panel(data_dir, pattern)
+    tcol = _ci(df.columns, [target])
+    if tcol is None:
+        _hint(f"target {target} not found in data",
+              f"for rebalance='{rebalance}' the data needs column {target}; "
+              "available: " + ", ".join(c for c in df.columns if "TRET" in str(c).upper()))
+    y = pd.to_numeric(df[tcol], errors="coerce").values.astype(np.float32)
+    ok = np.isfinite(y)
+    if ok.mean() < 0.5:
+        log.warning("only %.0f%% of target values are finite; check %s",
+                    100 * ok.mean(), tcol)
+    test_grid = df["is_me"].values if rebalance == "20D" else np.ones(len(df), bool)
+    ts = test_start or oos_start or int(df["date"].dt.year.quantile(0.5))
+    ts = f"{ts}-01" if isinstance(ts, int) else str(ts)
+    te_ = test_end or df["date"].max()
+    te_ = f"{te_}-12" if isinstance(te_, int) else str(te_)
+    months = pd.period_range(ts, te_, freq="M")
+    if len(months) == 0:
+        _hint(f"empty test window {ts}..{te_}",
+              "check test_start/test_end against the data range "
+              f"{df['date'].min().date()}..{df['date'].max().date()}")
+    log.info("test window: %s .. %s (%d months) | rebalance=%s refit=%dmo window=%s",
+             months[0], months[-1], len(months), rebalance, refit_months, window)
+    embargo = pd.DateOffset(days=int(horizon_days * 1.6))     # trading->calendar
+    preds = np.full(len(df), np.nan)
+    predictor = None
     t0 = time.time()
-    data = assemble_panel(panel, schema, target, config)
-    X, y, dates, ids = data["X"], data["y"], data["dates"], data["ids"]
-    in_shape = (1, data["surface_shape"][0], data["surface_shape"][1])
-    splits = make_window_splits(dates, config)
-    if not splits:
-        return {"target": target, "model": model_name, "error": "no splits"}
-
-    K = int(config["ensemble_K"])
-    base_seed = int(config["seed"])
-    is_torch = model_name in TORCH_MODELS
-    rows = []                      # collected OOS prediction rows
-    is_true = is_pred = None       # in-sample (last training window) for R2_is
-
-    if is_torch:
-        import torch
-        cpu_only = force_cpu or not config.get("use_cuda", False)
-        device = torch.device("cpu") if cpu_only else resolve_device(config)
-        if device.type == "cuda":
-            _maybe_cap_gpu_memory(config)
-        if n_threads is not None:               # pinned by the CPU scheduler
-            try:
-                torch.set_num_threads(max(1, int(n_threads)))
-            except Exception:
-                pass
-        else:
-            configure_threads(config, divisor=(config["n_workers"] if force_cpu else 1))
-        builders = _build_torch_modules()
-        members = [None] * K           # persistent models across splits
-        first_split = True
-        for sp in splits:
-            tr, te = sp["train_mask"], sp["test_mask"]
-            Xtr_all, ytr_all = X[tr], y[tr]
-            Xte = X[te]
-            if len(Xtr_all) < 8 or len(Xte) == 0:
+    for i, mper in enumerate(months):
+        te_lo = mper.to_timestamp()
+        te_hi = (mper + 1).to_timestamp()
+        te = ok & test_grid & ((df["date"] >= te_lo) & (df["date"] < te_hi)).values
+        if te.sum() == 0:
+            log.debug("no test rows in %s", mper)
+            continue
+        if predictor is None or i % max(1, int(refit_months)) == 0:
+            tr = ok & (df["date"] < te_lo - embargo).values
+            if window.startswith("roll"):
+                tr &= (df["date"] >= te_lo - pd.DateOffset(
+                    years=int(window[4:]))).values
+            if not train_weekly:
+                tr &= df["is_me"].values
+            if tr.sum() < 500:
+                log.warning("refit %s skipped: only %d training rows "
+                            "(need 500). SUGGESTION: move test_start later or "
+                            "use window='exp'", mper, int(tr.sum()))
                 continue
-            ps = PixelScaler().fit(Xtr_all)
-            ts = TargetScaler().fit(ytr_all)
-            Xtr_s = ps.transform(Xtr_all); ytr_s = ts.transform(ytr_all)
-            Xte_s = ps.transform(Xte)
-            # chronological val tail for warm-up early stopping
-            n_tr = len(Xtr_s)
-            n_val = max(1, int(round(n_tr * config["val_frac"]))) if first_split else 0
-            n_sub = n_tr - n_val
-            Xsub, ysub = Xtr_s[:n_sub], ytr_s[:n_sub]
-            Xval, yval = Xtr_s[n_sub:], ytr_s[n_sub:]
-
-            preds_k = np.zeros(len(Xte_s), np.float64)
-            is_k = np.zeros(len(Xtr_s), np.float64)     # in-sample (this window)
-            for k in range(K):
-                seed = base_seed + k
-                if members[k] is None:
-                    set_seed(seed)
-                    members[k] = builders[model_name](in_shape, {**config, "seed": seed})
-                epochs = config["warmup_epochs"] if first_split else config["transfer_epochs"]
-                members[k] = _train_epochs(members[k], Xsub, ysub, Xval, yval,
-                                           epochs, config, device, seed,
-                                           early_stop=first_split)
-                preds_k += ts.inverse(_predict(members[k], Xte_s, device))
-                is_k += ts.inverse(_predict(members[k], Xtr_s, device))
-            preds_k /= K; is_k /= K
-            for j, gi in enumerate(np.where(te)[0]):
-                rows.append((dates[gi], ids[gi], float(y[gi]), float(preds_k[j])))
-            is_true, is_pred = ytr_all.copy(), is_k    # keep last window's IS
-            first_split = False
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-        del members
-        gc.collect()
-
-    else:   # ---- RandomForest (sklearn), refit per window -------------
-        from sklearn.ensemble import RandomForestRegressor
-        for sp in splits:
-            tr, te = sp["train_mask"], sp["test_mask"]
-            Xtr_all, ytr_all = X[tr], y[tr]
-            Xte = X[te]
-            if len(Xtr_all) < 8 or len(Xte) == 0:
-                continue
-            Xtr_f = Xtr_all.reshape(len(Xtr_all), -1)
-            Xte_f = Xte.reshape(len(Xte), -1)
-            preds_k = np.zeros(len(Xte_f), np.float64)
-            is_k = np.zeros(len(Xtr_f), np.float64)     # in-sample (this window)
-            n_est = max(1, int(config["rf_estimators"]))
-            # threads for this model's RF: pinned budget, else all cores
-            rf_jobs = int(n_threads) if n_threads else (1 if force_cpu else -1)
-            for k in range(K):
-                rf = RandomForestRegressor(
-                    n_estimators=n_est, max_depth=config["rf_max_depth"],
-                    max_features=config["rf_max_features"],
-                    n_jobs=rf_jobs, random_state=base_seed + k)
-                rf.fit(Xtr_f, ytr_all)
-                preds_k += rf.predict(Xte_f)
-                is_k += rf.predict(Xtr_f)
-            preds_k /= K; is_k /= K
-            for j, gi in enumerate(np.where(te)[0]):
-                rows.append((dates[gi], ids[gi], float(y[gi]), float(preds_k[j])))
-            is_true, is_pred = ytr_all.copy(), is_k
-
-    if not rows:
-        return {"target": target, "model": model_name, "error": "no OOS rows"}
-
-    pred_df = pd.DataFrame(rows, columns=["date", "id", "y_true", "y_pred"])
-    pred_df = pred_df.sort_values(["date", "id"]).reset_index(drop=True)
-    if config.get("save_predictions", True):
-        fn = os.path.join(config["output_dir"], f"pred_{target}_{model_name}.parquet")
-        try:
-            pred_df.to_parquet(fn)
-        except Exception:
-            pred_df.to_csv(fn.replace(".parquet", ".csv"), index=False)
-
-    metrics = regression_metrics(pred_df["y_true"], pred_df["y_pred"])
-    metrics["R2_oos"] = metrics.pop("R2")          # the concatenated-OOS R^2
-    metrics.update(information_coefficients(pred_df))
-    # in-sample R^2 on the final training window (diagnostic for over/under-fit)
-    if is_true is not None and is_pred is not None and len(is_true) > 1:
-        metrics["R2_is"] = regression_metrics(is_true, is_pred)["R2"]
-    else:
-        metrics["R2_is"] = float("nan")
-    elapsed = time.time() - t0
-    logging.info("done %s/%-14s | IC=%.4f rankIC=%.4f R2_is=%.4f R2_oos=%.4f (%.1fs)",
-                 target, model_name, metrics.get("IC", float("nan")),
-                 metrics.get("rankIC", float("nan")),
-                 metrics["R2_is"], metrics["R2_oos"], elapsed)
-    return {"target": target, "model": model_name, **metrics,
-            "train_secs": round(elapsed, 2), "pred_path":
-            os.path.join(config["output_dir"], f"pred_{target}_{model_name}.parquet")}
-
-
-# ======================================================================
-# Section 10 - Portfolio construction & performance
-# ----------------------------------------------------------------------
-# Each month: sort stocks into deciles by predicted return; equal- (or value-)
-# weight; long top decile, short bottom decile (H-L), 1-period holding.
-# Reports annualised Sharpe, mean, vol, turnover, max drawdown, cumulative NAV.
-# Annualisation uses periods_per_year = 252 / horizon_days.
-# ======================================================================
-def _periods_per_year(target: str, config: dict) -> float:
-    h = config["target_horizon_days"].get(target, 21)
-    return 252.0 / float(h)
-
-
-def _infer_ppy(dates: pd.Series, target: str, config: dict) -> float:
-    """Annualisation factor from the ACTUAL rebalance cadence (monthly data ->
-    ~12). Falls back to 252/horizon if the cadence can't be inferred."""
-    u = pd.to_datetime(pd.Index(pd.Series(dates).unique())).sort_values()
-    if len(u) > 2:
-        gap = np.median(np.diff(u.values).astype("timedelta64[D]").astype(float))
-        if gap >= 1.0:
-            return 365.25 / gap
-    return _periods_per_year(target, config)
-
-
-def _max_drawdown(nav: np.ndarray) -> float:
-    peak = np.maximum.accumulate(nav)
-    return float((nav / peak - 1.0).min())
-
-
-def _to_monthly_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse predictions to ONE row per (stock, month): the last (month-end)
-    observation. This is where sub-monthly training data becomes a monthly
-    portfolio (resample to monthly only at portfolio construction)."""
-    df = pred_df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df["_m"] = df["date"].dt.to_period("M")
-    idx = df.groupby(["id", "_m"])["date"].idxmax()
-    out = df.loc[idx].copy()
-    out["date"] = out["_m"].dt.to_timestamp("M")     # align all stocks to month-end
-    return out.drop(columns="_m").sort_values(["date", "id"]).reset_index(drop=True)
-
-
-def build_portfolio(pred_df: pd.DataFrame, target: str, config: dict,
-                    weights_lookup: Optional[dict] = None) -> dict:
-    n_dec = int(config["n_deciles"])
-    if config.get("portfolio_monthly", True):
-        pred_df = _to_monthly_predictions(pred_df)
-    ppy = _infer_ppy(pred_df["date"], target, config)
-    tcost = config["tcost_bps"] / 1e4
-
-    monthly = []
-    prev_long, prev_short = set(), set()
-    for dt, g in pred_df.groupby("date"):
-        g = g.dropna(subset=["y_pred", "y_true"])
-        if len(g) < n_dec * 2:
+            predictor = train_cnn_dm_tanh(S[tr], y[tr], seeds=seeds)
+            if verbose:
+                print(f"  refit {mper}: ntr={tr.sum():,} "
+                      f"({time.time()-t0:.0f}s elapsed)", flush=True)
+        preds[te] = predictor(S[te])
+    # ---------------- evaluation ----------------
+    out = df.loc[np.isfinite(preds), ["perm_ID", "date"]].copy()
+    out["y_pred"] = preds[np.isfinite(preds)]
+    out["y_true"] = y[np.isfinite(preds)]
+    out["per"] = out["date"].dt.to_period(grp)
+    sizes = out.groupby("per").size()
+    min_n = max(15, int(sizes.median() * 0.5))
+    ics, hl, lng = [], [], []
+    for _, g in out.groupby("per"):
+        if len(g) < min_n or g["y_pred"].std() < 1e-12:
             continue
-        ranks = g["y_pred"].rank(method="first")
-        q_hi = ranks.quantile(1 - 1.0 / n_dec)
-        q_lo = ranks.quantile(1.0 / n_dec)
-        long_ = g[ranks >= q_hi]
-        short_ = g[ranks <= q_lo]
-        if config["weighting"] == "value" and weights_lookup is not None:
-            def _w(sub):
-                w = np.array([max(weights_lookup.get((r["id"], dt), np.nan), 0)
-                              for _, r in sub.iterrows()], float)
-                if np.all(~np.isfinite(w)) or np.nansum(w) <= 0:
-                    w = np.ones(len(sub))
-                w = np.nan_to_num(w, nan=0.0)
-                return w / w.sum()
-            wl, ws = _w(long_), _w(short_)
-            r_long = float((long_["y_true"].values * wl).sum())
-            r_short = float((short_["y_true"].values * ws).sum())
-        else:
-            r_long = float(long_["y_true"].mean())
-            r_short = float(short_["y_true"].mean())
-        cur_long, cur_short = set(long_["id"]), set(short_["id"])
-        # turnover = fraction of legs replaced vs previous period
-        to_long = 1.0 - len(cur_long & prev_long) / max(len(cur_long), 1)
-        to_short = 1.0 - len(cur_short & prev_short) / max(len(cur_short), 1)
-        turnover = 0.5 * (to_long + to_short)
-        hl = r_long - r_short
-        hl_net = hl - tcost * turnover * 2.0
-        monthly.append({"date": dt, "long": r_long, "short": r_short,
-                        "HL": hl, "HL_net": hl_net, "turnover": turnover,
-                        "n": len(g)})
-        prev_long, prev_short = cur_long, cur_short
-
-    if not monthly:
-        return {"error": "insufficient cross-section for portfolios"}
-    pf = pd.DataFrame(monthly).sort_values("date").reset_index(drop=True)
-
-    def _stats(col):
-        r = pf[col].values
-        mu, sd = float(r.mean()), float(r.std(ddof=1) if len(r) > 1 else 0.0)
-        sharpe = float(mu / sd * math.sqrt(ppy)) if sd > EPS else float("nan")
-        nav = np.cumprod(1.0 + r)
-        cagr = float(nav[-1] ** (ppy / len(r)) - 1.0) if len(r) > 0 else float("nan")
-        return {"mean_period": mu, "vol_period": sd, "sharpe_ann": sharpe,
-                "cagr": cagr, "maxdd": _max_drawdown(nav), "n_periods": len(r)}
-
-    out = {"target": target,
-           "HL": _stats("HL"), "HL_net": _stats("HL_net"),
-           "long": _stats("long"), "short": _stats("short"),
-           "avg_turnover": float(pf["turnover"].mean()),
-           "monthly": pf}
-    return out
-
-
-def build_mktcap_lookup(panel: pd.DataFrame, schema: Schema) -> Optional[dict]:
-    if schema.mktcap_col is None:
-        return None
-    sub = panel[[schema.id_col, schema.date_col, schema.mktcap_col]].dropna()
-    return {(r[schema.id_col], pd.Timestamp(r[schema.date_col])): float(r[schema.mktcap_col])
-            for _, r in sub.iterrows()}
-
-
-def size_group_analysis(pred_df: pd.DataFrame, panel: pd.DataFrame, schema: Schema,
-                        target: str, config: dict) -> Optional[pd.DataFrame]:
-    """Split the H-L Sharpe by size group using cross-sectional mktcap
-    breakpoints (mega>=80%, large 50-80%, small 20-50%, micro<20%, non-micro>=20%)."""
-    if schema.mktcap_col is None:
-        return None
-    cap = panel[[schema.id_col, schema.date_col, schema.mktcap_col]].copy()
-    cap[schema.date_col] = pd.to_datetime(cap[schema.date_col])
-    cap = cap.rename(columns={schema.id_col: "id", schema.date_col: "date",
-                              schema.mktcap_col: "cap"})
-    merged = pred_df.merge(cap, on=["id", "date"], how="left").dropna(subset=["cap"])
-    if merged.empty:
-        return None
-    # monthly breakpoints
-    def _grp(g):
-        q20, q50, q80 = g["cap"].quantile([0.2, 0.5, 0.8])
-        cond = [g["cap"] >= q80, (g["cap"] >= q50) & (g["cap"] < q80),
-                (g["cap"] >= q20) & (g["cap"] < q50), g["cap"] < q20]
-        g = g.copy()
-        g["sizegrp"] = np.select(cond, ["mega", "large", "small", "micro"], "micro")
-        return g
-    merged = merged.groupby("date", group_keys=False).apply(_grp)
-    rows = []
-    groups = {"mega": ["mega"], "large": ["large"], "small": ["small"],
-              "micro": ["micro"], "non-micro": ["mega", "large", "small"]}
-    for name, members in groups.items():
-        sub = merged[merged["sizegrp"].isin(members)]
-        pf = build_portfolio(sub[["date", "id", "y_true", "y_pred"]], target, config)
-        if "error" not in pf:
-            rows.append({"size_group": name, **{f"HL_{k}": v
-                         for k, v in pf["HL"].items()}})
-    return pd.DataFrame(rows) if rows else None
-
-
-# ======================================================================
-# Section 11 - Orchestration over the (target x model) grid
-# ======================================================================
-def build_task_list(config: dict) -> List[dict]:
-    tasks = []
-    for t, m in product(config["targets"], config["models"]):
-        tasks.append({"target": t, "model": m})
-    return tasks
-
-
-def _pin_blas_threads(n: int) -> None:
-    """Cap BLAS/OpenMP threads so concurrent workers don't oversubscribe."""
-    for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-        os.environ[v] = str(max(1, int(n)))
-
-
-def _load_panel_and_schema(config: dict) -> Tuple[pd.DataFrame, Schema]:
-    """Reload the cached panel + resolve schema (used by pool workers so the
-    big DataFrame is read from disk, not pickled across processes). Applies the
-    SAME subset + monthly resample as data_check so workers see an identical
-    panel to the parent."""
-    panel = load_raw_panel(config)
-    schema = resolve_schema(panel, config)
-    panel[schema.date_col] = pd.to_datetime(panel[schema.date_col])
-    panel = panel.sort_values([schema.date_col, schema.id_col]).reset_index(drop=True)
-    panel = apply_stock_subset(panel, schema, config)
-    if config.get("resample_monthly", True):
-        panel = resample_to_monthly(panel, schema)
-    return panel, schema
-
-
-def _cpu_worker(args):
-    panel, schema, task, config, n_threads = args
-    if n_threads is not None:
-        _pin_blas_threads(n_threads)
-    try:
-        if panel is None:          # reload from cache inside the worker
-            panel, schema = _load_panel_and_schema(config)
-        return run_model_target(panel, schema, task["target"], task["model"],
-                                config, force_cpu=True, n_threads=n_threads)
-    except Exception as exc:
-        logging.error("task %s failed: %s", task, exc, exc_info=True)
-        return {"target": task["target"], "model": task["model"], "error": str(exc)}
-
-
-def plan_cpu_allocation(n_tasks: int, n_cpus: int) -> Tuple[int, int]:
-    """Cores -> models policy:
-       * more models than cores -> one model per core, 1 thread each (queued);
-       * otherwise              -> split cores evenly across models.
-    Returns (max_workers, threads_per_model)."""
-    n_cpus = max(1, int(n_cpus))
-    n_tasks = max(1, int(n_tasks))
-    if n_tasks >= n_cpus:
-        return n_cpus, 1
-    return n_tasks, max(1, n_cpus // n_tasks)
-
-
-def run_grid(config: dict = CONFIG) -> pd.DataFrame:
-    panel, schema, _ = data_check(config)
-    config["force_rebuild"] = False        # cache now written; workers read it
-    tasks = build_task_list(config)
-    n_cpus = int(config.get("n_cpus") or os.cpu_count() or 1)
-    cpu_mode = not config.get("use_cuda", False)
-    logging.info("Grid: %d tasks (%d targets x %d models) | %s",
-                 len(tasks), len(config["targets"]), len(config["models"]),
-                 f"CPU-distributed over {n_cpus} cores" if cpu_mode else "GPU mode")
-    results: List[dict] = []
-
-    if cpu_mode and len(tasks) > 1:
-        # ---- distributed: every model trains concurrently across cores ----
-        max_workers, threads_per = plan_cpu_allocation(len(tasks), n_cpus)
-        logging.info("CPU schedule: %d concurrent workers x %d thread(s)/model "
-                     "(%d tasks, %d cores)", max_workers, threads_per,
-                     len(tasks), n_cpus)
-        _pin_blas_threads(threads_per)            # children inherit via spawn
-        import multiprocessing as mp
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-            # panel=None -> each worker reloads from the disk cache (avoids
-            # pickling the full panel to every process).
-            futs = [ex.submit(_cpu_worker, (None, None, t, config, threads_per))
-                    for t in tasks]
-            for fut in as_completed(futs):
-                results.append(fut.result())
-    elif cpu_mode:
-        # single task -> give it every core
-        t = tasks[0]
-        _pin_blas_threads(n_cpus)
-        results.append(run_model_target(panel, schema, t["target"], t["model"],
-                                        config, force_cpu=True, n_threads=n_cpus))
-    else:
-        # ---- GPU mode: neural sequential on GPU, rf fans out on CPU pool ----
-        cpu_tasks = [t for t in tasks if t["model"] in SKLEARN_MODELS]
-        gpu_tasks = [t for t in tasks if t["model"] in TORCH_MODELS]
-        n_workers = max(1, int(config.get("n_workers", 1)))
-        if cpu_tasks and n_workers > 1:
-            import multiprocessing as mp
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
-                futs = [ex.submit(_cpu_worker, (panel, schema, t, config, None))
-                        for t in cpu_tasks]
-                for fut in as_completed(futs):
-                    results.append(fut.result())
-        else:
-            for t in cpu_tasks:
-                results.append(run_model_target(panel, schema, t["target"],
-                                                t["model"], config))
-        for t in gpu_tasks:     # sequential on the GPU
-            results.append(run_model_target(panel, schema, t["target"],
-                                            t["model"], config))
-
-    res_df = pd.DataFrame(results)
-    res_df.to_csv(os.path.join(config["output_dir"], "results_all.csv"), index=False)
-
-    # ---- portfolios + analysis for every successful run ----------
-    portfolio_rows = []
-    nav_store = {}
-    for r in results:
-        if "error" in r and r.get("pred_path") is None:
-            continue
-        pp = r.get("pred_path")
-        if not pp or not (os.path.exists(pp) or os.path.exists(pp.replace(".parquet", ".csv"))):
-            continue
-        try:
-            pred_df = (pd.read_parquet(pp) if os.path.exists(pp)
-                       else pd.read_csv(pp.replace(".parquet", ".csv")))
-            pred_df["date"] = pd.to_datetime(pred_df["date"])
-        except Exception:
-            continue
-        wl = build_mktcap_lookup(panel, schema) if config["weighting"] == "value" else None
-        pf = build_portfolio(pred_df, r["target"], config, wl)
-        if "error" in pf:
-            continue
-        portfolio_rows.append({
-            "target": r["target"], "model": r["model"],
-            "sharpe_HL": pf["HL"]["sharpe_ann"],
-            "sharpe_HL_net": pf["HL_net"]["sharpe_ann"],
-            "cagr_HL": pf["HL"]["cagr"], "maxdd_HL": pf["HL"]["maxdd"],
-            "sharpe_long": pf["long"]["sharpe_ann"],
-            "avg_turnover": pf["avg_turnover"],
-            "IC": r.get("IC", float("nan")), "rankIC": r.get("rankIC", float("nan")),
-            "R2_is": r.get("R2_is", float("nan")), "R2_oos": r.get("R2_oos", float("nan")),
-        })
-        nav_store[(r["target"], r["model"])] = pf["monthly"]
-        # size groups for the primary target
-        if config.get("size_groups") and r["target"] == config["primary_target"]:
-            sg = size_group_analysis(pred_df, panel, schema, r["target"], config)
-            if sg is not None:
-                sg.insert(0, "model", r["model"])
-                sg.to_csv(os.path.join(config["output_dir"],
-                          f"sizegroups_{r['model']}.csv"), index=False)
-
-    pf_df = pd.DataFrame(portfolio_rows)
-    if not pf_df.empty:
-        pf_df = pf_df.sort_values(["target", "sharpe_HL"], ascending=[True, False])
-        pf_df.to_csv(os.path.join(config["output_dir"], "portfolio_summary.csv"), index=False)
-
-    finalize_and_report(res_df, pf_df, nav_store, config)
-    return pf_df
-
-
-# ======================================================================
-# Section 12 - Reporting + visualisation + benchmark comparison
-# ======================================================================
-def finalize_and_report(res_df: pd.DataFrame, pf_df: pd.DataFrame,
-                        nav_store: dict, config: dict) -> None:
-    line = "=" * 86
-    print("\n" + line)
-    print("  IV-SURFACE FORECAST RESULTS  (OOS %s .. %s, ranked by H-L Sharpe)"
-          % (config["oos_start"][:7], config["oos_end"][:7]))
-    print(line)
-    if pf_df is None or pf_df.empty:
-        print("  No portfolios produced.")
-    else:
-        cols = ["model", "sharpe_HL", "sharpe_HL_net", "cagr_HL", "maxdd_HL",
-                "sharpe_long", "avg_turnover", "IC", "rankIC", "R2_is", "R2_oos"]
-        for t in pf_df["target"].unique():
-            sub = pf_df[pf_df["target"] == t].copy()
-            print(f"\n--- target = {t} ---")
-            with pd.option_context("display.float_format", lambda v: f"{v:,.4f}"):
-                print(sub[[c for c in cols if c in sub.columns]].to_string(index=False))
-    print(line + "\n")
-
-    try:
-        _make_figures(pf_df, nav_store, config)
-    except Exception as exc:
-        logging.warning("figures skipped: %s", exc)
-
-
-def _make_figures(pf_df: pd.DataFrame, nav_store: dict, config: dict) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    target = config["primary_target"]
-
-    # (a) cumulative NAV of H-L by model (primary target) + market benchmark
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    plotted = False
-    for (t, m), pf in nav_store.items():
-        if t != target:
-            continue
-        nav = np.cumprod(1.0 + pf["HL"].values)
-        ax.plot(pd.to_datetime(pf["date"]), nav, lw=1.4, label=m)
-        plotted = True
-    if plotted:
-        ax.set_yscale("log")
-        ax.set_title(f"Cumulative H-L NAV (log) — target {target}")
-        ax.set_ylabel("growth of $1"); ax.legend(ncol=3, fontsize=8); ax.grid(alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(os.path.join(config["fig_dir"], "nav_HL_by_model.png"), dpi=130)
-    plt.close(fig)
-
-    # (b) Sharpe-by-model bar chart per target
-    if pf_df is not None and not pf_df.empty:
-        for t in pf_df["target"].unique():
-            sub = pf_df[pf_df["target"] == t].sort_values("sharpe_HL")
-            fig, ax = plt.subplots(figsize=(8, 0.5 * len(sub) + 1.5))
-            ax.barh(sub["model"], sub["sharpe_HL"])
-            ax.set_title(f"Annualised H-L Sharpe — {t}")
-            ax.axvline(0, color="k", lw=0.8); ax.grid(alpha=0.3, axis="x")
-            fig.tight_layout()
-            fig.savefig(os.path.join(config["fig_dir"],
-                        f"sharpe_by_model_{t}.png"), dpi=130)
-            plt.close(fig)
-
-    # (c) IC bar chart (primary target)
-    if pf_df is not None and not pf_df.empty:
-        sub = pf_df[pf_df["target"] == target].sort_values("rankIC")
-        if not sub.empty:
-            fig, ax = plt.subplots(figsize=(8, 0.5 * len(sub) + 1.5))
-            ax.barh(sub["model"], sub["rankIC"])
-            ax.set_title(f"Cross-sectional rank-IC — {target}")
-            ax.axvline(0, color="k", lw=0.8); ax.grid(alpha=0.3, axis="x")
-            fig.tight_layout()
-            fig.savefig(os.path.join(config["fig_dir"], "rankIC_by_model.png"), dpi=130)
-            plt.close(fig)
-
-
-def ensemble_size_sweep(model_name: str, target: str, config: dict = CONFIG,
-                        Ks: Optional[List[int]] = None) -> pd.DataFrame:
-    """Re-run one model at several ensemble sizes K and plot Sharpe vs K
-    (paper Figure 5). Expensive; call explicitly."""
-    panel, schema, _ = data_check(config)
-    Ks = Ks or config["ensemble_sweep"]
-    rows = []
-    for K in Ks:
-        cfg = {**config, "ensemble_K": K, "save_predictions": False}
-        r = run_model_target(panel, schema, target, model_name, cfg)
-        pp = r.get("pred_path")
-        # run_model_target with save off still returns metrics; rebuild pf from rows
-        # so re-enable save for the sweep:
-        cfg2 = {**config, "ensemble_K": K}
-        r = run_model_target(panel, schema, target, model_name, cfg2)
-        pred_df = pd.read_parquet(r["pred_path"]) if os.path.exists(r["pred_path"]) \
-            else pd.read_csv(r["pred_path"].replace(".parquet", ".csv"))
-        pred_df["date"] = pd.to_datetime(pred_df["date"])
-        pf = build_portfolio(pred_df, target, config)
-        rows.append({"K": K, "sharpe_HL": pf["HL"]["sharpe_ann"],
-                     "IC": r.get("IC", float("nan"))})
-    sweep = pd.DataFrame(rows)
-    sweep.to_csv(os.path.join(config["output_dir"],
-                 f"ensemble_sweep_{model_name}_{target}.csv"), index=False)
-    try:
-        import matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(sweep["K"], sweep["sharpe_HL"], "o-")
-        ax.set_xlabel("ensemble size K"); ax.set_ylabel("annualised H-L Sharpe")
-        ax.set_title(f"Sharpe vs ensemble size — {model_name} / {target}")
-        ax.grid(alpha=0.3); fig.tight_layout()
-        fig.savefig(os.path.join(config["fig_dir"],
-                    f"sharpe_vs_K_{model_name}_{target}.png"), dpi=130)
-        plt.close(fig)
-    except Exception:
-        pass
-    return sweep
-
-
-# ======================================================================
-# Section 13 - Synthetic data generator (smoke-test / demo)
-# ======================================================================
-def make_synthetic_dataset(out_dir: str, n_stocks: int = 120, n_months: int = 96,
-                           shape: Tuple[int, int] = (10, 18), seed: int = 0,
-                           signal: float = 0.15) -> str:
-    """
-    Create a tiny synthetic panel mimicking the real schema so the whole
-    pipeline can be smoke-tested without OptionMetrics access. A weak,
-    learnable signal links a smooth surface functional to forward returns.
-    Writes one pickle per stock and returns the directory.
-    """
-    rng = np.random.default_rng(seed)
-    os.makedirs(out_dir, exist_ok=True)
-    H, W = shape                         # H = maturity (10), W = delta (18)
-    n_cells = H * W
-    months = pd.period_range("2000-01", periods=n_months, freq="M")
-    # a fixed "loading" surface defining the true predictive functional
-    gd = np.linspace(-1, 1, H)[:, None]
-    gt = np.linspace(-1, 1, W)[None, :]
-    loading = (np.exp(-(gd ** 2)) * np.cos(2 * gt)).reshape(-1)
-    loading /= np.linalg.norm(loading)
-
-    for sid in range(n_stocks):
-        base = 0.2 + 0.05 * rng.standard_normal()
-        rows = []
-        for mp in months:
-            # mimic real data: a few intra-month dates; resample keeps the last
-            n_obs = rng.integers(1, 4)
-            obs_days = sorted(rng.choice(range(1, 27), size=n_obs, replace=False))
-            term = 0.10 * np.exp(-0.5 * (np.linspace(0, 1, W)))[None, :]
-            smile = 0.08 * (np.linspace(-1, 1, H) ** 2)[:, None]
-            for day in obs_days:
-                dt = pd.Timestamp(mp.to_timestamp()) + pd.Timedelta(days=int(day) - 1)
-                surf = (base + term + smile +
-                        0.03 * rng.standard_normal((H, W))).clip(0.02, None)
-                flat = surf.reshape(-1).astype(np.float32)       # maturity-major
-                score = float(flat @ loading)
-                fwd20 = signal * score + 0.04 * rng.standard_normal()
-                fwd5 = 0.5 * fwd20 + 0.03 * rng.standard_normal()
-                mkt = 0.005 * rng.standard_normal()
-                rows.append({
-                    "perm_ID": 10000 + sid, "date": dt,
-                    "trade_id": f"{10000+sid}_{dt.date()}",
-                    "mktcap": float(np.exp(6 + 2 * rng.random())),
-                    # surface stored as ONE length-180 list column, like the real data
-                    "ImpliedVolatility": flat.tolist(),
-                    "TRET_F20D": fwd20, "TRET_SP500_EX_F20D": fwd20 - mkt,
-                    "TRET_F5D": fwd5, "TRET_SP500_EX_F5D": fwd5 - mkt})
-        df = pd.DataFrame(rows)
-        df.to_pickle(os.path.join(out_dir, f"{10000+sid}_all_Count_w_fReturns.pickle"))
-    logging.info("Synthetic dataset: %d stocks x %d months (list-column surface) -> %s",
-                 n_stocks, n_months, out_dir)
-    return out_dir
-
-
-# ======================================================================
-# Section 14 - CLI
-# ======================================================================
-def _in_jupyter() -> bool:
-    if "ipykernel" in sys.modules or "IPython" in sys.modules:
-        return True
-    a0 = (sys.argv[0] or "").lower()
-    return any(k in a0 for k in ["ipykernel", "jupyter", "colab"])
+        ics.append(np.corrcoef(g["y_pred"].rank(), g["y_true"].rank())[0, 1])
+        q = g["y_pred"].rank(pct=True)
+        hl.append(g.loc[q >= 0.9, "y_true"].mean() - g.loc[q <= 0.1, "y_true"].mean())
+        lng.append(g.loc[q >= 0.9, "y_true"].mean())
+    ppy = 12.0 if grp == "M" else 52.0
+    ics, hl, lng = map(np.asarray, (ics, hl, lng))
+    summary = {
+        "rebalance": rebalance, "target": tcol, "window": window,
+        "refit_months": refit_months, "n_periods": int(len(hl)),
+        "IC": float(np.nanmean(ics)),
+        "IC_t": float(np.nanmean(ics) / np.nanstd(ics) * np.sqrt(len(ics))),
+        "HL_ann": float(np.nanmean(hl) * ppy),
+        "HL_sharpe": float(np.nanmean(hl) / np.nanstd(hl) * np.sqrt(ppy)),
+        "LONG_ann": float(np.nanmean(lng) * ppy),
+        "LONG_sharpe": float(np.nanmean(lng) / np.nanstd(lng) * np.sqrt(ppy)),
+    }
+    if verbose:
+        print("\n".join(f"  {k}: {v}" for k, v in summary.items()))
+    if save_csv:
+        d = Path(data_dir) if data_dir else Path.cwd()
+        fn = d / f"predictions_{rebalance}.csv"
+        out.drop(columns="per").to_csv(fn, index=False)
+        if verbose:
+            print(f"saved -> {fn}")
+    return {"predictions": out, "summary": summary}
 
 
 def main():
-    ap = argparse.ArgumentParser(description="IV-surface multi-model return forecasting")
-    ap.add_argument("stage", nargs="?", default="all",
-                    choices=["check", "run", "all", "smoke"])
+    ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default=None)
-    ap.add_argument("--models", default=None, help="comma list, or 'all'")
-    ap.add_argument("--targets", default=None, help="comma list")
-    ap.add_argument("--window", default=None,
-                    choices=["expanding", "rolling", "single"])
-    ap.add_argument("--max-train-years", type=int, default=None,
-                    help="cap the expanding window to this many trailing years")
-    ap.add_argument("--roll-years", type=int, default=None,
-                    help="trailing window length for --window rolling")
-    ap.add_argument("--ensemble-k", type=int, default=None)
-    ap.add_argument("--cuda", action="store_true", help="use a GPU (default: CPU-only)")
-    ap.add_argument("--no-cuda", action="store_true", help="force CPU-only (default)")
-    ap.add_argument("--n-cpus", type=int, default=None,
-                    help="cores for CPU-distributed training (default: all)")
-    ap.add_argument("--max-stocks", type=int, default=None,
-                    help="use only the first N perm_IDs (quick testing subset)")
-    ap.add_argument("--workers", type=int, default=None)
-    ap.add_argument("--force-rebuild", action="store_true")
-    args, _ = ap.parse_known_args()
-
-    if args.data_dir:
-        CONFIG["data_dir"] = args.data_dir
-    if args.max_stocks is not None:
-        CONFIG["max_stocks"] = args.max_stocks
-    if args.models:
-        CONFIG["models"] = CONFIG["all_models"] if args.models == "all" \
-            else [m.strip() for m in args.models.split(",")]
-    if args.targets:
-        CONFIG["targets"] = [t.strip() for t in args.targets.split(",")]
-    if args.window:
-        CONFIG["window_scheme"] = args.window
-    if args.max_train_years is not None:
-        CONFIG["max_train_years"] = args.max_train_years
-    if args.roll_years is not None:
-        CONFIG["roll_years"] = args.roll_years
-    if args.ensemble_k is not None:
-        CONFIG["ensemble_K"] = args.ensemble_k
-    if args.cuda:
-        CONFIG["use_cuda"] = True
-    if args.no_cuda:
-        CONFIG["use_cuda"] = False
-    if args.n_cpus is not None:
-        CONFIG["n_cpus"] = args.n_cpus
-    if args.workers is not None:
-        CONFIG["n_workers"] = args.workers
-    if args.force_rebuild:
-        CONFIG["force_rebuild"] = True
-
-    if args.stage == "smoke":
-        d = make_synthetic_dataset(os.path.join(WORK, "synth_data"))
-        CONFIG.update({"data_dir": d, "force_rebuild": True,
-                       "window_scheme": "single", "oos_start": "2005-01-01",
-                       "ensemble_K": 3, "warmup_epochs": 4, "transfer_epochs": 2,
-                       "targets": ["TRET_SP500_EX_F20D", "TRET_F5D"],
-                       "models": ["rf", "deepmlp", "cnn", "cnn1", "lstm"]})
-        run_grid(CONFIG)
-        return
-    if args.stage in ("check",):
-        data_check(CONFIG)
-        return
-    if args.stage in ("run", "all"):
-        run_grid(CONFIG)
+    ap.add_argument("--pattern", default="*_all_Count_w_fReturns.pickle")
+    ap.add_argument("--rebalance", default="20D", choices=["20D", "5D"])
+    ap.add_argument("--refit-months", type=int, default=1)
+    ap.add_argument("--window", default="exp")
+    ap.add_argument("--test-start", default=None)
+    ap.add_argument("--test-end", default=None)
+    ap.add_argument("--seeds", type=int, default=3)
+    a = ap.parse_args()
+    run(a.data_dir, a.pattern, a.rebalance, a.refit_months, a.window,
+        a.test_start, a.test_end, a.seeds)
 
 
 if __name__ == "__main__":
-    if _in_jupyter():
-        logging.info("Detected Jupyter — call run_grid(CONFIG) or main() directly.")
-    else:
-        main()
+    main()
