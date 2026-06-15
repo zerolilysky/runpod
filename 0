@@ -1,376 +1,209 @@
 # ======================================================================
-# iv_cnn_runner.py
+# pca_pc2_runner.py
 # ----------------------------------------------------------------------
-# Walk-forward return forecasting from IV surfaces (10x18) on weekly
-# per-stock pickle files, with a CNN (per-image demeaning + tanh-bounded
-# output). Data files are loaded from the CURRENT WORKING DIRECTORY by
-# default, so the notebook/script just needs to sit next to the pickles.
+# Drop-in replacement for the CNN in iv_cnn_runner.run():
+#   * model        -> standard PCA on the 10x18 IV surface, then an OLS
+#                     linear regression of the forward return on PC2 ONLY.
+#   * everything else (walk-forward, embargo/leak control, the long-only
+#     top-decile evaluation) is reused unchanged from iv_cnn_runner.
 #
-# Key settings (all arguments of run()):
-#   rebalance     : "20D" (default) -> target *_EX_F20D, one test obs per
-#                   stock-month (last available trading day of the month);
-#                   "5D" -> target *_EX_F5D, every weekly obs is a test obs,
-#                   portfolio formed every week.
-#   refit_months  : how often to retrain (1 = monthly, 3 = quarterly, ...).
-#   window        : "exp" expanding (default) or "rollN" (e.g. "roll6").
-#   oos_start     : first out-of-sample year.
+# We do NOT edit iv_cnn_runner.py. run() looks up the trainer by the
+# module-global name `train_cnn_dm_tanh` at call time, so we just rebind
+# that name to our PCA trainer (monkey-patch). The trainer keeps the same
+# contract: train(Xtr, ytr, ...) -> predict(Xte) -> predictions.
 #
-# Leak control: training uses only observations whose forward-return
-# window closes BEFORE the test period starts (embargo = horizon);
-# all scalers are fit on the training window only; weekly rows are used
-# for training, evaluation only on the rebalance-grid rows.
+# Leak control (matches the CNN path): the PCA basis, the feature
+# scalers and the regression coefficients are ALL fit on the training
+# window only, then applied to the held-out test rows.
 #
-# Notebook usage (data pickles in the same folder as the notebook):
-#   from iv_cnn_runner import run
-#   res = run()                                  # 20D, monthly refit
-#   res = run(rebalance="5D", refit_months=3)    # weekly rebalance
-#   res["predictions"].head(); res["summary"]
-#
-# CLI usage:
-#   python iv_cnn_runner.py --rebalance 20D --refit-months 1
+# Usage:
+#   python pca_pc2_runner.py
+#   # or, in a notebook:
+#   from pca_pc2_runner import run_pca
+#   res = run_pca(test_start="2008-03")
 # ======================================================================
 from __future__ import annotations
-import argparse, glob, logging, os, time
-from pathlib import Path
 import numpy as np
-import pandas as pd
-
-log = logging.getLogger("iv_runner")
-
-def _setup_log(data_dir=None, level=logging.DEBUG):
-    if log.handlers:
-        return
-    log.setLevel(level)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
-    log.addHandler(sh)
-    try:
-        d = Path(data_dir) if data_dir else Path.cwd()
-        fh = logging.FileHandler(d / "iv_runner.log"); fh.setFormatter(fmt)
-        log.addHandler(fh)
-    except Exception:
-        pass
-
-def _hint(msg, suggestion):
-    log.error(msg)
-    log.error("SUGGESTION: " + suggestion)
-    raise RuntimeError(f"{msg} | {suggestion}")
-
-N_CELLS, SHAPE = 180, (10, 18)
-ATM_CELLS = [0, 17]
+import iv_cnn_runner as ivr
 
 
-# ---------------------------- data -----------------------------------
-def _ci(cols, names):
-    low = {c.lower(): c for c in cols}
-    for n in names:
-        if n.lower() in low:
-            return low[n.lower()]
-    return None
+# ---------------------------------------------------------------- model
+def train_pca_pc2_lr(Xtr, ytr, n_components=2, use_pc=2, winsorize=True,
+                     per_image_demean=False, standardize=True, **kwargs):
+    """Standard PCA -> OLS on a single principal component (PC2 by default).
 
+    Same interface as iv_cnn_runner.train_cnn_dm_tanh, so it can be
+    monkey-patched in. `kwargs` swallows CNN-only args (seeds, epochs...).
 
-def load_panel(data_dir=None, pattern="*_all_Count_w_fReturns.pickle"):
-    """Load all weekly per-stock pickles found in `data_dir`
-    (default: current working directory, then the directory of this file)."""
-    dirs = [Path(data_dir)] if data_dir else [Path.cwd(), Path(__file__).parent]
-    files = []
-    for d in dirs:
-        files = sorted(glob.glob(str(d / pattern)))
-        if files:
-            break
-    if not files:
-        _hint(f"no files matching {pattern} in {dirs}",
-              "put the pickle files in the same folder as the notebook, or pass "
-              "data_dir='...'; if the filenames differ, pass pattern='*.pickle'")
-    df = pd.concat([pd.read_pickle(f) for f in files], ignore_index=True)
-    idc = _ci(df.columns, ["perm_ID", "perm_id", "permno", "permID"])
-    dtc = _ci(df.columns, ["date", "Date", "DATE"])
-    ivc = _ci(df.columns, ["ImpliedVolatility", "implied_volatility", "iv_surface"])
-    if not (idc and dtc and ivc):
-        _hint(f"required columns not found; have {list(df.columns)[:15]}",
-              "need an id column (perm_ID/permno), a date column, and a length-180 "
-              "surface column (ImpliedVolatility); rename columns or extend the "
-              "candidate lists in load_panel()")
-    df = df.rename(columns={idc: "perm_ID", dtc: "date", ivc: "ImpliedVolatility"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = (df.dropna(subset=["ImpliedVolatility"])
-            .drop_duplicates(["perm_ID", "date"])
-            .sort_values(["perm_ID", "date"]).reset_index(drop=True))
-    S = np.full((len(df), N_CELLS), np.nan, np.float32)
-    for i, v in enumerate(df["ImpliedVolatility"].values):
-        a = np.ravel(np.asarray(v, dtype=np.float32))
-        if a.size == N_CELLS:
-            S[i] = a
-    ok = np.isfinite(S).all(1)
-    n_bad = int((~ok).sum())
-    if n_bad:
-        log.warning("dropped %d rows with malformed/NaN surfaces (%.1f%%)",
-                    n_bad, 100 * n_bad / len(ok))
-        if n_bad > 0.2 * len(ok):
-            log.warning("SUGGESTION: >20%% bad surfaces - check that the surface "
-                        "column holds length-180 numeric arrays")
-    df, S = df[ok].reset_index(drop=True), S[ok]
-    if len(df) == 0:
-        _hint("no valid rows after surface cleaning",
-              "verify the surface column contains 180 finite values per row")
-    df["_m"] = df["date"].dt.to_period("M")
-    last = df.groupby(["perm_ID", "_m"])["date"].transform("max")
-    df["is_me"] = (df["date"] == last)          # last available day of month
-    print(f"loaded {len(files)} files -> {len(df):,} rows, "
-          f"{df['perm_ID'].nunique()} stocks, "
-          f"{df['date'].min().date()}..{df['date'].max().date()}")
-    return df, S
-
-
-# ---------------------------- model ----------------------------------
-def train_cnn_dm_tanh(Xtr, ytr, seeds=3, epochs=25, patience=3,
-                      winsorize=True, lr=1e-3, batch=1024, device=None):
-    """Train the CNN ensemble (per-image demeaning + tanh-bounded output).
-    Returns a predictor: predict(Xte) -> predictions in target units."""
-    import torch, torch.nn as nn, torch.nn.functional as F
-    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    if winsorize:
+    Fit ONLY on the training window:
+      1. (optional) per-image demean -- OFF by default. PCA does NOT need
+         it; it was a CNN choice to strip each surface's own level. Turn
+         on only if you want PCs to describe surface *shape* not *level*.
+      2. column-center (and optionally scale) using training-row stats.
+         Centering across observations is the only thing standard PCA
+         requires, and the SVD below operates on the centered matrix.
+      3. PCA basis from training rows (NumPy SVD, no sklearn dependency).
+      4. OLS of y on the chosen component score (PC2).
+    """
+    X = np.asarray(Xtr, dtype=np.float64)
+    ytr = np.asarray(ytr, dtype=np.float64)
+    if winsorize:                                   # tame return outliers
         lo, hi = np.quantile(ytr, [0.01, 0.99])
-        ytr = np.clip(ytr, lo, hi).astype(np.float32)
-    dm = lambda A: A - A.mean(1, keepdims=True)         # per-image demean
-    Xtr = dm(Xtr)
-    mu, sd = Xtr.mean(0), Xtr.std(0); sd[sd < 1e-8] = 1
-    Xtr = (Xtr - mu) / sd
-    ymu, ysd = float(ytr.mean()), float(ytr.std() + 1e-8)
-    ys_all = (ytr - ymu) / ysd
-    cap = float(np.quantile(np.abs(ys_all), 0.99))
-    nval = max(50, int(0.15 * len(Xtr)))
-    t = lambda A: torch.from_numpy(np.ascontiguousarray(A)).view(-1, 1, *SHAPE).to(dev)
-    Xs_t, Xv_t = t(Xtr[:-nval]), t(Xtr[-nval:])
-    ys_t = torch.from_numpy(ys_all[:-nval]).to(dev)
-    yv_t = torch.from_numpy(ys_all[-nval:]).to(dev)
+        ytr = np.clip(ytr, lo, hi)
 
-    class CNN4(nn.Module):
-        def __init__(s):
-            super().__init__()
-            L, c = [], 1
-            for f in (16, 32, 64, 128):
-                L += [nn.Conv2d(c, f, 3, padding=1),
-                      nn.MaxPool2d(2, ceil_mode=True),
-                      nn.BatchNorm2d(f), nn.ReLU()]
-                c = f
-            s.net = nn.Sequential(*L)
-            s.gap = nn.AdaptiveAvgPool2d(1)
-            s.head = nn.Linear(c, 1)
-        def forward(s, x):
-            return s.head(s.gap(s.net(x)).flatten(1)).squeeze(-1)
+    if per_image_demean:
+        X = X - X.mean(1, keepdims=True)            # per-surface level removed
 
-    nets = []
-    idx = torch.arange(len(Xs_t))
-    for k in range(seeds):
-        torch.manual_seed(42 + k)
-        net = CNN4().to(dev)
-        opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-5)
-        best, bst, wait = 1e18, None, 0
-        for _ in range(epochs):
-            net.train()
-            perm = idx[torch.randperm(len(idx))]
-            for s0 in range(0, len(perm), batch):
-                b = perm[s0:s0 + batch]
-                if len(b) < 2:
-                    continue
-                opt.zero_grad()
-                o = torch.tanh(net(Xs_t[b])) * cap
-                F.mse_loss(o, ys_t[b]).backward()
-                opt.step()
-            net.eval()
-            with torch.no_grad():
-                v = F.mse_loss(torch.tanh(net(Xv_t)) * cap, yv_t).item()
-            if v < best - 1e-7:
-                best, wait = v, 0
-                bst = {a: b_.clone() for a, b_ in net.state_dict().items()}
-            else:
-                wait += 1
-                if wait >= patience:
-                    break
-        if bst:
-            net.load_state_dict(bst)
-        net.eval()
-        nets.append(net)
+    mu = X.mean(0)                                  # column (per-cell) mean
+    sd = X.std(0) if standardize else np.ones(X.shape[1])
+    sd[sd < 1e-8] = 1.0
+    Xz = (X - mu) / sd                              # centered (+scaled) -> ready for PCA
+
+    # ---- PCA via SVD on the column-centered matrix; Vt rows = PCs by var ----
+    _, S_, Vt = np.linalg.svd(Xz, full_matrices=False)
+    var = (S_ ** 2) / max(len(Xz) - 1, 1)
+    evr = var / var.sum()
+    j = int(use_pc) - 1                             # PC2 -> index 1
+    comp = Vt[j]                                    # (180,) loading of PCj
+    pc_tr = (Xz @ comp).reshape(-1, 1)             # PC2 score on training rows
+
+    # ---- OLS of y on PC2 (with intercept) via lstsq ----
+    A = np.hstack([pc_tr, np.ones_like(pc_tr)])
+    coef, *_ = np.linalg.lstsq(A, ytr, rcond=None)
+    beta, intercept = float(coef[0]), float(coef[1])
+    yhat = A @ coef
+    ss_res = float(((ytr - yhat) ** 2).sum())
+    ss_tot = float(((ytr - ytr.mean()) ** 2).sum()) + 1e-12
+    r2 = 1.0 - ss_res / ss_tot
+
+    ivr.log.info("PCA+OLS on PC%d | demean=%s scale=%s | n_train=%d | "
+                 "PC%d var=%.1f%% | beta=%.4g intercept=%.4g (R2_pc=%.4f)",
+                 use_pc, per_image_demean, standardize, len(ytr),
+                 use_pc, 100 * evr[j], beta, intercept, r2)
 
     def predict(Xte):
-        Xte_ = (dm(Xte) - mu) / sd
-        Xte_t = t(Xte_)
-        p = np.zeros(len(Xte_), np.float64)
-        with torch.no_grad():
-            for net in nets:
-                p += (torch.tanh(net(Xte_t)) * cap).cpu().numpy()
-        return p / len(nets) * ysd + ymu
+        Xte = np.asarray(Xte, dtype=np.float64)
+        if per_image_demean:
+            Xte = Xte - Xte.mean(1, keepdims=True)
+        Xz_te = (Xte - mu) / sd                     # SAME training scalers
+        pc_te = Xz_te @ comp                        # project onto training basis
+        return beta * pc_te + intercept
+
     return predict
 
 
-# ------------------------- walk-forward ------------------------------
-def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
-        rebalance="20D", refit_months=1, window="exp",
-        test_start=None, test_end=None, seeds=3, train_weekly=True,
-        save_csv=True, verbose=True, oos_start=None,
-        require_months=None, balanced_panel=False):
+# ----------------------------------------------- equal-weight benchmark
+def _ann(ppy):
+    sharpe = lambda r: float(r.mean() / r.std() * np.sqrt(ppy))
+    def cagr(r):
+        nav = np.cumprod(1.0 + np.asarray(r, float))
+        return float(nav[-1] ** (ppy / len(r)) - 1.0)
+    return sharpe, cagr
+
+
+def equal_weight_benchmark(res):
+    """Equal-weight the ENTIRE scored universe each period (no model used).
+
+    This is the naive 1/N benchmark. Compare it against the model's
+    equal-weighted top decile (which res['portfolio'] already reports:
+    `top['ex_ret'].mean()` is itself an equal-weight average within the
+    top 10%). Returns a small dict and prints a side-by-side.
     """
-    Walk-forward evaluation. Returns dict with `predictions` (DataFrame),
-    `summary` (dict) and writes predictions_<rebalance>.csv next to the data.
-    test_start / test_end: year (2018) or "YYYY-MM" strings bounding the
-    out-of-sample window. Diagnostics go to iv_runner.log.
-    """
-    _setup_log(data_dir)
-    log.info("=" * 64)
-    log.info("NEW RUN | rebalance=%s refit_months=%s window=%s "
-             "test_start=%s test_end=%s seeds=%s",
-             rebalance, refit_months, window, test_start, test_end, seeds)
-    log.info("=" * 64)
-    assert rebalance in ("20D", "5D"), "rebalance must be '20D' or '5D'"
-    horizon_days = 20 if rebalance == "20D" else 5
-    target = f"TRET_SP500_EX_F{horizon_days}D"
-    grp = "M" if rebalance == "20D" else "W"
-    df, S = load_panel(data_dir, pattern)
-    tcol = _ci(df.columns, [target])
-    if tcol is None:
-        _hint(f"target {target} not found in data",
-              f"for rebalance='{rebalance}' the data needs column {target}; "
-              "available: " + ", ".join(c for c in df.columns if "TRET" in str(c).upper()))
-    y = pd.to_numeric(df[tcol], errors="coerce").values.astype(np.float32)
-    ok = np.isfinite(y)
-    if balanced_panel:
-        n_all = df["_m"].nunique()
-        cov = df.groupby("perm_ID")["_m"].nunique()
-        keep_ids = set(cov[cov == n_all].index)
-        ok &= df["perm_ID"].isin(keep_ids).values
-        log.warning("balanced_panel=True: %d/%d stocks kept. This filter uses "
-                    "FUTURE information (survivorship bias) - results are "
-                    "diagnostics only, do not report them as a backtest.",
-                    len(keep_ids), int(cov.shape[0]))
-    if require_months:
-        N = int(require_months)
-        pres = (df.drop_duplicates(["perm_ID", "_m"])
-                  .assign(v=1)
-                  .pivot_table(index="perm_ID", columns="_m", values="v",
-                               fill_value=0))
-        pres = pres.reindex(columns=pd.period_range(
-            df["_m"].min(), df["_m"].max(), freq="M"), fill_value=0)
-        roll = (pres.T.rolling(N, min_periods=N).sum().T == N)   # trailing N
-        flag = roll.stack()
-        idx = pd.MultiIndex.from_arrays([df["perm_ID"], df["_m"]])
-        good = flag.reindex(idx).fillna(False).values.astype(bool)
-        before = int(ok.sum())
-        ok &= good
-        log.info("require_months=%d (point-in-time): %d -> %d usable rows "
-                 "(%.0f%% kept)", N, before, int(ok.sum()),
-                 100 * ok.sum() / max(before, 1))
-        if ok.sum() < 0.3 * before:
-            log.warning("SUGGESTION: filter removed >70%% of rows - consider "
-                        "a smaller require_months or check for data gaps")
-    if ok.mean() < 0.5:
-        log.warning("only %.0f%% of target values are finite; check %s",
-                    100 * ok.mean(), tcol)
-    test_grid = df["is_me"].values if rebalance == "20D" else np.ones(len(df), bool)
-    def _to_month(v, default_ts):
-        if v is None:
-            return default_ts
-        if isinstance(v, int):
-            return pd.Period(f"{v}-01", "M") if default_ts.month == 1 \
-                   else pd.Period(f"{v}-12", "M")
-        return pd.Period(pd.Timestamp(str(v)), "M")   # accepts "YYYY", "YYYY-MM",
-                                                      # "YYYY-MM-DD", Timestamps
-    mid = int(df["date"].dt.year.quantile(0.5))
-    ts_default = pd.Period(f"{test_start or oos_start or mid}-01", "M") \
-        if isinstance(test_start or oos_start or mid, int) else None
-    start_m = _to_month(test_start or oos_start or mid, pd.Period(f"{mid}-01", "M"))
-    end_m = _to_month(test_end, pd.Period(df["date"].max(), "M"))
-    months = pd.period_range(start_m, end_m, freq="M")
-    if len(months) == 0:
-        _hint(f"empty test window {ts}..{te_}",
-              "check test_start/test_end against the data range "
-              f"{df['date'].min().date()}..{df['date'].max().date()}")
-    log.info("test window: %s .. %s (%d months) | rebalance=%s refit=%dmo window=%s",
-             months[0], months[-1], len(months), rebalance, refit_months, window)
-    embargo = pd.DateOffset(days=int(horizon_days * 1.6))     # trading->calendar
-    preds = np.full(len(df), np.nan)
-    predictor = None
-    t0 = time.time()
-    for i, mper in enumerate(months):
-        te_lo = mper.to_timestamp()
-        te_hi = (mper + 1).to_timestamp()
-        te = ok & test_grid & ((df["date"] >= te_lo) & (df["date"] < te_hi)).values
-        if te.sum() == 0:
-            log.debug("no test rows in %s", mper)
-            continue
-        if predictor is None or i % max(1, int(refit_months)) == 0:
-            tr = ok & (df["date"] < te_lo - embargo).values
-            if window.startswith("roll"):
-                tr &= (df["date"] >= te_lo - pd.DateOffset(
-                    years=int(window[4:]))).values
-            if not train_weekly:
-                tr &= df["is_me"].values
-            if tr.sum() < 500:
-                log.warning("refit %s skipped: only %d training rows "
-                            "(need 500). SUGGESTION: move test_start later or "
-                            "use window='exp'", mper, int(tr.sum()))
-                continue
-            predictor = train_cnn_dm_tanh(S[tr], y[tr], seeds=seeds)
-            log.debug("refit %s: fresh random-init ensemble (no warm start); "
-                      "scalers re-fit on current training window", mper)
-            if verbose:
-                print(f"  refit {mper}: ntr={tr.sum():,} fresh ensemble "
-                      f"({time.time()-t0:.0f}s elapsed)", flush=True)
-        preds[te] = predictor(S[te])
-    # ---------------- evaluation ----------------
-    out = df.loc[np.isfinite(preds), ["perm_ID", "date"]].copy()
-    out["y_pred"] = preds[np.isfinite(preds)]
-    out["y_true"] = y[np.isfinite(preds)]
-    out["per"] = out["date"].dt.to_period(grp)
-    sizes = out.groupby("per").size()
-    min_n = max(15, int(sizes.median() * 0.5))
-    ics, hl, lng = [], [], []
-    for _, g in out.groupby("per"):
-        if len(g) < min_n or g["y_pred"].std() < 1e-12:
-            continue
-        ics.append(np.corrcoef(g["y_pred"].rank(), g["y_true"].rank())[0, 1])
-        q = g["y_pred"].rank(pct=True)
-        hl.append(g.loc[q >= 0.9, "y_true"].mean() - g.loc[q <= 0.1, "y_true"].mean())
-        lng.append(g.loc[q >= 0.9, "y_true"].mean())
-    ppy = 12.0 if grp == "M" else 52.0
-    ics, hl, lng = map(np.asarray, (ics, hl, lng))
-    summary = {
-        "rebalance": rebalance, "target": tcol, "window": window,
-        "refit_months": refit_months, "n_periods": int(len(hl)),
-        "IC": float(np.nanmean(ics)),
-        "IC_t": float(np.nanmean(ics) / np.nanstd(ics) * np.sqrt(len(ics))),
-        "HL_ann": float(np.nanmean(hl) * ppy),
-        "HL_sharpe": float(np.nanmean(hl) / np.nanstd(hl) * np.sqrt(ppy)),
-        "LONG_ann": float(np.nanmean(lng) * ppy),
-        "LONG_sharpe": float(np.nanmean(lng) / np.nanstd(lng) * np.sqrt(ppy)),
+    out = res["predictions"].copy()
+    pf = res["portfolio"]
+    grp_is_month = res["summary"]["rebalance"] == "20D"
+    ppy = 12.0 if grp_is_month else 52.0
+    sharpe, cagr = _ann(ppy)
+
+    ew = (out.dropna(subset=["ex_ret", "raw_ret"])
+             .groupby("per")
+             .agg(ex=("ex_ret", "mean"), raw=("raw_ret", "mean"),
+                  n=("ex_ret", "size"))
+             .reset_index())
+
+    bench = {
+        "universe_EW_n":      float(ew["n"].mean()),
+        "universe_EW_ex_sharpe":  sharpe(ew["ex"]),
+        "universe_EW_ex_cagr":    cagr(ew["ex"]),
+        "universe_EW_real_sharpe": sharpe(ew["raw"]),
+        "universe_EW_real_cagr":   cagr(ew["raw"]),
+        "topdecile_EW_n":     float(pf["n"].mean()),
+        "topdecile_EW_ex_sharpe":  sharpe(pf["ex"]),
+        "topdecile_EW_ex_cagr":    cagr(pf["ex"]),
+        "topdecile_EW_real_sharpe": sharpe(pf["raw"]),
+        "topdecile_EW_real_cagr":   cagr(pf["raw"]),
     }
-    if verbose:
-        print("\n".join(f"  {k}: {v}" for k, v in summary.items()))
-    if save_csv:
-        d = Path(data_dir) if data_dir else Path.cwd()
-        fn = d / f"predictions_{rebalance}.csv"
-        out.drop(columns="per").to_csv(fn, index=False)
-        if verbose:
-            print(f"saved -> {fn}")
-    return {"predictions": out, "summary": summary}
+
+    print("\n=== equal-weight comparison (both portfolios equal-weighted) ===")
+    print(f"{'':22s}{'avg names':>10s}{'ex Sharpe':>11s}{'ex CAGR':>10s}"
+          f"{'real Sharpe':>13s}{'real CAGR':>11s}")
+    print(f"{'whole universe 1/N':22s}{bench['universe_EW_n']:>10.0f}"
+          f"{bench['universe_EW_ex_sharpe']:>11.2f}"
+          f"{100*bench['universe_EW_ex_cagr']:>9.1f}%"
+          f"{bench['universe_EW_real_sharpe']:>13.2f}"
+          f"{100*bench['universe_EW_real_cagr']:>10.1f}%")
+    print(f"{'model top decile':22s}{bench['topdecile_EW_n']:>10.0f}"
+          f"{bench['topdecile_EW_ex_sharpe']:>11.2f}"
+          f"{100*bench['topdecile_EW_ex_cagr']:>9.1f}%"
+          f"{bench['topdecile_EW_real_sharpe']:>13.2f}"
+          f"{100*bench['topdecile_EW_real_cagr']:>10.1f}%")
+    return bench, ew
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", default=None)
-    ap.add_argument("--pattern", default="*_all_Count_w_fReturns.pickle")
-    ap.add_argument("--rebalance", default="20D", choices=["20D", "5D"])
-    ap.add_argument("--refit-months", type=int, default=1)
-    ap.add_argument("--window", default="exp")
-    ap.add_argument("--test-start", default=None)
-    ap.add_argument("--test-end", default=None)
-    ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--require-months", type=int, default=None)
-    a = ap.parse_args()
-    run(a.data_dir, a.pattern, a.rebalance, a.refit_months, a.window,
-        a.test_start, a.test_end, a.seeds,
-        require_months=a.require_months)
+# ---------------------------------------------------------------- run
+def run_pca(pattern="om_panel_top100*.pickle", require_months="exp",
+            test_start="2008-03", test_end=None, rebalance="20D",
+            refit_months=1, window="exp", use_pc=2,
+            per_image_demean=False, standardize=True, **run_kwargs):
+    """Monkey-patch the trainer to PCA+OLS-on-PC2 and run the walk-forward."""
+    # rebind the global the runner calls -> our PCA trainer
+    ivr.train_cnn_dm_tanh = (
+        lambda Xtr, ytr, **kw: train_pca_pc2_lr(
+            Xtr, ytr, use_pc=use_pc, per_image_demean=per_image_demean,
+            standardize=standardize, **kw))
+
+    res = ivr.run(pattern=pattern, require_months=require_months,
+                  test_start=test_start, test_end=test_end,
+                  rebalance=rebalance, refit_months=refit_months,
+                  window=window, **run_kwargs)
+
+    bench, ew = equal_weight_benchmark(res)
+    res["ew_benchmark"] = bench
+    res["ew_series"] = ew
+
+    # ---- persist the equal-weight-all series + overlay it on a plot ----
+    import os
+    from pathlib import Path
+    d = Path(run_kwargs.get("data_dir") or os.getcwd())
+    reb = res["summary"]["rebalance"]
+    ew.to_csv(d / f"equal_weight_all_{reb}.csv", index=False)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        pf = res["portfolio"]
+        t_pf = pf["per"].dt.to_timestamp()
+        t_ew = ew["per"].dt.to_timestamp()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        for ax, col, ttl in [(axes[0], "ex", "cumulative EXCESS return"),
+                             (axes[1], "raw", "cumulative REAL return")]:
+            ax.plot(t_pf, np.cumprod(1 + pf[col].values) - 1,
+                    lw=1.6, label="model top decile (EW)")
+            ax.plot(t_ew, np.cumprod(1 + ew[col].values) - 1,
+                    lw=1.6, ls="--", label="equal-weight ALL (1/N)")
+            ax.set_title(f"{ttl} ({reb})"); ax.grid(alpha=0.3)
+            ax.set_ylabel("cumulative return"); ax.legend()
+        fig.tight_layout()
+        png = d / f"topdecile_vs_equalweight_{reb}.png"
+        fig.savefig(png, dpi=130); plt.close(fig)
+        ivr.log.info("comparison plot saved -> %s", png)
+        print(f"saved -> {png}")
+    except Exception as exc:
+        ivr.log.warning("EW comparison plot skipped (%s)", exc)
+
+    return res
 
 
 if __name__ == "__main__":
-    main()
+    run_pca()
