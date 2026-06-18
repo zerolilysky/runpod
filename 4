@@ -1,0 +1,507 @@
+# ======================================================================
+# iv_cnn_runner.py
+# ----------------------------------------------------------------------
+# Walk-forward return forecasting from IV surfaces (10x18) on weekly
+# per-stock pickle files, with a CNN (per-image demeaning + tanh-bounded
+# output). Data files are loaded from the CURRENT WORKING DIRECTORY by
+# default, so the notebook/script just needs to sit next to the pickles.
+#
+# Key settings (all arguments of run()):
+#   rebalance     : "20D" (default) -> target *_EX_F20D, one test obs per
+#                   stock-month (last available trading day of the month);
+#                   "5D" -> target *_EX_F5D, every weekly obs is a test obs,
+#                   portfolio formed every week.
+#   refit_months  : how often to retrain (1 = monthly, 3 = quarterly, ...).
+#   window        : "exp" expanding (default) or "rollN" (e.g. "roll6").
+#   oos_start     : first out-of-sample year.
+#
+# Leak control: training uses only observations whose forward-return
+# window closes BEFORE the test period starts (embargo = horizon);
+# all scalers are fit on the training window only; weekly rows are used
+# for training, evaluation only on the rebalance-grid rows.
+#
+# Notebook usage (data pickles in the same folder as the notebook):
+#   from iv_cnn_runner import run
+#   res = run()                                  # 20D, monthly refit
+#   res = run(rebalance="5D", refit_months=3)    # weekly rebalance
+#   res["predictions"].head(); res["summary"]
+#
+# CLI usage:
+#   python iv_cnn_runner.py --rebalance 20D --refit-months 1
+# ======================================================================
+from __future__ import annotations
+import argparse, glob, logging, os, time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+log = logging.getLogger("iv_runner")
+
+def _setup_log(data_dir=None, level=logging.DEBUG):
+    if log.handlers:
+        return
+    log.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
+    log.addHandler(sh)
+    try:
+        d = Path(data_dir) if data_dir else Path.cwd()
+        fh = logging.FileHandler(d / "iv_runner.log"); fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except Exception:
+        pass
+
+def _hint(msg, suggestion):
+    log.error(msg)
+    log.error("SUGGESTION: " + suggestion)
+    raise RuntimeError(f"{msg} | {suggestion}")
+
+N_CELLS, SHAPE = 180, (10, 18)
+ATM_CELLS = [0, 17]
+
+
+# ---------------------------- data -----------------------------------
+def _ci(cols, names):
+    low = {c.lower(): c for c in cols}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def load_panel(data_dir=None, pattern="*_all_Count_w_fReturns.pickle"):
+    """Load all weekly per-stock pickles found in `data_dir`
+    (default: current working directory, then the directory of this file)."""
+    dirs = [Path(data_dir)] if data_dir else [Path.cwd(), Path(__file__).parent]
+    files = []
+    for d in dirs:
+        files = sorted(glob.glob(str(d / pattern)))
+        if files:
+            break
+    if not files:
+        _hint(f"no files matching {pattern} in {dirs}",
+              "put the pickle files in the same folder as the notebook, or pass "
+              "data_dir='...'; if the filenames differ, pass pattern='*.pickle'")
+    df = pd.concat([pd.read_pickle(f) for f in files], ignore_index=True)
+    idc = _ci(df.columns, ["perm_ID", "perm_id", "permno", "permID"])
+    dtc = _ci(df.columns, ["date", "Date", "DATE"])
+    ivc = _ci(df.columns, ["ImpliedVolatility", "implied_volatility", "iv_surface"])
+    if not (idc and dtc and ivc):
+        _hint(f"required columns not found; have {list(df.columns)[:15]}",
+              "need an id column (perm_ID/permno), a date column, and a length-180 "
+              "surface column (ImpliedVolatility); rename columns or extend the "
+              "candidate lists in load_panel()")
+    df = df.rename(columns={idc: "perm_ID", dtc: "date", ivc: "ImpliedVolatility"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = (df.dropna(subset=["ImpliedVolatility"])
+            .drop_duplicates(["perm_ID", "date"])
+            .sort_values(["perm_ID", "date"]).reset_index(drop=True))
+    S = np.full((len(df), N_CELLS), np.nan, np.float32)
+    for i, v in enumerate(df["ImpliedVolatility"].values):
+        a = np.ravel(np.asarray(v, dtype=np.float32))
+        if a.size == N_CELLS:
+            S[i] = a
+    ok = np.isfinite(S).all(1)
+    n_bad = int((~ok).sum())
+    if n_bad:
+        log.warning("dropped %d rows with malformed/NaN surfaces (%.1f%%)",
+                    n_bad, 100 * n_bad / len(ok))
+        if n_bad > 0.2 * len(ok):
+            log.warning("SUGGESTION: >20%% bad surfaces - check that the surface "
+                        "column holds length-180 numeric arrays")
+    df, S = df[ok].reset_index(drop=True), S[ok]
+    if len(df) == 0:
+        _hint("no valid rows after surface cleaning",
+              "verify the surface column contains 180 finite values per row")
+    df["_m"] = df["date"].dt.to_period("M")
+    last = df.groupby(["perm_ID", "_m"])["date"].transform("max")
+    df["is_me"] = (df["date"] == last)          # last available day of month
+    print(f"loaded {len(files)} files -> {len(df):,} rows, "
+          f"{df['perm_ID'].nunique()} stocks, "
+          f"{df['date'].min().date()}..{df['date'].max().date()}")
+    return df, S
+
+
+# ---------------------------- model ----------------------------------
+def train_cnn_dm_tanh(Xtr, ytr, seeds=3, epochs=25, patience=3,
+                      winsorize=True, lr=1e-3, batch=1024, device=None):
+    """Train the CNN ensemble (per-image demeaning + tanh-bounded output).
+    Returns a predictor: predict(Xte) -> predictions in target units."""
+    import torch, torch.nn as nn, torch.nn.functional as F
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if winsorize:
+        lo, hi = np.quantile(ytr, [0.01, 0.99])
+        ytr = np.clip(ytr, lo, hi).astype(np.float32)
+    dm = lambda A: A - A.mean(1, keepdims=True)         # per-image demean
+    Xtr = dm(Xtr)
+    mu, sd = Xtr.mean(0), Xtr.std(0); sd[sd < 1e-8] = 1
+    Xtr = (Xtr - mu) / sd
+    ymu, ysd = float(ytr.mean()), float(ytr.std() + 1e-8)
+    ys_all = (ytr - ymu) / ysd
+    cap = float(np.quantile(np.abs(ys_all), 0.99))
+    nval = max(50, int(0.15 * len(Xtr)))
+    t = lambda A: torch.from_numpy(np.ascontiguousarray(A)).view(-1, 1, *SHAPE).to(dev)
+    Xs_t, Xv_t = t(Xtr[:-nval]), t(Xtr[-nval:])
+    ys_t = torch.from_numpy(ys_all[:-nval]).to(dev)
+    yv_t = torch.from_numpy(ys_all[-nval:]).to(dev)
+
+    class CNN4(nn.Module):
+        def __init__(s):
+            super().__init__()
+            L, c = [], 1
+            for f in (16, 32, 64, 128):
+                L += [nn.Conv2d(c, f, 3, padding=1),
+                      nn.MaxPool2d(2, ceil_mode=True),
+                      nn.BatchNorm2d(f), nn.ReLU()]
+                c = f
+            s.net = nn.Sequential(*L)
+            s.gap = nn.AdaptiveAvgPool2d(1)
+            s.head = nn.Linear(c, 1)
+        def forward(s, x):
+            return s.head(s.gap(s.net(x)).flatten(1)).squeeze(-1)
+
+    nets = []
+    idx = torch.arange(len(Xs_t))
+    for k in range(seeds):
+        torch.manual_seed(42 + k)
+        net = CNN4().to(dev)
+        opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-5)
+        best, bst, wait = 1e18, None, 0
+        for _ in range(epochs):
+            net.train()
+            perm = idx[torch.randperm(len(idx))]
+            for s0 in range(0, len(perm), batch):
+                b = perm[s0:s0 + batch]
+                if len(b) < 2:
+                    continue
+                opt.zero_grad()
+                o = torch.tanh(net(Xs_t[b])) * cap
+                F.mse_loss(o, ys_t[b]).backward()
+                opt.step()
+            net.eval()
+            with torch.no_grad():
+                v = F.mse_loss(torch.tanh(net(Xv_t)) * cap, yv_t).item()
+            if v < best - 1e-7:
+                best, wait = v, 0
+                bst = {a: b_.clone() for a, b_ in net.state_dict().items()}
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+        if bst:
+            net.load_state_dict(bst)
+        net.eval()
+        nets.append(net)
+
+    def predict(Xte):
+        Xte_ = (dm(Xte) - mu) / sd
+        Xte_t = t(Xte_)
+        p = np.zeros(len(Xte_), np.float64)
+        with torch.no_grad():
+            for net in nets:
+                p += (torch.tanh(net(Xte_t)) * cap).cpu().numpy()
+        return p / len(nets) * ysd + ymu
+    return predict
+
+
+# ----------------------- optional denoising --------------------------
+def _make_filter(Xtr, denoise=None, drop_train_noise_q=None,
+                 drop_metric="composite"):
+    """Build a (transform, keep_mask) pair from the TRAINING surfaces only.
+
+    All calibration is fit on the training window, so there is NO look-ahead:
+      * transform : applied identically to train and to every test surface
+                    later (parameter-free repair/smoothing, or a train-fitted
+                    winsorizer / PCA low-rank denoiser).
+      * keep_mask : boolean over training rows; drops the noisiest training
+                    surfaces (test universe is left untouched).
+    Needs iv_denoise.py on the path; returns identity if missing or if both
+    arguments are None (the default -> behaviour unchanged)."""
+    ident = (lambda A: A)
+    if denoise in (None, "", "none") and drop_train_noise_q is None:
+        return ident, np.ones(len(Xtr), bool)
+    try:
+        import iv_denoise as dn
+    except Exception:
+        log.warning("iv_denoise.py not importable; denoise/filter ignored")
+        return ident, np.ones(len(Xtr), bool)
+    tf = ident
+    if denoise in (None, "", "none"):
+        pass
+    elif denoise == "spike_repair":
+        tf = lambda A: dn.spike_repair(A)
+    elif denoise in ("smooth_gauss", "smooth_box"):
+        kind = denoise.split("_")[1]; tf = lambda A: dn.smooth(A, kind, 0.5)
+    elif denoise == "winsor":
+        w = dn.PixelWinsorizer().fit(Xtr); tf = lambda A: w.transform(A)
+    elif denoise.startswith("lowrank"):
+        k = int(denoise[7:] or 20)
+        p = dn.PCADenoiser(k=k).fit(Xtr); tf = lambda A: p.transform(A)
+    else:
+        log.warning("unknown denoise='%s'; using identity", denoise)
+    keep = np.ones(len(Xtr), bool)
+    if drop_train_noise_q is not None:
+        if drop_metric == "roughness":
+            v = dn.m_roughness(Xtr); keep = v <= np.quantile(v, drop_train_noise_q)
+        else:
+            sc = dn.NoiseScorer().fit(Xtr)
+            keep = sc.score(Xtr) <= sc.threshold(drop_train_noise_q)
+        log.info("filter: denoise=%s drop %s>q%.2f -> keep %d/%d train rows",
+                 denoise, drop_metric, drop_train_noise_q,
+                 int(keep.sum()), len(keep))
+    return tf, keep
+
+
+# ------------------------- walk-forward ------------------------------
+def run(data_dir=None, pattern="*_all_Count_w_fReturns.pickle",
+        rebalance="20D", refit_months=1, window="exp",
+        test_start=None, test_end=None, seeds=3, train_weekly=True,
+        save_csv=True, verbose=True, oos_start=None,
+        require_months=None, balanced_panel=False, log_level=None,
+        denoise=None, drop_train_noise_q=None, drop_metric="composite"):
+    """
+    Walk-forward evaluation. Returns dict with `predictions` (DataFrame),
+    `summary` (dict) and writes predictions_<rebalance>.csv next to the data.
+    test_start / test_end: year (2018) or "YYYY-MM" strings bounding the
+    out-of-sample window. Diagnostics go to iv_runner.log.
+    """
+    _setup_log(data_dir)
+    if log_level:                       # e.g. "error" silences warnings on
+        import logging as _lg           # the console; file log keeps all
+        _valid = ("debug", "info", "warning", "error")
+        if str(log_level).lower() not in _valid:
+            _hint(f"invalid log_level='{log_level}'",
+                  f"use one of {_valid} (case-insensitive); did you type a "
+                  "zero instead of the letter O?")
+        lvl = getattr(_lg, str(log_level).upper())
+        for h in log.handlers:
+            if isinstance(h, _lg.StreamHandler) and not isinstance(h, _lg.FileHandler):
+                h.setLevel(lvl)
+    log.info("=" * 64)
+    log.info("NEW RUN | rebalance=%s refit_months=%s window=%s "
+             "test_start=%s test_end=%s seeds=%s",
+             rebalance, refit_months, window, test_start, test_end, seeds)
+    log.info("=" * 64)
+    assert rebalance in ("20D", "5D"), "rebalance must be '20D' or '5D'"
+    if window != "exp":
+        if not (window.startswith("roll") and window[4:].isdigit()
+                and int(window[4:]) > 0):
+            _hint(f"invalid window='{window}'",
+                  "use 'exp' (expanding) or 'rollN' with N = years, "
+                  "e.g. 'roll5', 'roll6', 'roll10'")
+    horizon_days = 20 if rebalance == "20D" else 5
+    target = f"TRET_SP500_EX_F{horizon_days}D"
+    grp = "M" if rebalance == "20D" else "W"
+    df, S = load_panel(data_dir, pattern)
+    tcol = _ci(df.columns, [target])
+    if tcol is None:
+        _hint(f"target {target} not found in data",
+              f"for rebalance='{rebalance}' the data needs column {target}; "
+              "available: " + ", ".join(c for c in df.columns if "TRET" in str(c).upper()))
+    y = pd.to_numeric(df[tcol], errors="coerce").values.astype(np.float32)
+    ok = np.isfinite(y)
+    if balanced_panel:
+        n_all = df["_m"].nunique()
+        cov = df.groupby("perm_ID")["_m"].nunique()
+        keep_ids = set(cov[cov == n_all].index)
+        ok &= df["perm_ID"].isin(keep_ids).values
+        log.warning("balanced_panel=True: %d/%d stocks kept. This filter uses "
+                    "FUTURE information (survivorship bias) - results are "
+                    "diagnostics only, do not report them as a backtest.",
+                    len(keep_ids), int(cov.shape[0]))
+    if require_months:
+        pres = (df.drop_duplicates(["perm_ID", "_m"])
+                  .assign(v=1)
+                  .pivot_table(index="perm_ID", columns="_m", values="v",
+                               fill_value=0))
+        all_m = pd.period_range(df["_m"].min(), df["_m"].max(), freq="M")
+        pres = pres.reindex(columns=all_m, fill_value=0)
+        if str(require_months).lower() in ("exp", "expanding", "all"):
+            # expanding coverage: data in EVERY month since sample start
+            elapsed = np.arange(1, len(all_m) + 1)
+            flag = pd.DataFrame(pres.values.cumsum(axis=1) == elapsed,
+                                index=pres.index, columns=all_m).stack()
+            label = "exp (every month since sample start)"
+        else:
+            N = int(require_months)
+            flag = (pres.T.rolling(N, min_periods=N).sum().T == N).stack()
+            label = f"trailing {N} months"
+        idx = pd.MultiIndex.from_arrays([df["perm_ID"], df["_m"]])
+        good = flag.reindex(idx).fillna(False).values.astype(bool)
+        before = int(ok.sum())
+        ok &= good
+        log.info("require_months=%s (point-in-time): %d -> %d usable rows "
+                 "(%.0f%% kept)", label, before, int(ok.sum()),
+                 100 * ok.sum() / max(before, 1))
+        if ok.sum() < 0.3 * before:
+            log.warning("SUGGESTION: filter removed >70%% of rows - with "
+                        "'exp', any stock listed after the sample start is "
+                        "excluded forever; consider a trailing int instead")
+    if ok.mean() < 0.5:
+        log.warning("only %.0f%% of target values are finite; check %s",
+                    100 * ok.mean(), tcol)
+    test_grid = df["is_me"].values if rebalance == "20D" else np.ones(len(df), bool)
+    def _to_month(v, default_ts):
+        if v is None:
+            return default_ts
+        if isinstance(v, int):
+            return pd.Period(f"{v}-01", "M") if default_ts.month == 1 \
+                   else pd.Period(f"{v}-12", "M")
+        return pd.Period(pd.Timestamp(str(v)), "M")   # accepts "YYYY", "YYYY-MM",
+                                                      # "YYYY-MM-DD", Timestamps
+    mid = int(df["date"].dt.year.quantile(0.5))
+    ts_default = pd.Period(f"{test_start or oos_start or mid}-01", "M") \
+        if isinstance(test_start or oos_start or mid, int) else None
+    start_m = _to_month(test_start or oos_start or mid, pd.Period(f"{mid}-01", "M"))
+    end_m = _to_month(test_end, pd.Period(df["date"].max(), "M"))
+    months = pd.period_range(start_m, end_m, freq="M")
+    if len(months) == 0:
+        _hint(f"empty test window {ts}..{te_}",
+              "check test_start/test_end against the data range "
+              f"{df['date'].min().date()}..{df['date'].max().date()}")
+    log.info("test window: %s .. %s (%d months) | rebalance=%s refit=%dmo window=%s",
+             months[0], months[-1], len(months), rebalance, refit_months, window)
+    embargo = pd.DateOffset(days=int(horizon_days * 1.6))     # trading->calendar
+    preds = np.full(len(df), np.nan)
+    predictor = None
+    tf_current = (lambda A: A)          # optional in-place denoiser (set at refit)
+    t0 = time.time()
+    for i, mper in enumerate(months):
+        te_lo = mper.to_timestamp()
+        te_hi = (mper + 1).to_timestamp()
+        te = ok & test_grid & ((df["date"] >= te_lo) & (df["date"] < te_hi)).values
+        if te.sum() == 0:
+            log.debug("no test rows in %s", mper)
+            continue
+        if predictor is None or i % max(1, int(refit_months)) == 0:
+            tr = ok & (df["date"] < te_lo - embargo).values
+            if window.startswith("roll"):
+                tr &= (df["date"] >= te_lo - pd.DateOffset(
+                    years=int(window[4:]))).values
+            if not train_weekly:
+                tr &= df["is_me"].values
+            if tr.sum() < 500:
+                log.warning("refit %s skipped: only %d training rows "
+                            "(need 500). SUGGESTION: move test_start later or "
+                            "use window='exp'", mper, int(tr.sum()))
+                continue
+            tf_current, _keep = _make_filter(S[tr], denoise, drop_train_noise_q,
+                                             drop_metric)
+            predictor = train_cnn_dm_tanh(tf_current(S[tr])[_keep],
+                                          y[tr][_keep], seeds=seeds)
+            log.debug("refit %s: fresh random-init ensemble (no warm start); "
+                      "scalers re-fit on current training window", mper)
+            if verbose:
+                print(f"  refit {mper}: ntr={tr.sum():,} fresh ensemble "
+                      f"({time.time()-t0:.0f}s elapsed)", flush=True)
+        preds[te] = predictor(tf_current(S[te]))
+    # ---------------- evaluation: LONG-ONLY top decile ----------------
+    raw_col = _ci(df.columns, [f"TRET_F{horizon_days}D"])
+    if raw_col is None:
+        _hint(f"raw return column TRET_F{horizon_days}D not found",
+              "the raw (total) forward return is required for real-return "
+              "stats; available: " +
+              ", ".join(c for c in df.columns if "TRET" in str(c).upper()))
+    raw = pd.to_numeric(df[raw_col], errors="coerce").values.astype(np.float32)
+    fin = np.isfinite(preds)
+    out = df.loc[fin, ["perm_ID", "date"]].copy()
+    out["y_pred"] = preds[fin]
+    out["ex_ret"] = y[fin]            # excess forward return (vs index)
+    out["raw_ret"] = raw[fin]         # total forward return
+    out["per"] = out["date"].dt.to_period(grp)
+    sizes = out.groupby("per").size()
+    min_n = max(15, int(sizes.median() * 0.5))
+    rows = []
+    for per_, g in out.groupby("per"):
+        g = g.dropna(subset=["y_pred", "ex_ret", "raw_ret"])
+        if len(g) < min_n or g["y_pred"].std() < 1e-12:
+            continue
+        q = g["y_pred"].rank(pct=True)
+        top = g[q >= 0.9]
+        rows.append({"per": per_, "ex": top["ex_ret"].mean(),
+                     "raw": top["raw_ret"].mean(), "n": len(top)})
+    pf = pd.DataFrame(rows)
+    if len(pf) < 6:
+        _hint(f"only {len(pf)} evaluable periods",
+              "widen test_start/test_end, lower require_months, or check that "
+              "predictions were produced (see refit lines above)")
+    ppy = 12.0 if grp == "M" else 52.0
+    def _sharpe(r): return float(r.mean() / r.std() * np.sqrt(ppy))
+    def _cagr(r):
+        nav = np.cumprod(1.0 + r.values)
+        return float(nav[-1] ** (ppy / len(r)) - 1.0)
+    summary = {
+        "rebalance": rebalance, "target": tcol, "raw_col": raw_col,
+        "window": window, "refit_months": refit_months,
+        "n_periods": int(len(pf)),
+        "avg_names_held": float(pf["n"].mean()),
+        "ex_sharpe": _sharpe(pf["ex"]), "ex_cagr": _cagr(pf["ex"]),
+        "real_sharpe": _sharpe(pf["raw"]), "real_cagr": _cagr(pf["raw"]),
+    }
+    log.info("LONG-ONLY top decile | ex_sharpe=%.2f ex_cagr=%.1f%% | "
+             "real_sharpe=%.2f real_cagr=%.1f%% (%d periods)",
+             summary["ex_sharpe"], 100 * summary["ex_cagr"],
+             summary["real_sharpe"], 100 * summary["real_cagr"],
+             summary["n_periods"])
+    if verbose:
+        print("\n".join(f"  {k}: {v}" for k, v in summary.items()))
+    d = Path(data_dir) if data_dir else Path.cwd()
+    # ---------------- plots: cumulative excess & real return ----------
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        ts_idx = pf["per"].dt.to_timestamp()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        for ax, col, ttl in [(axes[0], "ex", "cumulative EXCESS return"),
+                             (axes[1], "raw", "cumulative REAL return")]:
+            nav = np.cumprod(1.0 + pf[col].values) - 1.0
+            ax.plot(ts_idx, nav, lw=1.6)
+            ax.set_title(f"long-only top decile - {ttl} ({rebalance})")
+            ax.grid(alpha=0.3)
+            ax.set_ylabel("cumulative return")
+        fig.tight_layout()
+        png = d / f"long_only_{rebalance}.png"
+        fig.savefig(png, dpi=130)
+        plt.close(fig)
+        log.info("plot saved -> %s", png)
+    except Exception as exc:
+        log.warning("plot skipped (%s). SUGGESTION: pip install matplotlib", exc)
+    if save_csv:
+        fn = d / f"predictions_{rebalance}.csv"
+        out.drop(columns="per").to_csv(fn, index=False)
+        pf.to_csv(d / f"portfolio_{rebalance}.csv", index=False)
+        if verbose:
+            print(f"saved -> {fn}")
+    return {"predictions": out, "portfolio": pf, "summary": summary}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default=None)
+    ap.add_argument("--pattern", default="*_all_Count_w_fReturns.pickle")
+    ap.add_argument("--rebalance", default="20D", choices=["20D", "5D"])
+    ap.add_argument("--refit-months", type=int, default=1)
+    ap.add_argument("--window", default="exp")
+    ap.add_argument("--test-start", default=None)
+    ap.add_argument("--test-end", default=None)
+    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--require-months", type=int, default=None)
+    ap.add_argument("--denoise", default=None,
+                    help="in-place surface denoiser: spike_repair | winsor | "
+                         "smooth_gauss | smooth_box | lowrankK (e.g. lowrank20). "
+                         "Default off.")
+    ap.add_argument("--drop-train-noise-q", type=float, default=None,
+                    help="drop training surfaces above this train-quantile of the "
+                         "noise score (e.g. 0.90). Default off.")
+    ap.add_argument("--drop-metric", default="composite",
+                    choices=["composite", "roughness"])
+    a = ap.parse_args()
+    run(a.data_dir, a.pattern, a.rebalance, a.refit_months, a.window,
+        a.test_start, a.test_end, a.seeds,
+        require_months=a.require_months, denoise=a.denoise,
+        drop_train_noise_q=a.drop_train_noise_q, drop_metric=a.drop_metric)
+
+
+if __name__ == "__main__":
+    main()
