@@ -1,0 +1,300 @@
+"""
+iv_denoise.py
+=============
+Noise detection and denoising for 10x18 OptionMetrics implied-vol surfaces.
+
+Grid convention (matches om_panel_*.pickle / iv_cnn_runner.py):
+    surface = length-180 vector, reshaped C-order to (10 maturities, 18 deltas).
+    rows  : maturities 30, 60, ... 730 days (already monotone & smooth).
+    cols  : 18 deltas in the order  P-50 P-45 ... P-10 | C+10 ... C+45 C+50
+            (columns 0..8 are puts, 9..17 are calls).  ATM = cols {0,17} (+-50d).
+
+CRITICAL geometry fact (verified on the data): in the *raw* column order the
+put-wing (col 8, P-10) and the call-wing (col 9, C+10) are adjacent but sit at
+opposite ends of strike space, so |col9 - col8| is ~0.087 in the mean surface vs
+~0.002-0.018 everywhere else.  A naive left-right difference therefore flags this
+*structural* seam as "roughness" on every surface.  All shape/roughness metrics
+below first reorder columns into **monotone strike order** so that smoothness is
+measured along the economically smooth axis (low strike -> high strike):
+
+    MONEY = [8,7,6,5,4,3,2,1,0, 17,16,15,14,13,12,11,10,9]
+
+No-look-ahead contract
+----------------------
+* Metrics that are a pure function of a single surface (roughness, spike,
+  dispersion, total variation, calendar roughness, extreme-pixel fraction) are
+  safe to compute on a test surface at time t -- they use only that surface.
+* Anything that needs a *threshold* or *basis* (NoiseScorer, PCADenoiser,
+  PixelWinsorizer) is fit on the TRAINING window only and then applied to test.
+* The parameter-free in-place denoisers (spike_repair, smooth) apply the *same*
+  transform to train and test surfaces, so the evaluation universe is unchanged.
+
+Author: built for the IV-surface study (denoising experiments).
+"""
+from __future__ import annotations
+import numpy as np
+
+N_CELLS, SHAPE = 180, (10, 18)
+ATM_CELLS = (0, 17)
+# monotone strike order (low strike -> high strike); see module docstring.
+MONEY = np.array([8, 7, 6, 5, 4, 3, 2, 1, 0, 17, 16, 15, 14, 13, 12, 11, 10, 9])
+INV_MONEY = np.argsort(MONEY)
+
+
+# --------------------------------------------------------------------------
+# shape helpers
+# --------------------------------------------------------------------------
+def to_grid(S):
+    """(N,180) or (180,) -> (N,10,18) float64."""
+    A = np.asarray(S, dtype=np.float64)
+    if A.ndim == 1:
+        A = A[None, :]
+    return A.reshape(-1, *SHAPE)
+
+
+def strike_order(G):
+    """Reorder the delta axis of an (N,10,18) grid into monotone strike order."""
+    return G[:, :, MONEY]
+
+
+def _flat(G):
+    """(N,10,18) -> (N,180) in the ORIGINAL column order."""
+    return G.reshape(len(G), -1)
+
+
+# --------------------------------------------------------------------------
+# per-surface noise metrics  (each returns shape (N,); pure function of S)
+# --------------------------------------------------------------------------
+def m_level(S):
+    """Average IV of the surface (a control, not noise per se)."""
+    return to_grid(S).mean((1, 2))
+
+
+def m_dispersion(S):
+    """Per-surface standard deviation of IV across the grid ('high std')."""
+    return to_grid(S).std((1, 2))
+
+
+def m_cov(S):
+    """Coefficient of variation = dispersion / level (scale-free 'high std')."""
+    G = to_grid(S)
+    return G.std((1, 2)) / (G.mean((1, 2)) + 1e-9)
+
+
+def m_roughness(S):
+    """RMS discrete 2-D Laplacian in strike order -- the *validated* noise metric.
+
+    Penalises local bumps/kinks that a genuine arbitrage-free surface cannot
+    have.  Verified: next-month |dIV_ATM| rises ~2x monotonically across
+    roughness quintiles (the mark-noise / mean-reversion signature)."""
+    g = strike_order(to_grid(S))
+    lap = (-4 * g + np.roll(g, 1, 1) + np.roll(g, -1, 1)
+           + np.roll(g, 1, 2) + np.roll(g, -1, 2))[:, 1:-1, 1:-1]
+    return np.sqrt((lap ** 2).mean((1, 2)))
+
+
+def m_total_variation(S):
+    """Mean |first difference| along both axes (strike order)."""
+    g = strike_order(to_grid(S))
+    return (np.abs(np.diff(g, axis=2)).mean((1, 2))
+            + np.abs(np.diff(g, axis=1)).mean((1, 2)))
+
+
+def m_calendar_roughness(S):
+    """RMS second difference along the maturity axis only (term-structure kinks)."""
+    g = to_grid(S)
+    d2 = g[:, 2:, :] - 2 * g[:, 1:-1, :] + g[:, :-2, :]
+    return np.sqrt((d2 ** 2).mean((1, 2)))
+
+
+def _med3(g):
+    """Pure-numpy 3x3 median filter (edge-replicate). g: (N,10,18)."""
+    p = np.pad(g, ((0, 0), (1, 1), (1, 1)), mode="edge")
+    nbr = [p[:, i:i + g.shape[1], j:j + g.shape[2]]
+           for i in range(3) for j in range(3)]
+    return np.median(np.stack(nbr, -1), -1)
+
+
+def m_spike(S, k=4.0, return_count=False):
+    """Single-point spike score (Hampel identifier) in strike order.
+
+    For each pixel, deviation from its 3x3 median is scaled by the surface's
+    robust scale (1.4826 * MAD).  Returns the WORST-pixel z by default; if
+    `return_count`, also returns how many pixels exceed k robust sigmas.
+    Targets the user's 'standalone single-point spike' failure mode."""
+    g = strike_order(to_grid(S))
+    med = _med3(g)
+    res = np.abs(g - med)
+    mad = np.median(np.abs(g - np.median(g, (1, 2), keepdims=True)), (1, 2)) + 1e-6
+    z = res / (1.4826 * mad[:, None, None])
+    worst = z.max((1, 2))
+    if return_count:
+        return worst, (z > k).sum((1, 2))
+    return worst
+
+
+def m_extreme(S, lo=0.02, hi=1.5):
+    """Fraction of pixels outside a plausible IV range (hard data errors)."""
+    g = to_grid(S)
+    return ((g < lo) | (g > hi)).mean((1, 2))
+
+
+METRICS = {
+    "level": m_level, "dispersion": m_dispersion, "cov": m_cov,
+    "roughness": m_roughness, "total_variation": m_total_variation,
+    "calendar_roughness": m_calendar_roughness, "spike": m_spike,
+    "extreme": m_extreme,
+}
+
+
+def all_metrics(S):
+    """Return a dict name -> (N,) array for every metric above."""
+    return {k: f(S) for k, f in METRICS.items()}
+
+
+# --------------------------------------------------------------------------
+# train-calibrated composite noise score  (fit on train ONLY)
+# --------------------------------------------------------------------------
+class NoiseScorer:
+    """Robust composite noise score.
+
+    On the training surfaces it stores the median and MAD of each chosen
+    metric; the score of any surface is the average *positive* robust-z across
+    metrics (noise is one-sided: only unusually HIGH roughness/spike is bad).
+    `threshold(q)` returns the q-quantile of the TRAIN composite score, the
+    natural look-ahead-free cut for dropping noisy rows."""
+
+    def __init__(self, metrics=("roughness", "total_variation", "spike",
+                                "calendar_roughness")):
+        self.metrics = tuple(metrics)
+        self.med_, self.mad_, self.train_score_ = {}, {}, None
+
+    def fit(self, S_train):
+        for k in self.metrics:
+            v = METRICS[k](S_train)
+            self.med_[k] = np.median(v)
+            self.mad_[k] = np.median(np.abs(v - self.med_[k])) + 1e-9
+        self.train_score_ = self.score(S_train)
+        return self
+
+    def robust_z(self, S):
+        out = {}
+        for k in self.metrics:
+            v = METRICS[k](S)
+            out[k] = (v - self.med_[k]) / (1.4826 * self.mad_[k])
+        return out
+
+    def score(self, S):
+        z = self.robust_z(S)
+        Z = np.clip(np.stack([z[k] for k in self.metrics], 0), 0, None)
+        return Z.mean(0)
+
+    def threshold(self, q):
+        return float(np.quantile(self.train_score_, q))
+
+
+# --------------------------------------------------------------------------
+# PCA low-rank denoiser  (basis fit on train ONLY -> look-ahead safe)
+# --------------------------------------------------------------------------
+class PCADenoiser:
+    """Project surfaces onto the train-fitted top-k principal subspace.
+
+    Doubles as (a) a denoiser: `transform` returns the rank-k reconstruction,
+    which discards idiosyncratic per-pixel noise lying outside the common
+    factor structure; and (b) a metric: `recon_error` is the residual norm,
+    large for surfaces that do not look like the rest of the panel."""
+
+    def __init__(self, k=10, standardize=True):
+        self.k, self.standardize = k, standardize
+
+    def fit(self, S_train):
+        X = _flat(to_grid(S_train))
+        self.mu_ = X.mean(0)
+        self.sd_ = X.std(0) if self.standardize else np.ones(X.shape[1])
+        self.sd_[self.sd_ < 1e-8] = 1.0
+        Z = (X - self.mu_) / self.sd_
+        _, _, Vt = np.linalg.svd(Z, full_matrices=False)
+        self.comp_ = Vt[:self.k]                       # (k,180)
+        return self
+
+    def transform(self, S):
+        X = _flat(to_grid(S))
+        Z = (X - self.mu_) / self.sd_
+        Zr = (Z @ self.comp_.T) @ self.comp_           # rank-k reconstruction
+        return Zr * self.sd_ + self.mu_
+
+    def recon_error(self, S):
+        X = _flat(to_grid(S))
+        return np.sqrt(((X - self.transform(S)) ** 2).mean(1))
+
+
+# --------------------------------------------------------------------------
+# per-cell winsorizer  (quantiles fit on train ONLY)
+# --------------------------------------------------------------------------
+class PixelWinsorizer:
+    """Clip each cell to its train [lo, hi] quantiles (tames extreme pixels)."""
+
+    def __init__(self, lo=0.005, hi=0.995):
+        self.lo, self.hi = lo, hi
+
+    def fit(self, S_train):
+        X = _flat(to_grid(S_train))
+        self.qlo_ = np.quantile(X, self.lo, axis=0)
+        self.qhi_ = np.quantile(X, self.hi, axis=0)
+        return self
+
+    def transform(self, S):
+        X = _flat(to_grid(S))
+        return np.clip(X, self.qlo_, self.qhi_)
+
+
+# --------------------------------------------------------------------------
+# parameter-free in-place denoisers  (same transform on train & test)
+# --------------------------------------------------------------------------
+def spike_repair(S, k=4.0):
+    """Hampel filter: replace pixels that deviate > k robust sigma from their
+    3x3 median with that median.  Repairs single-point spikes WITHOUT dropping
+    the surface (keeps the rest of the information).  Returns (N,180)."""
+    G = to_grid(S)
+    g = strike_order(G).copy()
+    med = _med3(g)
+    mad = np.median(np.abs(g - np.median(g, (1, 2), keepdims=True)), (1, 2)) + 1e-6
+    bad = np.abs(g - med) > (1.4826 * mad[:, None, None] * k)
+    g[bad] = med[bad]
+    out = np.empty_like(g)
+    out[:, :, MONEY] = g                                 # undo strike reordering
+    return out.reshape(len(out), -1)
+
+
+def smooth(S, kind="box", strength=0.5):
+    """Light spatial smoothing in strike order. `strength` in [0,1] blends the
+    smoothed surface with the original (0 = original, 1 = fully smoothed)."""
+    g = strike_order(to_grid(S))
+    if kind == "box":
+        p = np.pad(g, ((0, 0), (1, 1), (1, 1)), mode="edge")
+        sm = sum(p[:, i:i + g.shape[1], j:j + g.shape[2]]
+                 for i in range(3) for j in range(3)) / 9.0
+    elif kind == "gauss":
+        w = np.array([1., 2., 1.])
+        p = np.pad(g, ((0, 0), (1, 1), (1, 1)), mode="edge")
+        sm = sum(w[i] * w[j] * p[:, i:i + g.shape[1], j:j + g.shape[2]]
+                 for i in range(3) for j in range(3)) / 16.0
+    else:
+        raise ValueError("kind must be 'box' or 'gauss'")
+    g = (1 - strength) * g + strength * sm
+    out = np.empty_like(g)
+    out[:, :, MONEY] = g
+    return out.reshape(len(out), -1)
+
+
+if __name__ == "__main__":
+    import pandas as pd, sys
+    f = (sys.argv[1] if len(sys.argv) > 1
+         else "om_panel_top100_1996_2025.pickle")
+    df = pd.read_pickle(f)
+    S = np.stack(df["ImpliedVolatility"].values).astype(np.float64)
+    M = all_metrics(S)
+    print(f"{len(S)} surfaces from {f}")
+    for k, v in M.items():
+        print(f"  {k:18s} p50={np.percentile(v,50):.4f} "
+              f"p99={np.percentile(v,99):.4f} max={v.max():.4f}")
