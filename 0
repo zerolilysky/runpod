@@ -1,4 +1,688 @@
-from iv_cnn_runner import run
-run(pattern="om_panel_top100*.pickle", window="roll6", refit_months=24,
-    denoise="lowrank20")            # in-place denoise (best for the CNN)
-run( drop_train_noise_q=0.90, drop_metric="roughness")   # drop noisy train rows
+# ======================================================================
+# price_trend_cnn.py
+# ----------------------------------------------------------------------
+# Return forecasting from OHLC chart IMAGES, re-implementing the CNN of
+# Jiang, Kelly & Xiu (2023, "(Re-)Imag(in)ing Price Trends", RFS) on top
+# of the engineering scaffold of the IV-surface runner (walk-forward,
+# leak control, seed-ensembling, portfolio evaluation, CLI). Everything
+# lives in this single importable module.
+#
+# Data: one pickle of stock-day charts, e.g.
+#   R1000_picMap20MA_price_chart_image_df.pickle
+# columns: sedol, date, days, ph, vh, MA, idx, rF5D, rF20D, rF60D,
+#          img_height, img_width, price_chart_image
+# where price_chart_image is a FLATTENED binary image (0/1) reshaped
+# C-order to (img_height, img_width); `ph`/`vh` are the price/volume
+# sub-heights, `MA` flags the moving-average line, `days` the look-back
+# (5/20/60). The file is read from the CURRENT WORKING DIRECTORY by
+# default, so the notebook just sits next to it.
+#
+# Two design switches:
+#   task     : "clf" -> Jiang-Kelly-Xiu classification (label = 1{rF>0},
+#              softmax + cross-entropy, rank by P(up)); "reg" -> regression
+#              on the forward return (tanh-bounded MSE, rank by prediction).
+#   protocol : "faithful" -> train+validate ONCE on the initial window
+#              (70/30 random split), freeze for the whole OOS test (the
+#              paper's protocol); "walkforward" -> expanding/rolling refit
+#              with an embargo. Long-short decile (H-L) and long-only
+#              top-decile portfolios are always both reported.
+#
+# No-look-ahead contract:
+#   * the label is a STRICTLY FORWARD return rF{h}D over (t, t+h]; the image
+#     ends at t, so today's return never predicts itself;
+#   * training images are embargoed by the horizon so no training label
+#     window reaches into the test period;
+#   * the pixel normaliser (train mean/std), the regression y-scaler, and any
+#     QC threshold are fit on the training window ONLY; early stopping uses a
+#     validation split carved out of training, never the test set.
+#
+# Quick start (import):
+#   from price_trend_cnn import run, make_synth_panel
+#   make_synth_panel()                            # optional: test fixture
+#   res = run()                                   # 20D, clf, faithful
+#   res = run(task="reg", protocol="walkforward")
+#   res["portfolio"].head(); res["summary"]
+#
+# CLI:
+#   python price_trend_cnn.py --task clf --protocol faithful --horizon 20
+# ======================================================================
+from __future__ import annotations
+import argparse, glob, logging, time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+log = logging.getLogger("price_trend_cnn")
+
+# ---- canonical Jiang-Kelly-Xiu geometries (days -> H, W, ph, vh) ----
+GEOMETRY = {5: (32, 15, 25, 6), 20: (64, 60, 51, 12), 60: (96, 180, 76, 19)}
+# Only the first conv block differs by horizon; later blocks use stride (1,1),
+# dilation (1,1), padding (2,1). This reproduces the paper's flattened FC sizes
+# 15,360 / 46,080 / 184,320 for the 5/20/60-day models.
+FIRST_BLOCK = {
+    5:  dict(stride=(1, 1), dilation=(1, 1), padding=(2, 1)),
+    20: dict(stride=(3, 1), dilation=(2, 1), padding=(12, 1)),
+    60: dict(stride=(3, 1), dilation=(3, 1), padding=(12, 1)),
+}
+N_BLOCKS = {5: 2, 20: 3, 60: 4}
+FILTERS = [64, 128, 256, 512]
+
+
+def _setup_log(data_dir=None, level=logging.DEBUG):
+    if log.handlers:
+        return
+    log.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
+    log.addHandler(sh)
+    try:
+        d = Path(data_dir) if data_dir else Path.cwd()
+        fh = logging.FileHandler(d / "price_trend_cnn.log"); fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except Exception:
+        pass
+
+
+def _hint(msg, suggestion):
+    log.error(msg); log.error("SUGGESTION: " + suggestion)
+    raise RuntimeError(f"{msg} | {suggestion}")
+
+
+# ======================================================================
+# PART 1 -- image reshape + look-ahead-free quality control (vectorized)
+# ======================================================================
+def to_images(flat, H, W, order="C"):
+    """Stack/reshape flattened chart vectors into an (N, H, W) float32 cube.
+    `flat` may be 2-D (N,H*W), 1-D (H*W,), or a Series/list of per-row arrays."""
+    A = np.asarray(flat)
+    if A.dtype == object:
+        A = np.stack([np.ravel(np.asarray(v)) for v in A])
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim == 1:
+        A = A[None, :]
+    if A.shape[1] != H * W:
+        raise ValueError(f"flat length {A.shape[1]} != H*W = {H*W}")
+    return A.reshape(-1, H, W) if order == "C" else \
+        np.stack([a.reshape(W, H).T for a in A]).astype(np.float32)
+
+
+def _as_cube(G):
+    G = np.asarray(G, dtype=np.float32)
+    return G[None] if G.ndim == 2 else G
+
+
+def price_region(G, ph):  return _as_cube(G)[:, :ph, :]      # OHLC + MA sub-image
+def volume_region(G, vh): return _as_cube(G)[:, -vh:, :]     # volume-bar sub-image
+
+
+# ---- per-image QC metrics (pure function of a single image -> safe at test) --
+def m_white(G):
+    G = _as_cube(G); return G.reshape(len(G), -1).mean(1)
+
+
+def m_price_white(G, ph):
+    P = price_region(G, ph); return P.reshape(len(P), -1).mean(1)
+
+
+def m_blank_cols(G, ph):
+    """Fraction of fully-black columns in the price region. High => missing
+    days (JKX leave missing days black). Pure per-image incompleteness signal."""
+    P = price_region(G, ph)
+    return 1.0 - (P.sum(1) > 0).mean(1)
+
+
+def m_vextent(G, ph):
+    """Fraction of price rows that contain any object (low => flat/degenerate)."""
+    P = price_region(G, ph)
+    return (P.sum(2) > 0).mean(1)
+
+
+def m_region_balance(G, ph, vh):
+    """white(volume)/white(price): unusually large => volume artefact."""
+    Gc = _as_cube(G)
+    pw = price_region(Gc, ph).reshape(len(Gc), -1).sum(1)
+    vw = volume_region(Gc, vh).reshape(len(Gc), -1).sum(1)
+    return vw / (pw + 1e-9)
+
+
+METRICS = {
+    "white": lambda G, ph, vh: m_white(G),
+    "price_white": lambda G, ph, vh: m_price_white(G, ph),
+    "blank_cols": lambda G, ph, vh: m_blank_cols(G, ph),
+    "vextent": lambda G, ph, vh: m_vextent(G, ph),
+    "region_balance": lambda G, ph, vh: m_region_balance(G, ph, vh),
+}
+METRIC_NAMES = list(METRICS) + ["composite"]
+
+
+def all_metrics(G, ph, vh):
+    return {k: f(G, ph, vh) for k, f in METRICS.items()}
+
+
+def qc_score(G, ph, vh, metric="composite", train=None, metrics=None):
+    """Per-image QC value (higher = more suspect). 'composite' calibrates robust
+    z-scores on `train` images only; single metrics are intrinsic to each image."""
+    if metric == "composite":
+        sc = ImageQC(metrics=metrics) if metrics else ImageQC()
+        sc.fit(G if train is None else train, ph, vh)
+        return sc.score(G, ph, vh)
+    if metric in METRICS:
+        return METRICS[metric](G, ph, vh)
+    raise ValueError(f"unknown metric {metric!r}; choose from {METRIC_NAMES}")
+
+
+class ImageQC:
+    """Train-calibrated composite image-quality score (fit on TRAIN only)."""
+    _FLIP = {"vextent"}                      # low extent is the bad direction
+
+    def __init__(self, metrics=("blank_cols", "vextent", "region_balance")):
+        self.metrics = tuple(metrics)
+        self.med_, self.mad_, self.train_score_ = {}, {}, None
+
+    def fit(self, G_train, ph, vh):
+        for k in self.metrics:
+            v = METRICS[k](G_train, ph, vh)
+            self.med_[k] = float(np.median(v))
+            self.mad_[k] = float(np.median(np.abs(v - self.med_[k])) + 1e-9)
+        self._ph, self._vh = ph, vh
+        self.train_score_ = self.score(G_train, ph, vh)
+        return self
+
+    def score(self, G, ph, vh):
+        Z = []
+        for k in self.metrics:
+            z = (METRICS[k](G, ph, vh) - self.med_[k]) / (1.4826 * self.mad_[k])
+            Z.append(-z if k in self._FLIP else z)
+        return np.clip(np.stack(Z, 0), 0, None).mean(0)
+
+    def threshold(self, q):
+        return float(np.quantile(self.train_score_, q))
+
+
+def despeckle(G, H, W):
+    """Remove isolated single white pixels (no 4-neighbour lit) -> (N, H*W).
+    Aggressive for thin chart lines, so OFF by default; provided for parity."""
+    Gc = _as_cube(G).copy()
+    up = np.zeros_like(Gc); up[:, 1:, :] = Gc[:, :-1, :]
+    dn = np.zeros_like(Gc); dn[:, :-1, :] = Gc[:, 1:, :]
+    lf = np.zeros_like(Gc); lf[:, :, 1:] = Gc[:, :, :-1]
+    rt = np.zeros_like(Gc); rt[:, :, :-1] = Gc[:, :, 1:]
+    Gc[(Gc > 0) & (up + dn + lf + rt == 0)] = 0.0
+    return Gc.reshape(len(Gc), -1)
+
+
+# ======================================================================
+# PART 2 -- the Jiang-Kelly-Xiu CNN
+# ======================================================================
+def build_cnn(days, H, W, task="clf"):
+    """Stacked [Conv(5x3) -> BatchNorm -> LeakyReLU -> MaxPool(2x1)] blocks
+    (2/3/4 for 5/20/60-day; filters 64,128,256,512), flatten -> Dropout(0.5)
+    -> Linear. task='clf' -> 2-logit head; 'reg' -> single output. Flatten size
+    inferred by a dummy forward pass so any H,W works."""
+    import torch, torch.nn as nn
+    nb = N_BLOCKS.get(days, 3)
+    first = FIRST_BLOCK.get(days, dict(stride=(1, 1), dilation=(1, 1), padding=(2, 1)))
+
+    class CNN(nn.Module):
+        def __init__(s):
+            super().__init__()
+            blocks, c = [], 1
+            for b in range(nb):
+                cfg = first if b == 0 else dict(stride=(1, 1), dilation=(1, 1),
+                                                padding=(2, 1))
+                blocks += [nn.Conv2d(c, FILTERS[b], (5, 3), **cfg),
+                           nn.BatchNorm2d(FILTERS[b]),
+                           nn.LeakyReLU(0.01, inplace=True),
+                           nn.MaxPool2d((2, 1))]
+                c = FILTERS[b]
+            s.conv = nn.Sequential(*blocks)
+            with torch.no_grad():
+                s.flat = s.conv(torch.zeros(1, 1, H, W)).flatten(1).shape[1]
+            s.drop = nn.Dropout(0.5)
+            s.head = nn.Linear(s.flat, 2 if task == "clf" else 1)
+            for m in s.modules():                # Xavier (Glorot) init
+                if isinstance(m, (nn.Conv2d, nn.Linear)):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+        def forward(s, x):
+            return s.head(s.drop(s.conv(x).flatten(1)))
+
+    return CNN()
+
+
+def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
+              patience=2, lr=1e-5, batch=128, val_frac=0.30, winsorize=True,
+              device=None, seed0=42):
+    """Train the JKX CNN ensemble on TRAINING images only; return a predictor
+    `predict(Xte) -> score` (P(up) for clf, return units for reg). Pixel
+    normaliser and y-scaler fit on train only; a random `val_frac` split drives
+    early stopping. No test data is ever seen during fitting."""
+    import torch, torch.nn as nn, torch.nn.functional as F
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    Xtr = np.ascontiguousarray(Xtr, dtype=np.float32)
+    mu, sd = float(Xtr.mean()), float(Xtr.std() + 1e-8)     # train-only pixel norm
+
+    if task == "clf":
+        lab = (ytr > 0).astype(np.int64)                    # 1{forward return > 0}
+        ymu = ysd = cap = None
+    else:
+        y = ytr.astype(np.float32)
+        if winsorize:
+            lo, hi = np.quantile(y, [0.01, 0.99]); y = np.clip(y, lo, hi)
+        ymu, ysd = float(y.mean()), float(y.std() + 1e-8)
+        lab = ((y - ymu) / ysd).astype(np.float32)
+        cap = float(np.quantile(np.abs(lab), 0.99))
+
+    rng = np.random.default_rng(seed0)                      # random 70/30 split
+    perm = rng.permutation(len(Xtr))
+    nval = max(50, int(val_frac * len(Xtr)))
+    vi, ti = perm[:nval], perm[nval:]
+
+    def t_img(A, idx):
+        a = (A[idx] - mu) / sd
+        return torch.from_numpy(np.ascontiguousarray(a)).view(-1, 1, H, W).to(dev)
+
+    Xt, Xv = t_img(Xtr, ti), t_img(Xtr, vi)
+    yt = torch.from_numpy(lab[ti]).to(dev)
+    yv = torch.from_numpy(lab[vi]).to(dev)
+    if task == "clf":
+        loss_fn = lambda o, y_: F.cross_entropy(o, y_)
+    else:
+        loss_fn = lambda o, y_: F.mse_loss(torch.tanh(o.squeeze(-1)) * cap, y_)
+
+    nets, idx_t = [], torch.arange(len(ti))
+    for k in range(seeds):
+        torch.manual_seed(seed0 + k)
+        net = build_cnn(days, H, W, task).to(dev)
+        opt = torch.optim.Adam(net.parameters(), lr=lr)     # Adam, lr=1e-5 (JKX)
+        best, bst, wait = 1e18, None, 0
+        for _ in range(epochs):
+            net.train()
+            pm = idx_t[torch.randperm(len(idx_t))]
+            for s0 in range(0, len(pm), batch):
+                b = pm[s0:s0 + batch]
+                if len(b) < 2:
+                    continue
+                opt.zero_grad()
+                loss_fn(net(Xt[b]), yt[b]).backward()
+                opt.step()
+            net.eval()
+            with torch.no_grad():
+                v = loss_fn(net(Xv), yv).item()
+            if v < best - 1e-7:
+                best, wait, bst = v, 0, {a: b_.clone()
+                                        for a, b_ in net.state_dict().items()}
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+        if bst:
+            net.load_state_dict(bst)
+        net.eval(); nets.append(net)
+
+    def predict(Xte):
+        Xte = np.ascontiguousarray(Xte, dtype=np.float32)
+        xt = (Xte - mu) / sd
+        out = np.zeros(len(Xte), np.float64)
+        with torch.no_grad():
+            for s0 in range(0, len(Xte), 4096):
+                xb = torch.from_numpy(np.ascontiguousarray(xt[s0:s0 + 4096])
+                                      ).view(-1, 1, H, W).to(dev)
+                for net in nets:
+                    o = net(xb)
+                    if task == "clf":
+                        out[s0:s0 + 4096] += torch.softmax(o, 1)[:, 1].cpu().numpy()
+                    else:
+                        out[s0:s0 + 4096] += (torch.tanh(o.squeeze(-1)) * cap).cpu().numpy()
+        out /= len(nets)
+        return out if task == "clf" else out * ysd + ymu
+    return predict
+
+
+# ======================================================================
+# PART 3 -- data loading
+# ======================================================================
+def _ci(cols, names):
+    low = {c.lower(): c for c in cols}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def load_panel(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle"):
+    """Load the chart-image pickle(s) in `data_dir` (default: cwd then this
+    file's folder). Returns (df, X) with X an (N, H, W) float32 cube."""
+    dirs = [Path(data_dir)] if data_dir else [Path.cwd(), Path(__file__).parent]
+    files = []
+    for d in dirs:
+        files = sorted(glob.glob(str(d / pattern)))
+        if files:
+            break
+    if not files:
+        _hint(f"no files matching {pattern} in {dirs}",
+              "put the pickle next to the notebook, or pass data_dir='...'")
+    df = pd.concat([pd.read_pickle(f) for f in files], ignore_index=True)
+    idc = _ci(df.columns, ["sedol", "perm_ID", "permno", "id"])
+    dtc = _ci(df.columns, ["date", "Date", "DATE"])
+    imc = _ci(df.columns, ["price_chart_image", "image", "img"])
+    if not (idc and dtc and imc):
+        _hint(f"required columns not found; have {list(df.columns)[:15]}",
+              "need an id (sedol), a date, and a flattened image column")
+    df = df.rename(columns={idc: "sedol", dtc: "date", imc: "price_chart_image"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = (df.dropna(subset=["price_chart_image"])
+            .drop_duplicates(["sedol", "date"])
+            .sort_values(["sedol", "date"]).reset_index(drop=True))
+    H, W = int(df["img_height"].iloc[0]), int(df["img_width"].iloc[0])
+    ph, vh = int(df["ph"].iloc[0]), int(df["vh"].iloc[0])
+    days = int(df["days"].iloc[0])
+    X = to_images(df["price_chart_image"].values, H, W)      # vectorized reshape
+    finite = np.isfinite(X.reshape(len(X), -1)).all(1)
+    if (~finite).any():
+        log.warning("dropped %d rows with malformed images", int((~finite).sum()))
+        df, X = df[finite].reset_index(drop=True), X[finite]
+    df["_m"] = df["date"].dt.to_period("M")
+    df["is_me"] = (df.groupby(["sedol", "_m"])["date"].transform("max") == df["date"])
+    print(f"loaded {len(files)} file(s) -> {len(df):,} images {H}x{W} "
+          f"(days={days}, ph={ph}, vh={vh}, MA={bool(df['MA'].iloc[0])}), "
+          f"{df['sedol'].nunique()} stocks, "
+          f"{df['date'].min().date()}..{df['date'].max().date()}")
+    df.attrs.update(H=H, W=W, ph=ph, vh=vh, days=days)
+    return df, X
+
+
+# ======================================================================
+# PART 4 -- optional QC filter, portfolio evaluation, walk-forward driver
+# ======================================================================
+def _make_filter(Xtr, ph, vh, denoise=None, drop_train_noise_q=None,
+                 drop_metric="composite"):
+    """Build (transform, keep_mask) from TRAINING images only. The transform is
+    applied identically to train and test; keep_mask only drops noisy TRAIN
+    rows -> no look-ahead."""
+    ident = (lambda A: A)
+    if denoise in (None, "", "none") and drop_train_noise_q is None:
+        return ident, np.ones(len(Xtr), bool)
+    H, W = Xtr.shape[1], Xtr.shape[2]
+    tf = ident
+    if denoise == "despeckle":
+        tf = lambda A: despeckle(A, H, W).reshape(-1, H, W)
+    elif denoise not in (None, "", "none"):
+        log.warning("unknown denoise='%s'; using identity", denoise)
+    keep = np.ones(len(Xtr), bool)
+    if drop_train_noise_q is not None:
+        v = qc_score(Xtr, ph, vh, drop_metric, train=Xtr)
+        keep = v <= np.quantile(v, drop_train_noise_q)
+        log.info("filter: denoise=%s drop %s>q%.2f -> keep %d/%d train images",
+                 denoise, drop_metric, drop_train_noise_q, int(keep.sum()), len(keep))
+    return tf, keep
+
+
+def _cap_train(tr, max_train, seed=0):
+    """Randomly subsample a boolean TRAIN mask to at most `max_train` rows
+    (train-only, look-ahead-free) -- a speed/memory knob, off by default."""
+    if not max_train or int(tr.sum()) <= int(max_train):
+        return tr
+    idx = np.where(tr)[0]
+    keep = np.random.default_rng(seed).choice(idx, int(max_train), replace=False)
+    m = np.zeros_like(tr); m[keep] = True
+    return m
+
+
+def _evaluate(out, grp, min_names=20):
+    """out: [per, score, ret]. Returns (portfolio_df, summary) for BOTH the
+    long-short decile (H-L) and long-only top-decile portfolios."""
+    sizes = out.groupby("per").size()
+    min_n = min(int(min_names), max(2, int(sizes.median() * 0.5)))
+    rows = []
+    for per_, g in out.groupby("per"):
+        g = g.dropna(subset=["score", "ret"])
+        if len(g) < min_n or g["score"].std() < 1e-12:
+            continue
+        q = g["score"].rank(pct=True)
+        top, bot = g[q >= 0.9], g[q <= 0.1]
+        rows.append({"per": per_, "long_only": top["ret"].mean(),
+                     "long_short": top["ret"].mean() - bot["ret"].mean(),
+                     "n_top": len(top), "n_bot": len(bot)})
+    pf = pd.DataFrame(rows)
+    if len(pf) < 6:
+        _hint(f"only {len(pf)} evaluable periods",
+              "widen the test window or check that predictions were produced")
+    ppy = {"M": 12.0, "W": 52.0, "Q": 4.0}[grp]
+    sh = lambda r: float(r.mean() / (r.std() + 1e-12) * np.sqrt(ppy))
+    cg = lambda r: float(np.cumprod(1.0 + r.values)[-1] ** (ppy / len(r)) - 1.0)
+    summary = {"n_periods": int(len(pf)), "avg_names_long": float(pf["n_top"].mean()),
+               "ls_sharpe": sh(pf["long_short"]), "ls_cagr": cg(pf["long_short"]),
+               "lo_sharpe": sh(pf["long_only"]), "lo_cagr": cg(pf["long_only"])}
+    return pf, summary
+
+
+def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
+        task="clf", protocol="faithful", horizon=None,
+        train_years=8, refit_months=12, window="exp",
+        test_start=None, test_end=None, seeds=5, epochs=50,
+        denoise=None, drop_train_noise_q=None, drop_metric="composite",
+        max_train=None, min_names=20,
+        save_csv=True, verbose=True, log_level=None):
+    """Forecast forward returns from chart images with the JKX CNN.
+
+    task='clf'|'reg'; protocol='faithful'|'walkforward';
+    horizon=5/20/60 picks target rF5D/rF20D/rF60D and W/M/Q rebalancing
+    (default = the image's own `days`). Returns {'predictions','portfolio',
+    'summary'} and writes CSV/PNG next to the data."""
+    _setup_log(data_dir)
+    if log_level:
+        lvl = getattr(logging, str(log_level).upper(), logging.INFO)
+        for h in log.handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(lvl)
+    assert task in ("clf", "reg") and protocol in ("faithful", "walkforward")
+    log.info("=" * 64)
+    log.info("NEW RUN | task=%s protocol=%s horizon=%s train_years=%s seeds=%s",
+             task, protocol, horizon, train_years, seeds)
+    log.info("=" * 64)
+
+    df, X = load_panel(data_dir, pattern)
+    days, H, W = df.attrs["days"], df.attrs["H"], df.attrs["W"]
+    ph, vh = df.attrs["ph"], df.attrs["vh"]
+    h = int(horizon or days)
+    target = _ci(df.columns, [f"rF{h}D", f"rf{h}D"])
+    if target is None:
+        _hint(f"target rF{h}D not found",
+              "available: " + ", ".join(c for c in df.columns if "rf" in c.lower()))
+    grp = {5: "W", 20: "M", 60: "Q"}.get(h, "M")
+    y = pd.to_numeric(df[target], errors="coerce").values.astype(np.float32)
+    ok = np.isfinite(y)
+    if grp == "M":
+        test_grid = df["is_me"].values
+    else:
+        pcode = df["date"].dt.to_period(grp)
+        test_grid = (df.groupby([df["sedol"], pcode])["date"].transform("max")
+                     == df["date"]).values
+
+    embargo = pd.DateOffset(days=int(h * 1.6))     # trading -> calendar embargo
+    preds = np.full(len(df), np.nan)
+    t0 = time.time()
+
+    def _fit_predict(tr_mask, te_mask):
+        tf, keep = _make_filter(X[tr_mask], ph, vh, denoise,
+                                drop_train_noise_q, drop_metric)
+        predictor = train_cnn(tf(X[tr_mask])[keep], y[tr_mask][keep], days, H, W,
+                              task=task, seeds=seeds, epochs=epochs)
+        preds[te_mask] = predictor(tf(X[te_mask]))
+
+    if protocol == "faithful":
+        yr0 = int(df["date"].dt.year.min())
+        tr_end_year = (int(test_start) - 1) if test_start else (yr0 + int(train_years) - 1)
+        tr_cut = pd.Timestamp(f"{tr_end_year}-12-31")
+        tr = ok & (df["date"] <= tr_cut - embargo).values     # embargo right edge
+        te_lo = pd.Timestamp(f"{tr_end_year + 1}-01-01") if not test_start \
+            else pd.Timestamp(str(test_start))
+        te_hi = pd.Timestamp(str(test_end)) if test_end else df["date"].max() + pd.Timedelta(days=1)
+        te = ok & test_grid & ((df["date"] >= te_lo) & (df["date"] <= te_hi)).values
+        if tr.sum() < 500:
+            _hint(f"only {int(tr.sum())} training images", "lower train_years")
+        tr = _cap_train(tr, max_train)                 # optional speed/memory cap
+        log.info("faithful: train<=%s (embargo %dd) ntr=%d | test %s..%s nte=%d",
+                 tr_cut.date(), embargo.days, int(tr.sum()), te_lo.date(),
+                 te_hi.date(), int(te.sum()))
+        _fit_predict(tr, te)
+        if verbose:
+            print(f"  trained once on {int(tr.sum()):,} images "
+                  f"({time.time()-t0:.0f}s)", flush=True)
+    else:
+        yr0 = int(df["date"].dt.year.min())
+        start = pd.Period(f"{test_start or (yr0 + int(train_years))}-01", "M")
+        end = pd.Period(str(test_end), "M") if test_end else pd.Period(df["date"].max(), "M")
+        months = pd.period_range(start, end, freq="M")
+        predictor, tf_cur = None, (lambda A: A)
+        for i, mper in enumerate(months):
+            te_lo, te_hi = mper.to_timestamp(), (mper + 1).to_timestamp()
+            te = ok & test_grid & ((df["date"] >= te_lo) & (df["date"] < te_hi)).values
+            if te.sum() == 0:
+                continue
+            if predictor is None or i % max(1, int(refit_months)) == 0:
+                tr = ok & (df["date"] < te_lo - embargo).values
+                if window.startswith("roll"):
+                    tr &= (df["date"] >= te_lo - pd.DateOffset(years=int(window[4:]))).values
+                if tr.sum() < 500:
+                    log.warning("refit %s skipped: only %d train images", mper, int(tr.sum()))
+                    continue
+                tr = _cap_train(tr, max_train, seed=i)     # optional speed/memory cap
+                tf_cur, keep = _make_filter(X[tr], ph, vh, denoise,
+                                            drop_train_noise_q, drop_metric)
+                predictor = train_cnn(tf_cur(X[tr])[keep], y[tr][keep], days, H, W,
+                                      task=task, seeds=seeds, epochs=epochs)
+                if verbose:
+                    print(f"  refit {mper}: ntr={int(tr.sum()):,} "
+                          f"({time.time()-t0:.0f}s)", flush=True)
+            preds[te] = predictor(tf_cur(X[te]))
+
+    fin = np.isfinite(preds)
+    out = df.loc[fin, ["sedol", "date"]].copy()
+    out["score"], out["ret"] = preds[fin], y[fin]
+    out["per"] = out["date"].dt.to_period(grp)
+    pf, summary = _evaluate(out, grp, min_names)
+    summary = {"task": task, "protocol": protocol, "target": target, "horizon": h,
+               "rebalance": grp, **summary}
+    log.info("%s/%s | LONG-SHORT sharpe=%.2f cagr=%.1f%% | LONG-ONLY sharpe=%.2f "
+             "cagr=%.1f%% (%d periods)", task, protocol, summary["ls_sharpe"],
+             100 * summary["ls_cagr"], summary["lo_sharpe"], 100 * summary["lo_cagr"],
+             summary["n_periods"])
+    if verbose:
+        print("\n".join(f"  {k}: {v}" for k, v in summary.items()))
+
+    d = Path(data_dir) if data_dir else Path.cwd()
+    try:
+        import matplotlib; matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        ts = pf["per"].dt.to_timestamp()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        for ax, col, ttl in [(axes[0], "long_short", "long-short H-L decile"),
+                             (axes[1], "long_only", "long-only top decile")]:
+            ax.plot(ts, np.cumprod(1.0 + pf[col].values) - 1.0, lw=1.6)
+            ax.set_title(f"{ttl} ({task},{protocol},rF{h}D)")
+            ax.grid(alpha=0.3); ax.set_ylabel("cumulative return")
+        fig.tight_layout()
+        fig.savefig(d / f"pt_{task}_{protocol}_rF{h}D.png", dpi=130); plt.close(fig)
+    except Exception as exc:
+        log.warning("plot skipped (%s)", exc)
+    if save_csv:
+        out.drop(columns="per").to_csv(d / f"predictions_{task}_{protocol}_rF{h}D.csv",
+                                       index=False)
+        pf.to_csv(d / f"portfolio_{task}_{protocol}_rF{h}D.csv", index=False)
+    return {"predictions": out, "portfolio": pf, "summary": summary}
+
+
+# ======================================================================
+# PART 5 -- synthetic test fixture (build a same-schema pickle to dry-run)
+# ======================================================================
+def make_synth_panel(n_stocks=80, start="2004-01-01", years=12, beta=0.9,
+                     seed=0, out=None):
+    """Write a pickle with the EXACT schema of the real data so the runner can
+    be exercised without it. 20-day OHLC+MA+volume charts (64x60, ph=51, vh=12)
+    with a faint momentum signal baked into the forward returns. TEST USE ONLY."""
+    DAYS, H, W, PH, VH, PXW = 20, 64, 60, 51, 12, 3
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start, periods=years * 252)
+
+    def draw(o, hi, lo, c, ma, vol):
+        img = np.zeros((H, W), np.uint8)
+        a, b = float(np.nanmin(lo)), float(np.nanmax(hi)); r = (b - a) or 1.0
+        yp = lambda v: PH - 1 - np.clip(((v - a) / r) * (PH - 1), 0, PH - 1)  # float row
+        yo, yh, yl, yc, yma = yp(o), yp(hi), yp(lo), yp(c), yp(ma)
+        vmax = float(np.nanmax(vol)) or 1.0
+        for d in range(DAYS):
+            x = d * PXW
+            t1, t2 = sorted((int(round(yh[d])), int(round(yl[d]))))
+            img[t1:t2 + 1, x + 1] = 1
+            img[int(round(yo[d])), x] = 1; img[int(round(yc[d])), x + 2] = 1
+            if np.isfinite(yma[d]):                      # MA undefined for early days
+                img[int(round(yma[d])), x + 1] = 1
+            vb = int(round((vol[d] / vmax) * (VH - 1)))
+            img[H - 1 - vb:H, x + 1] = 1
+        return img.ravel()
+
+    rows = []
+    for s in range(n_stocks):
+        ret = rng.normal(0.0003, 0.02, len(dates))
+        p = 100 * np.exp(np.cumsum(ret))
+        op = p * (1 + rng.normal(0, 0.005, len(dates)))
+        spread = np.abs(rng.normal(0, 0.01, len(dates))) * p
+        hi = np.maximum(p, op) + spread; lo = np.minimum(p, op) - spread
+        vol = np.abs(rng.normal(1.0, 0.4, len(dates))) + 0.2
+        ma = pd.Series(p).rolling(DAYS).mean().values
+        wk = pd.Series(dates).dt.to_period("W")
+        for dt in pd.Series(dates).groupby(wk).max():
+            t = int(np.searchsorted(dates.values, np.datetime64(dt)))
+            if t < DAYS or t + 60 >= len(dates):
+                continue
+            sl = slice(t - DAYS + 1, t + 1)
+            trend = (p[t] - p[t - DAYS + 1]) / p[t - DAYS + 1]   # in-window momentum
+            rows.append(dict(
+                sedol=f"S{s:05d}", date=dt, days=DAYS, ph=PH, vh=VH, MA=True,
+                idx=len(rows),
+                rF5D=np.float32(p[t + 5] / p[t] - 1 + beta * .15 * trend + rng.normal(0, .03)),
+                rF20D=np.float32(p[t + 20] / p[t] - 1 + beta * .30 * trend + rng.normal(0, .05)),
+                rF60D=np.float32(p[t + 60] / p[t] - 1 + beta * .20 * trend + rng.normal(0, .09)),
+                img_height=H, img_width=W,
+                price_chart_image=draw(op[sl], hi[sl], lo[sl], p[sl], ma[sl], vol[sl])))
+    df = pd.DataFrame(rows)
+    out = Path(out or Path.cwd() / "R1000_picMap20MA_price_chart_image_df.pickle")
+    df.to_pickle(out)
+    print(f"wrote {len(df):,} synthetic images -> {out}")
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default=None)
+    ap.add_argument("--pattern", default="R1000_picMap*_price_chart_image_df.pickle")
+    ap.add_argument("--task", default="clf", choices=["clf", "reg"])
+    ap.add_argument("--protocol", default="faithful", choices=["faithful", "walkforward"])
+    ap.add_argument("--horizon", type=int, default=None)
+    ap.add_argument("--train-years", type=int, default=8)
+    ap.add_argument("--refit-months", type=int, default=12)
+    ap.add_argument("--window", default="exp")
+    ap.add_argument("--test-start", default=None)
+    ap.add_argument("--test-end", default=None)
+    ap.add_argument("--seeds", type=int, default=5)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--denoise", default=None, help="despeckle | none")
+    ap.add_argument("--drop-train-noise-q", type=float, default=None)
+    ap.add_argument("--drop-metric", default="composite")
+    ap.add_argument("--max-train", type=int, default=None,
+                    help="cap #training images (train-only subsample) for speed")
+    ap.add_argument("--min-names", type=int, default=20,
+                    help="min cross-section per period to form deciles")
+    a = ap.parse_args()
+    run(a.data_dir, a.pattern, a.task, a.protocol, a.horizon, a.train_years,
+        a.refit_months, a.window, a.test_start, a.test_end, a.seeds, a.epochs,
+        a.denoise, a.drop_train_noise_q, a.drop_metric,
+        max_train=a.max_train, min_names=a.min_names)
+
+
+if __name__ == "__main__":
+    main()
