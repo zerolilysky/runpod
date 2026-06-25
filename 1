@@ -1,19 +1,4 @@
-from iv_cnn_runner import run
-
-# default: 20D rebalance (month-end test rows), monthly refit, expanding window
-res = run()
-
-# weekly rebalance -> target switches to TRET_SP500_EX_F5D automatically
-res = run(rebalance="5D")
-
-# full control
-res = run(rebalance="20D",
-          refit_months=1,            # 1=monthly retrain; 3, 12... to lighten
-          window="exp",              # or "roll6", "roll8", ...
-          test_start="2015-01",      # year int or "YYYY-MM"
-          test_end="2024-12",
-          seeds=3)                   # ensemble size
-
-res["summary"]              # IC, IC_t, H-L Sharpe, long-only Sharpe, n_periods
-res["predictions"].head()   # per stock-date predictions; also saved as
-                            # predictions_20D.csv next to the data
+from price_trend_cnn import run
+res = run()                                  # 20D, clf, faithful (JKX defaults: seeds=5, epochs=50)
+res = run(task="reg", protocol="walkforward")
+res["summary"]; res["portfolio"]
