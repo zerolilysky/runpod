@@ -72,7 +72,7 @@
 #   python price_trend_cnn.py --experiment vix_sp500_5MA
 # ======================================================================
 from __future__ import annotations
-import argparse, glob, json, logging, time
+import argparse, fnmatch, glob, json, logging, time
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -454,45 +454,119 @@ def _ci(cols, names):
 
 
 def _find_files(data_dir, pattern):
-    """Resolve a chart pickle spec robustly. Accepts a full filename, a glob, or
-    a bare universe tag like 'sp500_5MA' (we then try .pickle/.pkl variants)."""
+    """Resolve a chart pickle spec robustly and CASE-INSENSITIVELY. Accepts a full
+    filename, a glob, or a bare universe tag like 'SP500_5MA' -- which also matches
+    'SP500_pic_Map5MA_price_chart_image_df.pickle' (underscores act as wildcards).
+    A '5MA' tag never grabs a '20MA' file (and vice-versa)."""
     dirs = [Path(data_dir)] if data_dir else [Path.cwd(), Path(__file__).parent]
     stem = pattern
     for ext in (".pickle", ".pkl"):
         stem = stem.replace(ext, "")
-    # treat '_' in a bare tag as a wildcard so 'sp500_5MA' also matches
-    # 'sp500_picMap5MA_price_chart_image_df.pickle', etc.
-    loose = stem.replace("_", "*")
+    loose = stem.replace("_", "*")        # 'SP500_5MA' -> 'SP500*5MA'
+    img = "price_chart_image"             # canonical chart-image df signature
+    # Candidates are tried IN ORDER; the first that matches wins. The tag+chart-image
+    # patterns come first so an unrelated dict pickle that merely shares the tag is
+    # never picked up. Only if nothing chart-image-like matches do we fall back to a
+    # broader tag glob.
     cands = [pattern, pattern + ".pickle", pattern + ".pkl",
-             f"*{stem}*.pickle", f"*{stem}*.pkl", f"*{stem}*",
-             f"*{loose}*.pickle", f"*{loose}*.pkl", f"*{loose}*"]
+             f"*{stem}*{img}*.pickle", f"*{stem}*{img}*.pkl",
+             f"*{loose}*{img}*.pickle", f"*{loose}*{img}*.pkl",
+             f"*{stem}*.pickle", f"*{stem}*.pkl",
+             f"*{loose}*.pickle", f"*{loose}*.pkl",
+             f"*{stem}*", f"*{loose}*"]
     seen, uniq = set(), []
     for c in cands:                       # de-dup while preserving order
         if c not in seen:
             seen.add(c); uniq.append(c)
     cands = uniq
     for d in dirs:
+        try:
+            entries = sorted(p for p in Path(d).iterdir() if p.is_file())
+        except (FileNotFoundError, NotADirectoryError):
+            continue
         for pat in cands:
-            files = [f for f in sorted(glob.glob(str(d / pat))) if Path(f).is_file()]
-            # wildcard candidates must resolve to a pickle (never a dir/log/csv);
-            # an exact filename is accepted with any extension.
-            if any(ch in pat for ch in "*?["):
-                files = [f for f in files if Path(f).suffix.lower() in (".pickle", ".pkl")]
-            if files:
-                return files
+            patl = pat.lower()
+            wild = any(ch in pat for ch in "*?[")
+            hits = []
+            for p in entries:
+                if not fnmatch.fnmatchcase(p.name.lower(), patl):
+                    continue
+                # wildcard candidates must resolve to a pickle (never a dir/log/csv);
+                # an exact filename is accepted with any extension.
+                if wild and p.suffix.lower() not in (".pickle", ".pkl"):
+                    continue
+                hits.append(str(p))
+            if hits:
+                return hits
     return []
+
+
+def _coerce_to_df(obj, src=""):
+    """Coerce a loaded pickle payload into a tidy DataFrame. Real picMap pickles
+    are sometimes stored as a *dict* (of columns, or wrapping/holding DataFrames)
+    rather than a DataFrame -- handle the common shapes and fail loudly otherwise."""
+    if isinstance(obj, pd.DataFrame):
+        return obj
+    if isinstance(obj, pd.Series):
+        return obj.to_frame()
+    if isinstance(obj, dict):
+        # 1) dict that HOLDS DataFrame(s): {'df': df} or {sedol: df, ...}
+        df_vals = [v for v in obj.values() if isinstance(v, pd.DataFrame)]
+        if df_vals:
+            log.info("%s: dict holding %d DataFrame(s) -> concat", src, len(df_vals))
+            return pd.concat(df_vals, ignore_index=True) if len(df_vals) > 1 else df_vals[0]
+        # 2) COLUMN-oriented dict: {'date':[...], 'price_chart_image':[...], ...}
+        arr_len = {}
+        for k, v in obj.items():
+            if isinstance(v, (str, bytes)) or not hasattr(v, "__len__"):
+                continue
+            try:
+                arr_len[k] = len(v)
+            except TypeError:
+                pass
+        if arr_len:
+            vals = list(arr_len.values())
+            L = max(set(vals), key=vals.count)          # dominant column length
+            cols = {}
+            for k, v in obj.items():
+                if arr_len.get(k) == L:
+                    cols[k] = list(v)                    # array/2D -> per-row objects
+                elif isinstance(v, (str, bytes)) or not hasattr(v, "__len__"):
+                    cols[k] = v                          # scalar metadata -> broadcast
+            if cols:
+                log.info("%s: column-dict -> DataFrame (%d cols, %d rows)",
+                         src, len(cols), L)
+                return pd.DataFrame(cols)
+        # 3) dict of RECORDS keyed by id: {key: {col: val, ...}, ...}
+        if obj and all(isinstance(v, dict) for v in obj.values()):
+            return pd.DataFrame.from_dict(obj, orient="index").reset_index(drop=True)
+        info = {k: type(v).__name__ + (f"[{len(v)}]" if hasattr(v, "__len__")
+                and not isinstance(v, (str, bytes)) else "")
+                for k, v in list(obj.items())[:25]}
+        _hint(f"{src}: pickle is a dict I couldn't coerce to a DataFrame; keys->types: {info}",
+              "share this mapping, or pre-convert to a DataFrame with columns "
+              "sedol,date,days,ph,vh,MA,rF5D,rF20D,rF60D,img_height,img_width,price_chart_image")
+    if isinstance(obj, (list, tuple)) and len(obj):
+        if all(isinstance(v, pd.DataFrame) for v in obj):
+            return pd.concat(list(obj), ignore_index=True)
+        if all(isinstance(v, dict) for v in obj):
+            return pd.DataFrame(list(obj))
+    _hint(f"{src}: unsupported pickle payload of type {type(obj).__name__}",
+          "expected a DataFrame or a dict of columns; pre-convert and re-save")
 
 
 def load_panel(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle"):
     """Load the chart-image pickle(s) matching `pattern` in `data_dir` (default:
     cwd then this file's folder). Returns (df, X) with X an (N, H, W) float32
-    cube. `pattern` may be a glob, a filename, or a bare tag like 'sp500_5MA'."""
+    cube. `pattern` may be a glob, a filename, or a bare tag like 'SP500_5MA'.
+    Each pickle may be a DataFrame OR a dict (of columns / of DataFrames)."""
     files = _find_files(data_dir, pattern)
     if not files:
         _hint(f"no files matching {pattern!r} in "
               f"{data_dir or [str(Path.cwd()), str(Path(__file__).parent)]}",
               "put the pickle next to the notebook, or pass data_dir=/ pattern=")
-    df = pd.concat([pd.read_pickle(f) for f in files], ignore_index=True)
+    df = pd.concat([_coerce_to_df(pd.read_pickle(f), Path(f).name) for f in files],
+                   ignore_index=True)
     idc = _ci(df.columns, ["sedol", "perm_ID", "permno", "id"])
     dtc = _ci(df.columns, ["date", "Date", "DATE"])
     imc = _ci(df.columns, ["price_chart_image", "image", "img"])
@@ -1151,12 +1225,12 @@ def make_synth_suite(data_dir=None, years=22, n_stocks=50):
     dry-run of every experiment (incl. the 15-year-train case). TEST USE ONLY."""
     d = Path(data_dir) if data_dir else Path.cwd()
     make_synth_panel(n_stocks=n_stocks, days=5, universe="sp500", seed=1, beta=1.0,
-                     years=years, out=d / "sp500_picMap5MA_price_chart_image_df.pickle")
+                     years=years, out=d / "SP500_pic_Map5MA_price_chart_image_df.pickle")
     make_synth_panel(n_stocks=n_stocks, days=5, universe="sp600", seed=2, beta=0.7,
                      drift=0.0002, years=years,
-                     out=d / "sp600_picMap5MA_price_chart_image_df.pickle")
+                     out=d / "SP600_pic_Map5MA_price_chart_image_df.pickle")
     make_synth_panel(n_stocks=n_stocks, days=20, universe="sp500", seed=1, beta=1.0,
-                     years=years, out=d / "sp500_picMap20MA_price_chart_image_df.pickle")
+                     years=years, out=d / "SP500_pic_Map20MA_price_chart_image_df.pickle")
     make_synth_vix(years=years, data_dir=d)
     print("synthetic suite ready.")
 
@@ -1166,31 +1240,35 @@ def make_synth_suite(data_dir=None, years=22, n_stocks=50):
 # ======================================================================
 # Each preset is just kwargs for run(). Predictions + model + half-year beta +
 # portfolio-with-dates + decile profile are produced for EVERY preset.
+# Patterns are the bare universe tags; they resolve case-insensitively to the real
+# files, e.g. 'SP500_5MA' -> SP500_pic_Map5MA_price_chart_image_df.pickle. Here
+# '5MA'/'20MA' denote the image LOOK-BACK length (5-day / 20-day), read from the
+# file's own `days` field; `horizon` is the separate forward-return holding period.
 EXPERIMENTS = {
-    # baseline: sp500, 5-day image, horizon 5, faithful clf
+    # baseline: SP500, 5-day look-back image, horizon 5, faithful clf
     "baseline_sp500_5MA": dict(
-        pattern="sp500_5MA", horizon=5, task="clf", protocol="faithful"),
+        pattern="SP500_5MA", horizon=5, task="clf", protocol="faithful"),
 
-    # (1) train on sp500, test on sp600 (time-aligned, strictly OOS)
+    # (1) train on SP500, test on SP600 (time-aligned, strictly OOS)
     "cross_sp500_to_sp600": dict(
-        pattern="sp500_5MA", test_pattern="sp600_5MA", horizon=5,
+        pattern="SP500_5MA", test_pattern="SP600_5MA", horizon=5,
         task="clf", protocol="faithful"),
 
     # (5) VIX channel appended under the volume block
     "vix_sp500_5MA": dict(
-        pattern="sp500_5MA", horizon=5, add_vix=True, vix_rows=3, vix_scale="minmax"),
+        pattern="SP500_5MA", horizon=5, add_vix=True, vix_rows=3, vix_scale="minmax"),
 
     # (6) per-image pixel normalisation instead of the global one
     "perimg_sp500_5MA": dict(
-        pattern="sp500_5MA", horizon=5, pixel_norm="per_image"),
+        pattern="SP500_5MA", horizon=5, pixel_norm="per_image"),
 
     # (7) 15 years of training
     "train15y_sp500_5MA": dict(
-        pattern="sp500_5MA", horizon=5, train_years=15),
+        pattern="SP500_5MA", horizon=5, train_years=15),
 
-    # (8) 20-day image with a 5-day horizon (weekly rebalance)
+    # (8) 20-day look-back image with a 5-day horizon (weekly rebalance)
     "sp500_20MA_h5": dict(
-        pattern="sp500_20MA", horizon=5),
+        pattern="SP500_20MA", horizon=5),
 }
 
 
