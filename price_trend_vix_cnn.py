@@ -1786,7 +1786,11 @@ def vix_bucket_summary(periods, bins=None):
                 "n_periods": int(len(g)),
                 "active_share": float(g["active"].mean()),
                 "ls_mean": float(g["long_short"].mean()),
+                "lo_mean": float(g["long_only"].mean()),
                 "ls_sharpe_active_bucket": _sharpe(g["long_short"], 52.0),
+                "lo_sharpe_active_bucket": _sharpe(g["long_only"], 52.0),
+                "gated_ls_mean": float(g["gated_long_short"].mean()),
+                "gated_lo_mean": float(g["gated_long_only"].mean()),
                 "ic_mean": float(g["ic_spearman"].mean()),
                 "wrong_tail_rate": float(g["wrong_tail"].mean()),
                 "top_hit": float(g["top_hit"].mean()),
@@ -1816,42 +1820,50 @@ def plot_diagnostics(periods, bucket, out_dir, gate_name):
     paths = []
     dates = pd.to_datetime(periods["rebalance_date"])
 
-    fig, ax1 = plt.subplots(figsize=(12, 5))
-    raw = (1.0 + periods["long_short"].fillna(0.0)).cumprod()
-    gated = (1.0 + periods["gated_long_short"].fillna(0.0)).cumprod()
-    ax1.plot(dates, raw, lw=1.6, label="raw long-short")
-    ax1.plot(dates, gated, lw=1.9, label=f"{gate_name} long-short")
-    ax1.set_ylabel("cumulative growth")
-    ax1.grid(alpha=0.25)
-    ax2 = ax1.twinx()
-    ax2.plot(dates, periods["vix"], color="tab:gray", lw=0.9, alpha=0.55, label="VIX")
-    ax2.set_ylabel("VIX")
-    inactive = ~periods["active"].astype(bool)
-    if inactive.any():
-        ax1.scatter(dates[inactive], raw[inactive], s=9, color="tab:red", alpha=0.45, label="inactive weeks")
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc="upper left")
-    ax1.set_title(f"Cumulative performance with {gate_name}")
-    fig.tight_layout()
-    path = out_dir / "vix_gate_cumulative.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    paths.append(str(path))
+    def cumulative_plot(raw_col, gated_col, label, filename):
+        fig, ax1 = plt.subplots(figsize=(12, 5))
+        raw = (1.0 + periods[raw_col].fillna(0.0)).cumprod()
+        gated = (1.0 + periods[gated_col].fillna(0.0)).cumprod()
+        ax1.plot(dates, raw, lw=1.6, label=f"raw {label}")
+        ax1.plot(dates, gated, lw=1.9, label=f"{gate_name} {label}")
+        ax1.set_ylabel("cumulative growth")
+        ax1.grid(alpha=0.25)
+        ax2 = ax1.twinx()
+        ax2.plot(dates, periods["vix"], color="tab:gray", lw=0.9, alpha=0.55, label="VIX")
+        ax2.set_ylabel("VIX")
+        inactive = ~periods["active"].astype(bool)
+        if inactive.any():
+            ax1.scatter(dates[inactive], raw[inactive], s=9, color="tab:red", alpha=0.45, label="inactive weeks")
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc="upper left")
+        ax1.set_title(f"Cumulative {label} performance with {gate_name}")
+        fig.tight_layout()
+        path = out_dir / filename
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        paths.append(str(path))
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    colors = np.where(periods["active"], "tab:blue", "tab:red")
-    ax.scatter(periods["vix"], periods["long_short"], c=colors, s=28, alpha=0.75)
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_xlabel("VIX at rebalance")
-    ax.set_ylabel("weekly long-short return")
-    ax.set_title("Where the cross-section works vs fails")
-    ax.grid(alpha=0.25)
-    path = out_dir / "vix_vs_long_short.png"
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    paths.append(str(path))
+    cumulative_plot("long_short", "gated_long_short", "long-short", "vix_gate_cumulative_long_short.png")
+    cumulative_plot("long_only", "gated_long_only", "long-only", "vix_gate_cumulative_long_only.png")
+
+    def scatter_plot(return_col, label, filename):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        colors = np.where(periods["active"], "tab:blue", "tab:red")
+        ax.scatter(periods["vix"], periods[return_col], c=colors, s=28, alpha=0.75)
+        ax.axhline(0, color="black", lw=0.8)
+        ax.set_xlabel("VIX at rebalance")
+        ax.set_ylabel(f"weekly {label} return")
+        ax.set_title(f"Where {label} works vs fails")
+        ax.grid(alpha=0.25)
+        path = out_dir / filename
+        fig.tight_layout()
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        paths.append(str(path))
+
+    scatter_plot("long_short", "long-short", "vix_vs_long_short.png")
+    scatter_plot("long_only", "long-only", "vix_vs_long_only.png")
 
     if len(bucket):
         fig, ax1 = plt.subplots(figsize=(12, 5))
@@ -1868,6 +1880,24 @@ def plot_diagnostics(periods, bucket, out_dir, gate_name):
         ax1.set_title("VIX bucket performance")
         fig.tight_layout()
         path = out_dir / "vix_bucket_performance.png"
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        paths.append(str(path))
+
+        fig, ax1 = plt.subplots(figsize=(12, 5))
+        x = np.arange(len(bucket))
+        colors = np.where(bucket["lo_mean"] >= 0, "tab:green", "tab:red")
+        ax1.bar(x, bucket["lo_mean"], color=colors, alpha=0.8)
+        ax1.axhline(0, color="black", lw=0.8)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(bucket["vix_bucket"], rotation=35, ha="right")
+        ax1.set_ylabel("mean weekly long-only")
+        ax2 = ax1.twinx()
+        ax2.plot(x, bucket["ic_mean"], color="tab:blue", marker="o", label="mean IC")
+        ax2.set_ylabel("mean Spearman IC")
+        ax1.set_title("VIX bucket long-only performance")
+        fig.tight_layout()
+        path = out_dir / "vix_bucket_long_only_performance.png"
         fig.savefig(path, dpi=160)
         plt.close(fig)
         paths.append(str(path))
@@ -1991,12 +2021,32 @@ def run(data_dir=None, pattern="sp00_5MA",
     bucket = vix_bucket_summary(periods)
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    long_short_csv = out_dir / "long_short_period_returns.csv"
+    long_only_csv = out_dir / "long_only_period_returns.csv"
+    combined_returns_csv = out_dir / "portfolio_period_returns.csv"
+    summary.update(
+        {
+            "long_short_csv": str(long_short_csv),
+            "long_only_csv": str(long_only_csv),
+            "portfolio_period_returns_csv": str(combined_returns_csv),
+        }
+    )
     predictions.to_csv(out_dir / "predictions.csv", index=False)
     periods.to_csv(out_dir / "vix_period_diagnostics.csv", index=False)
     periods[[
         "per", "rebalance_date", "vix", "active", "long_only", "long_short",
         "gated_long_only", "gated_long_short", "n_names",
-    ]].to_csv(out_dir / "portfolio_period_returns.csv", index=False)
+    ]].to_csv(combined_returns_csv, index=False)
+    periods[[
+        "per", "rebalance_date", "vix", "active", "vix_regime",
+        "long_short", "gated_long_short", "n_names",
+        "ic_spearman", "wrong_tail", "top_hit", "bottom_hit",
+    ]].to_csv(long_short_csv, index=False)
+    periods[[
+        "per", "rebalance_date", "vix", "active", "vix_regime",
+        "long_only", "gated_long_only", "n_names",
+        "ic_spearman", "wrong_tail", "top_hit", "bottom_hit",
+    ]].to_csv(long_only_csv, index=False)
     bucket.to_csv(out_dir / "vix_bucket_summary.csv", index=False)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     plot_paths = plot_diagnostics(periods, bucket, out_dir, gate_name) if make_plots else []
