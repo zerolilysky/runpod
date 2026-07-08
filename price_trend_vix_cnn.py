@@ -454,8 +454,17 @@ def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
                 loss_fn(net(Xt[b]), yt[b]).backward()
                 opt.step()
             net.eval()
+            total, nobs = 0.0, 0
             with torch.no_grad():
-                v = loss_fn(net(Xv), yv).item()
+                for s0 in range(0, len(Xv), batch):
+                    xb = Xv[s0:s0 + batch]
+                    yb = yv[s0:s0 + batch]
+                    if len(yb) == 0:
+                        continue
+                    loss = loss_fn(net(xb), yb)
+                    total += float(loss.item()) * len(yb)
+                    nobs += len(yb)
+            v = total / max(nobs, 1)
             if v < best - 1e-7:
                 best, wait, bst = v, 0, {a: b_.clone()
                                         for a, b_ in net.state_dict().items()}
@@ -977,11 +986,19 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
     # ------------------------------------------------------------------
     if protocol == "faithful":
         yr0 = int(df["date"].dt.year.min())
-        tr_end_year = (int(test_start) - 1) if test_start else (yr0 + int(train_years) - 1)
-        tr_cut = pd.Timestamp(f"{tr_end_year}-12-31")
-        tr = ok & (df["date"] <= tr_cut - embargo).values       # embargo right edge
-        te_lo = pd.Timestamp(f"{tr_end_year + 1}-01-01") if not test_start \
-            else pd.Timestamp(str(test_start))
+        if test_start:
+            te_lo = pd.Timestamp(str(test_start))
+            tr_cut = te_lo - pd.Timedelta(days=1)
+        else:
+            tr_end_year = yr0 + int(train_years) - 1
+            tr_cut = pd.Timestamp(f"{tr_end_year}-12-31")
+            te_lo = pd.Timestamp(f"{tr_end_year + 1}-01-01")
+        train_end = tr_cut - embargo
+        tr = ok & (df["date"] <= train_end).values       # embargo right edge
+        train_lo_limit = None
+        if train_years is not None and int(train_years) > 0:
+            train_lo_limit = te_lo - pd.DateOffset(years=int(train_years))
+            tr &= (df["date"] >= train_lo_limit).values
         te_hi = pd.Timestamp(str(test_end)) if test_end else df_te["date"].max() + pd.Timedelta(days=1)
         # cross-universe: guarantee no temporal overlap with the train labels
         if cross and te_lo <= tr_cut:
@@ -1001,8 +1018,8 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
         vix_aug = _maybe_vix(add_vix, data_dir, base, df, df_te, days, W, vix_rows,
                              vix_symbol, vix_scale, vix_csv, vix_download,
                              train_lo, tr_cut)
-        log.info("faithful: train<=%s (embargo %dd) ntr=%d | test %s..%s nte=%d",
-                 tr_cut.date(), embargo.days, int(tr.sum()), te_lo.date(),
+        log.info("faithful: train %s..%s (cut %s, embargo %dd) ntr=%d | test %s..%s nte=%d",
+                 train_lo.date(), train_end.date(), tr_cut.date(), embargo.days, int(tr.sum()), te_lo.date(),
                  te_hi.date(), int(te.sum()))
 
         predictor = _fit_predict(
@@ -1881,7 +1898,7 @@ def run(data_dir=None, pattern="sp00_5MA",
         gate="gate_nan_nan", gate_lower=None, gate_upper=None,
         task="clf", protocol="faithful", horizon=5,
         test_start="2015", test_end="2019-12-31",
-        seeds=5, epochs=50, pixel_norm="global",
+        train_years=8, seeds=5, epochs=50, pixel_norm="global",
         vix_symbol="^VIX", vix_cache="vix.csv", vix_download=True,
         drop_train_abs_ret=None, train_vix_lt=None,
         out_dir=None, source_out_dir=None, tag=None,
@@ -1923,6 +1940,7 @@ def run(data_dir=None, pattern="sp00_5MA",
         task=task,
         protocol=protocol,
         horizon=horizon,
+        train_years=train_years,
         test_start=test_start,
         test_end=test_end,
         seeds=seeds,
@@ -1962,6 +1980,7 @@ def run(data_dir=None, pattern="sp00_5MA",
             "task": task,
             "protocol": protocol,
             "horizon": int(horizon),
+            "train_years": None if train_years is None else int(train_years),
             "rebalance": freq,
             "test_start": test_start,
             "test_end": test_end,
@@ -2003,6 +2022,8 @@ def main(argv=None):
     ap.add_argument("--gate-lower", default=None)
     ap.add_argument("--gate-upper", default=None)
     ap.add_argument("--horizon", type=int, default=5)
+    ap.add_argument("--train-years", type=int, default=8,
+                    help="limit faithful training to this many years before test_start")
     ap.add_argument("--test-start", default="2015")
     ap.add_argument("--test-end", default="2019-12-31")
     ap.add_argument("--seeds", type=int, default=5)
@@ -2026,6 +2047,7 @@ def main(argv=None):
         gate_lower=args.gate_lower,
         gate_upper=args.gate_upper,
         horizon=args.horizon,
+        train_years=args.train_years,
         test_start=args.test_start,
         test_end=args.test_end,
         seeds=args.seeds,
