@@ -20,10 +20,11 @@ Gate semantics:
       - gate_16_nan     -> active when VIX < 16
       - gate_nan_nan    -> no VIX gate
 
-The CNN runner is embedded in this file. The module trains from the chart-image
-pickle in each call and does not require price_trend_cnn.py to be present.
-It also does not read a pre-existing predictions.csv, so it cannot silently
-pick up a cache from another model run.
+The embedded CNN runner follows the compact/fast reference form from the original
+price-trend script. The module trains from the chart-image pickle in each call
+and does not require price_trend_cnn.py to be present. It also does not read a
+pre-existing predictions.csv, so it cannot silently pick up a cache from another
+model run.
 """
 # ======================================================================
 # price_trend_cnn.py
@@ -99,7 +100,7 @@ pick up a cache from another model run.
 #   python price_trend_cnn.py --experiment vix_sp500_5MA
 # ======================================================================
 from __future__ import annotations
-import argparse, fnmatch, glob, json, logging, os, time
+import argparse, fnmatch, glob, json, logging, time
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -118,118 +119,6 @@ FIRST_BLOCK = {
 }
 N_BLOCKS = {5: 2, 20: 3, 60: 4}
 FILTERS = [64, 128, 256, 512]
-PIXEL_NORMS = ("none", "global", "per_image", "region_global",
-               "region_per_image", "stock_global")
-
-
-def _pixel_regions(days, H):
-    """Rows used for region-wise normalization: price, volume, and everything else."""
-    if days in GEOMETRY:
-        base_h, _, ph, vh = GEOMETRY[days]
-        base_h = min(int(base_h), int(H))
-        price_end = min(int(ph), int(H))
-        vol_start = max(0, min(base_h - int(vh), int(H)))
-        vol_end = min(base_h, int(H))
-    else:
-        price_end = max(1, int(H) * 3 // 4)
-        vol_start, vol_end = price_end, int(H)
-    used = np.zeros(int(H), dtype=bool)
-    regions = []
-    if price_end > 0:
-        rows = np.arange(0, price_end, dtype=int)
-        regions.append({"name": "price", "rows": rows.tolist()})
-        used[rows] = True
-    if vol_end > vol_start:
-        rows = np.arange(vol_start, vol_end, dtype=int)
-        regions.append({"name": "volume", "rows": rows.tolist()})
-        used[rows] = True
-    other = np.where(~used)[0]
-    if len(other):
-        regions.append({"name": "other", "rows": other.astype(int).tolist()})
-    return regions
-
-
-def _stat_block(block):
-    return float(block.mean()), float(block.std() + 1e-8)
-
-
-def _fit_pixel_normalizer(A, pixel_norm, days, train_ids=None):
-    """Fit a train-only image normalizer and return a JSON-serializable config."""
-    A = np.asarray(A, dtype=np.float32)
-    mode = str(pixel_norm or "global")
-    if mode not in PIXEL_NORMS:
-        raise ValueError(f"pixel_norm must be one of {PIXEL_NORMS}, got {mode!r}")
-    if mode == "none":
-        return {"mode": "none"}
-    if mode == "global":
-        mu, sd = _stat_block(A)
-        return {"mode": "global", "mu": mu, "sd": sd}
-    if mode == "per_image":
-        return {"mode": "per_image"}
-    if mode in ("region_global", "region_per_image"):
-        regions = _pixel_regions(days, A.shape[1])
-        if mode == "region_global":
-            for r in regions:
-                rows = np.asarray(r["rows"], dtype=int)
-                r["mu"], r["sd"] = _stat_block(A[:, rows, :])
-        return {"mode": mode, "regions": regions}
-    if train_ids is None:
-        raise ValueError("pixel_norm='stock_global' requires train_ids")
-    ids = np.asarray(train_ids).astype(str)
-    if len(ids) != len(A):
-        raise ValueError("train_ids length must match Xtr length")
-    mu, sd = _stat_block(A)
-    by_id = {}
-    for sid in pd.unique(ids):
-        m = ids == sid
-        smu, ssd = _stat_block(A[m])
-        by_id[str(sid)] = {"mu": smu, "sd": ssd}
-    return {"mode": "stock_global", "default": {"mu": mu, "sd": sd}, "by_id": by_id}
-
-
-def _apply_pixel_normalizer(A, meta, ids=None):
-    """Apply a normalizer returned by _fit_pixel_normalizer."""
-    A = np.asarray(A, dtype=np.float32)
-    mode = meta.get("mode", "global")
-    if mode == "none":
-        return A
-    if mode == "global":
-        return (A - float(meta["mu"])) / float(meta["sd"])
-    if mode == "per_image":
-        flat = A.reshape(len(A), -1)
-        return (A - flat.mean(1)[:, None, None]) / (flat.std(1)[:, None, None] + 1e-8)
-    if mode == "region_global":
-        out = A.copy()
-        for r in meta["regions"]:
-            rows = np.asarray(r["rows"], dtype=int)
-            out[:, rows, :] = (out[:, rows, :] - float(r["mu"])) / float(r["sd"])
-        return out
-    if mode == "region_per_image":
-        out = A.copy()
-        for r in meta["regions"]:
-            rows = np.asarray(r["rows"], dtype=int)
-            block = out[:, rows, :]
-            flat = block.reshape(len(out), -1)
-            out[:, rows, :] = (block - flat.mean(1)[:, None, None]) / (
-                flat.std(1)[:, None, None] + 1e-8
-            )
-        return out
-    if mode == "stock_global":
-        if ids is None:
-            d = meta["default"]
-            return (A - float(d["mu"])) / float(d["sd"])
-        ids = np.asarray(ids).astype(str)
-        if len(ids) != len(A):
-            raise ValueError("ids length must match image count")
-        out = np.empty_like(A)
-        default = meta["default"]
-        by_id = meta.get("by_id", {})
-        for sid in pd.unique(ids):
-            st = by_id.get(str(sid), default)
-            m = ids == sid
-            out[m] = (A[m] - float(st["mu"])) / float(st["sd"])
-        return out
-    raise ValueError(f"unknown pixel normalizer mode {mode!r}")
 
 
 def _setup_log(data_dir=None, level=logging.DEBUG):
@@ -382,36 +271,6 @@ def despeckle(G, H, W):
 # ======================================================================
 # PART 2 -- the Jiang-Kelly-Xiu CNN + trainable, savable Predictor
 # ======================================================================
-def _ret_weights(y, alpha=3.0, q=0.95, cap=5.0):
-    y = np.asarray(y, dtype=np.float32)
-    scale = float(np.nanquantile(np.abs(y), q) + 1e-8)
-    w = 1.0 + float(alpha) * np.clip(np.abs(y) / scale, 0.0, float(cap))
-    return w.astype(np.float32)
-
-
-def _clf_objective_loss(logits, labels, returns, weights=None, objective="ce",
-                        focal_gamma=2.0, corr_weight=0.0):
-    import torch
-    import torch.nn.functional as F
-
-    obj = str(objective or "ce").lower()
-    ce = F.cross_entropy(logits, labels, reduction="none")
-    if "focal" in obj:
-        pt = torch.softmax(logits, dim=1).gather(1, labels.view(-1, 1)).squeeze(1)
-        ce = ce * (1.0 - pt).clamp_min(1e-6).pow(float(focal_gamma))
-    if weights is not None and ("weighted" in obj or "ret_weighted" in obj):
-        ce = ce * weights
-    loss = ce.mean()
-    if obj in ("corr_ce", "weighted_corr_ce", "rank_corr_ce"):
-        score = logits[:, 1] - logits[:, 0]
-        ret = returns.to(score.dtype)
-        score = score - score.mean()
-        ret = ret - ret.mean()
-        corr = (score * ret).mean() / (score.std(unbiased=False) * ret.std(unbiased=False) + 1e-8)
-        loss = loss - float(corr_weight) * corr
-    return loss
-
-
 def build_cnn(days, H, W, task="clf"):
     """Stacked [Conv(5x3) -> BatchNorm -> LeakyReLU -> MaxPool(2x1)] blocks
     (2/3/4 for 5/20/60-day; filters 64,128,256,512), flatten -> Dropout(0.5)
@@ -457,33 +316,32 @@ class Predictor:
     saved to disk and reloaded. Everything it holds was fit on TRAIN only."""
 
     def __init__(self, nets, task, days, H, W, pixel_norm,
-                 mu, sd, ymu, ysd, cap, device="cpu", norm_meta=None):
+                 mu, sd, ymu, ysd, cap, device="cpu"):
         self.nets = nets                 # list[nn.Module] (already .eval())
         self.task, self.days = task, int(days)
         self.H, self.W = int(H), int(W)
-        self.pixel_norm = pixel_norm
-        self.norm_meta = norm_meta or (
-            {"mode": "per_image"} if pixel_norm == "per_image"
-            else {"mode": "none"} if pixel_norm == "none"
-            else {"mode": "global", "mu": mu, "sd": sd}
-        )
-        self.mu, self.sd = mu, sd
+        self.pixel_norm = pixel_norm      # "global" | "per_image"
+        self.mu, self.sd = mu, sd         # floats (global) or None (per_image)
         self.ymu, self.ysd, self.cap = ymu, ysd, cap
         self.device = device
 
     # -- pixel normalisation (vectorized; works on any (n,H,W) slice) --
-    def _norm(self, A, ids=None):
-        return _apply_pixel_normalizer(A, self.norm_meta, ids=ids)
+    def _norm(self, A):
+        A = np.asarray(A, dtype=np.float32)
+        if self.pixel_norm == "per_image":
+            flat = A.reshape(len(A), -1)
+            m = flat.mean(1)[:, None, None]
+            s = flat.std(1)[:, None, None] + 1e-8
+            return (A - m) / s
+        return (A - self.mu) / self.sd
 
-    def __call__(self, Xte, batch=4096, ids=None):
+    def __call__(self, Xte, batch=4096):
         import torch
         Xte = np.ascontiguousarray(Xte, dtype=np.float32)
-        ids = None if ids is None else np.asarray(ids).astype(str)
         out = np.zeros(len(Xte), np.float64)
         with torch.no_grad():
             for s0 in range(0, len(Xte), batch):
-                xb_ids = ids[s0:s0 + batch] if ids is not None else None
-                xb = self._norm(Xte[s0:s0 + batch], ids=xb_ids)
+                xb = self._norm(Xte[s0:s0 + batch])
                 xb = torch.from_numpy(np.ascontiguousarray(xb)) \
                     .view(-1, 1, self.H, self.W).to(self.device)
                 for net in self.nets:
@@ -503,8 +361,7 @@ class Predictor:
         d = _ensure_dir(out_dir)
         meta = dict(task=self.task, days=self.days, H=self.H, W=self.W,
                     pixel_norm=self.pixel_norm, mu=self.mu, sd=self.sd,
-                    norm_meta=self.norm_meta, ymu=self.ymu, ysd=self.ysd,
-                    cap=self.cap, n_nets=len(self.nets))
+                    ymu=self.ymu, ysd=self.ysd, cap=self.cap, n_nets=len(self.nets))
         for k, net in enumerate(self.nets):
             torch.save(net.state_dict(), d / f"{tag}_seed{k}.pt")
         (d / f"{tag}_meta.json").write_text(json.dumps(meta, indent=2))
@@ -525,51 +382,35 @@ def load_predictor(model_dir, tag="model", device=None):
         net.eval(); nets.append(net)
     return Predictor(nets, meta["task"], meta["days"], meta["H"], meta["W"],
                      meta["pixel_norm"], meta["mu"], meta["sd"],
-                     meta["ymu"], meta["ysd"], meta["cap"], device=dev,
-                     norm_meta=meta.get("norm_meta"))
+                     meta["ymu"], meta["ysd"], meta["cap"], device=dev)
 
 
 def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
-              patience=2, lr=1e-5, batch=16384, val_frac=0.30, winsorize=True,
-              device=None, seed0=42, pixel_norm="global", train_ids=None):
+              patience=2, lr=1e-5, batch=128, val_frac=0.30, winsorize=True,
+              device=None, seed0=42, pixel_norm="global"):
     """Train the JKX CNN ensemble on TRAINING images only; return a `Predictor`.
     Pixel normaliser and y-scaler are fit on train only; a random `val_frac`
     split drives early stopping. No test data is ever seen during fitting.
     pixel_norm='global' (train mean/std) or 'per_image' (each image self-norms)."""
     import torch, torch.nn.functional as F
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    lr = float(os.environ.get("PRICE_TREND_LR", lr))
-    opt_name = os.environ.get("PRICE_TREND_OPT", "adam").lower()
-    objective = os.environ.get("PRICE_TREND_OBJECTIVE", "ce").lower()
-    ret_weight_alpha = float(os.environ.get("PRICE_TREND_RET_WEIGHT_ALPHA", "3.0"))
-    focal_gamma = float(os.environ.get("PRICE_TREND_FOCAL_GAMMA", "2.0"))
-    corr_weight = float(os.environ.get("PRICE_TREND_CORR_WEIGHT", "0.25"))
-    if H * W >= 12000:
-        batch = min(batch, 1024)
-    elif H * W >= 3000:
-        batch = min(batch, 4096)
-    use_amp = str(dev).startswith("cuda")
-    if use_amp:
-        torch.backends.cudnn.benchmark = True
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
     Xtr = np.ascontiguousarray(Xtr, dtype=np.float32)
 
     # ---- pixel normalisation (feature 6) : fit on TRAIN only ----
-    train_ids_arr = None if train_ids is None else np.asarray(train_ids).astype(str)
-    norm_meta = _fit_pixel_normalizer(Xtr, pixel_norm, days, train_ids=train_ids_arr)
-    mu = norm_meta.get("mu")
-    sd = norm_meta.get("sd")
-
-    def _norm(A, ids=None):
-        return _apply_pixel_normalizer(A, norm_meta, ids=ids)
+    if pixel_norm == "per_image":
+        mu = sd = None
+        def _norm(A):
+            A = np.asarray(A, dtype=np.float32); flat = A.reshape(len(A), -1)
+            return (A - flat.mean(1)[:, None, None]) / (flat.std(1)[:, None, None] + 1e-8)
+    elif pixel_norm == "global":
+        mu, sd = float(Xtr.mean()), float(Xtr.std() + 1e-8)
+        def _norm(A):
+            return (np.asarray(A, dtype=np.float32) - mu) / sd
+    else:
+        raise ValueError(f"pixel_norm must be 'global' or 'per_image', got {pixel_norm!r}")
 
     if task == "clf":
         lab = (ytr > 0).astype(np.int64)                    # 1{forward return > 0}
-        ret_lab = ytr.astype(np.float32)
-        w_lab = _ret_weights(ret_lab, alpha=ret_weight_alpha)
         ymu = ysd = cap = None
     else:
         y = ytr.astype(np.float32)
@@ -577,8 +418,6 @@ def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
             lo, hi = np.quantile(y, [0.01, 0.99]); y = np.clip(y, lo, hi)
         ymu, ysd = float(y.mean()), float(y.std() + 1e-8)
         lab = ((y - ymu) / ysd).astype(np.float32)
-        ret_lab = None
-        w_lab = None
         cap = float(np.quantile(np.abs(lab), 0.99))
 
     rng = np.random.default_rng(seed0)                      # random 70/30 split
@@ -587,107 +426,22 @@ def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
     vi, ti = perm[:nval], perm[nval:]
 
     def t_img(A, idx):
-        ids = train_ids_arr[idx] if train_ids_arr is not None else None
-        a = _norm(A[idx], ids=ids)
+        a = _norm(A[idx])
         return torch.from_numpy(np.ascontiguousarray(a)).view(-1, 1, H, W).to(dev)
 
     Xt, Xv = t_img(Xtr, ti), t_img(Xtr, vi)
     yt = torch.from_numpy(lab[ti]).to(dev)
     yv = torch.from_numpy(lab[vi]).to(dev)
     if task == "clf":
-        rt = torch.from_numpy(ret_lab[ti]).to(dev)
-        rv = torch.from_numpy(ret_lab[vi]).to(dev)
-        wt = torch.from_numpy(w_lab[ti]).to(dev)
-        wv = torch.from_numpy(w_lab[vi]).to(dev)
+        loss_fn = lambda o, y_: F.cross_entropy(o, y_)
     else:
-        rt = rv = wt = wv = None
-    if task == "clf":
-        loss_fn = lambda o, y_, r_, w_: _clf_objective_loss(
-            o, y_, r_, w_, objective=objective, focal_gamma=focal_gamma,
-            corr_weight=corr_weight
-        )
-    else:
-        loss_fn = lambda o, y_, r_, w_: F.mse_loss(torch.tanh(o.squeeze(-1)) * cap, y_)
+        loss_fn = lambda o, y_: F.mse_loss(torch.tanh(o.squeeze(-1)) * cap, y_)
 
-    def eval_loss(net):
-        total, n = 0.0, 0
-        with torch.no_grad():
-            for s0 in range(0, len(Xv), batch):
-                xb = Xv[s0:s0 + batch]
-                yb = yv[s0:s0 + batch]
-                rb = rv[s0:s0 + batch] if rv is not None else None
-                wb = wv[s0:s0 + batch] if wv is not None else None
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                    loss = loss_fn(net(xb), yb, rb, wb)
-                total += float(loss.item()) * len(yb)
-                n += len(yb)
-        return total / max(n, 1)
-
-    class Muon(torch.optim.Optimizer):
-        """Small Muon-style optimizer for matrix/tensor weights.
-
-        1D parameters are left to a companion AdamW optimizer below.
-        """
-        def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5):
-            defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps)
-            super().__init__(params, defaults)
-
-        @staticmethod
-        def _zeropower(g, steps):
-            orig_shape = g.shape
-            x = g.reshape(g.shape[0], -1)
-            transposed = x.shape[0] > x.shape[1]
-            if transposed:
-                x = x.T
-            x = x / (x.norm() + 1e-7)
-            a, b, c = 3.4445, -4.7750, 2.0315
-            for _ in range(steps):
-                xx = x @ x.T
-                x = (a * torch.eye(xx.shape[0], device=x.device, dtype=x.dtype) + b * xx + c * (xx @ xx)) @ x
-            if transposed:
-                x = x.T
-            return x.reshape(orig_shape)
-
-        @torch.no_grad()
-        def step(self, closure=None):
-            loss = closure() if closure is not None else None
-            for group in self.param_groups:
-                lr_, mom, ns = group["lr"], group["momentum"], group["ns_steps"]
-                for p_ in group["params"]:
-                    if p_.grad is None:
-                        continue
-                    st = self.state[p_]
-                    if "buf" not in st:
-                        st["buf"] = torch.zeros_like(p_)
-                    buf = st["buf"]
-                    buf.mul_(mom).add_(p_.grad)
-                    update = self._zeropower(buf, ns)
-                    p_.add_(update, alpha=-lr_)
-            return loss
-
-    def make_optim(net):
-        if opt_name == "adamw":
-            return [torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)]
-        if opt_name == "sgd":
-            return [torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, nesterov=True)]
-        if opt_name == "muon":
-            matrix, vector = [], []
-            for p_ in net.parameters():
-                (matrix if p_.ndim >= 2 else vector).append(p_)
-            opts = []
-            if matrix:
-                opts.append(Muon(matrix, lr=lr))
-            if vector:
-                opts.append(torch.optim.AdamW(vector, lr=lr, weight_decay=0.0))
-            return opts
-        return [torch.optim.Adam(net.parameters(), lr=lr)]
-
-    nets, idx_t = [], torch.arange(len(ti), device=dev)
+    nets, idx_t = [], torch.arange(len(ti))
     for k in range(seeds):
         torch.manual_seed(seed0 + k)
         net = build_cnn(days, H, W, task).to(dev)
-        opts = make_optim(net)
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        opt = torch.optim.Adam(net.parameters(), lr=lr)     # Adam, lr=1e-5 (JKX)
         best, bst, wait = 1e18, None, 0
         for _ in range(epochs):
             net.train()
@@ -696,18 +450,12 @@ def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
                 b = pm[s0:s0 + batch]
                 if len(b) < 2:
                     continue
-                for opt in opts:
-                    opt.zero_grad(set_to_none=True)
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                    rb = rt[b] if rt is not None else None
-                    wb = wt[b] if wt is not None else None
-                    loss = loss_fn(net(Xt[b]), yt[b], rb, wb)
-                scaler.scale(loss).backward()
-                for opt in opts:
-                    scaler.step(opt)
-                scaler.update()
+                opt.zero_grad()
+                loss_fn(net(Xt[b]), yt[b]).backward()
+                opt.step()
             net.eval()
-            v = eval_loss(net)
+            with torch.no_grad():
+                v = loss_fn(net(Xv), yv).item()
             if v < best - 1e-7:
                 best, wait, bst = v, 0, {a: b_.clone()
                                         for a, b_ in net.state_dict().items()}
@@ -719,8 +467,7 @@ def train_cnn(Xtr, ytr, days, H, W, task="clf", seeds=5, epochs=50,
             net.load_state_dict(bst)
         net.eval(); nets.append(net)
 
-    return Predictor(nets, task, days, H, W, pixel_norm, mu, sd, ymu, ysd, cap, dev,
-                     norm_meta=norm_meta)
+    return Predictor(nets, task, days, H, W, pixel_norm, mu, sd, ymu, ysd, cap, dev)
 
 
 # ======================================================================
@@ -1152,8 +899,7 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
       pattern / test_pattern : train / (cross-universe) test files, e.g.
                                pattern='sp500_5MA', test_pattern='sp600_5MA'.
       task='clf'|'reg'; protocol='faithful'|'walkforward'; horizon=5/20/60.
-      pixel_norm='global'|'per_image'|'region_global'|'region_per_image'|'stock_global'
-                                            (feature 6)
+      pixel_norm='global'|'per_image'      (feature 6)
       add_vix=True, vix_rows, vix_scale    (feature 5)
       train_years                          (feature 7: set 15)
       save_csv / save_model                (feature 2: predictions + model)
@@ -1260,8 +1006,8 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
                  te_hi.date(), int(te.sum()))
 
         predictor = _fit_predict(
-            X[tr], y[tr], df["date"].values[tr], df["sedol"].values[tr],
-            X_te[te], df_te["date"].values[te], df_te["sedol"].values[te], preds, te,
+            X[tr], y[tr], df["date"].values[tr],
+            X_te[te], df_te["date"].values[te], preds, te,
             ph, vh, denoise, drop_train_noise_q, drop_metric,
             days, Hn, W, task, seeds, epochs, pixel_norm, vix_aug)
         if save_model:
@@ -1297,8 +1043,7 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
                     continue
                 tr = _cap_train(tr, max_train, seed=i)
                 predictor = _fit_predict(
-                    X[tr], y[tr], df["date"].values[tr], df["sedol"].values[tr],
-                    None, None, None, None, None,
+                    X[tr], y[tr], df["date"].values[tr], None, None, None, None,
                     ph, vh, denoise, drop_train_noise_q, drop_metric,
                     days, Hn, W, task, seeds, epochs, pixel_norm, vix_aug,
                     predict_only=False)
@@ -1308,7 +1053,7 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
             Xte = X[te]
             if vix_aug is not None:
                 Xte = vix_aug.augment(Xte, df["date"].values[te])
-            preds[te] = predictor(Xte, ids=df["sedol"].values[te])
+            preds[te] = predictor(Xte)
         if save_model and predictor is not None:
             predictor.save(out / "model", "model")
 
@@ -1359,7 +1104,7 @@ def run(data_dir=None, pattern="R1000_picMap*_price_chart_image_df.pickle",
     return res
 
 
-def _fit_predict(Xtr_raw, ytr, dtr, idtr, Xte_raw, dte, idte, preds, te_mask,
+def _fit_predict(Xtr_raw, ytr, dtr, Xte_raw, dte, preds, te_mask,
                  ph, vh, denoise, drop_train_noise_q, drop_metric,
                  days, Hn, W, task, seeds, epochs, pixel_norm, vix_aug,
                  predict_only=False):
@@ -1370,16 +1115,15 @@ def _fit_predict(Xtr_raw, ytr, dtr, idtr, Xte_raw, dte, idte, preds, te_mask,
     Xtr = tf(Xtr_raw)[keep]
     ytr = ytr[keep]
     dtr = np.asarray(dtr)[keep]
-    idtr = np.asarray(idtr).astype(str)[keep]
     if vix_aug is not None:
         Xtr = vix_aug.augment(Xtr, dtr)
     predictor = train_cnn(Xtr, ytr, days, Hn, W, task=task, seeds=seeds,
-                          epochs=epochs, pixel_norm=pixel_norm, train_ids=idtr)
+                          epochs=epochs, pixel_norm=pixel_norm)
     if Xte_raw is not None and preds is not None:
         Xte = tf(Xte_raw)
         if vix_aug is not None:
             Xte = vix_aug.augment(Xte, dte)
-        preds[te_mask] = predictor(Xte, ids=idte)
+        preds[te_mask] = predictor(Xte)
     return predictor
 
 
@@ -1419,7 +1163,7 @@ def _auto_tag(uni_tr, uni_te, days, h, task, protocol, pixel_norm, add_vix,
     if protocol != "faithful":
         bits.append(protocol)
     if pixel_norm != "global":
-        bits.append(str(pixel_norm).replace("_", ""))
+        bits.append("perimg")
     if add_vix:
         bits.append("vix")
     if int(train_years) != 8:
@@ -1597,7 +1341,7 @@ def main():
     ap.add_argument("--drop-metric", default="composite")
     ap.add_argument("--max-train", type=int, default=None)
     ap.add_argument("--min-names", type=int, default=20)
-    ap.add_argument("--pixel-norm", default="global", choices=list(PIXEL_NORMS))
+    ap.add_argument("--pixel-norm", default="global", choices=["global", "per_image"])
     ap.add_argument("--add-vix", action="store_true")
     ap.add_argument("--vix-rows", type=int, default=3)
     ap.add_argument("--vix-scale", default="minmax", choices=["minmax", "zscore"])
@@ -1615,11 +1359,14 @@ def main():
         save_model=not a.no_save_model)
 
 
+if __name__ == "__main__":
+    main()
 
 # ---- Embedded base CNN runner captured before the VIX wrapper overrides run/main ----
 from types import SimpleNamespace
 import inspect
 import math
+import os
 import re
 
 _embedded_base_run = run
