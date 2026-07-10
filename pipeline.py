@@ -97,11 +97,21 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     """Load the panel, build the target and all (lagged) features. Returns a tidy
     fund-security-quarter frame with columns: fund, security, yq, qi, <features>,
     Y (target), fwd_qret, weight, rank."""
-    df = pd.read_parquet(cfg.data_path)
     inv = {v: k for k, v in cfg.col_map.items()}          # internal -> your column
+    # (a) READ ONLY the raw columns we actually use (huge saving on a 20M-row file)
+    want = ["fund", "date", "security", "shares", "position_value", "market_cap",
+            "quarterly_ret", "past_1q_ret", "future_1q_ret", "portfolio_value",
+            "weight", "rank", "n_holdings", "isUs"]
+    want_raw = [inv[c] for c in want if c in inv]
+    try:
+        import pyarrow.parquet as _pq
+        avail = set(_pq.ParquetFile(cfg.data_path).schema.names)
+        use = [c for c in want_raw if c in avail]
+        df = pd.read_parquet(cfg.data_path, columns=use or None)
+    except Exception:
+        df = pd.read_parquet(cfg.data_path)
     df = df.rename(columns={inv[c]: c for c in cfg.col_map.values() if inv[c] in df.columns})
-    need = ["fund", "date", "security", "shares"]
-    miss = [c for c in need if c not in df.columns]
+    miss = [c for c in ["fund", "date", "security", "shares"] if c not in df.columns]
     if miss:
         raise ValueError(f"missing required columns after mapping: {miss}")
 
@@ -109,38 +119,38 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     df["yq"] = df["date"].dt.to_period("Q")
     if cfg.us_only and "isUs" in df.columns:
         df = df[df["isUs"].astype(bool)]
-    # one row per (fund, quarter, security) -- keep the latest report in the quarter
     df = df.sort_values("date").drop_duplicates(["fund", "yq", "security"], keep="last")
     if "rank" in df.columns:
         df = df[df["rank"] <= cfg.n_slots]
+    df.drop(columns=[c for c in ("date", "isUs") if c in df.columns], inplace=True)
 
-    # fill optional columns so features always exist
-    for c, d in [("weight", np.nan), ("rank", np.nan), ("position_value", np.nan),
-                 ("portfolio_value", np.nan), ("market_cap", np.nan),
-                 ("quarterly_ret", np.nan), ("past_1q_ret", np.nan),
-                 ("future_1q_ret", np.nan), ("n_holdings", np.nan)]:
-        if c not in df.columns:
-            df[c] = d
-
+    # (b) DOWNCAST raw numerics to float32 UP FRONT -> every derived feature stays
+    # float32, pd.NA/nullable become np.nan, and no float64 (n_cols, n_rows) block forms.
+    F32 = "float32" if cfg.downcast else "float64"
+    raw_num = ["shares", "position_value", "market_cap", "quarterly_ret", "past_1q_ret",
+               "future_1q_ret", "portfolio_value", "weight", "rank", "n_holdings"]
+    for c in raw_num:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
+            else np.array(np.nan, dtype=F32)
     df = df.sort_values(["fund", "security", "yq"]).reset_index(drop=True)
     g = df.groupby(["fund", "security"], sort=False)
 
-    # own-position dynamics (all lagged / known at t)
-    for k in range(1, 7):
-        df[f"sh_lag{k}"] = g["shares"].shift(k)
-    df["w_lag1"] = g["weight"].shift(1)
-    df["dw"] = df["weight"] - df["w_lag1"]
-    df["pdsh"] = (df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)   # past trade into t
-    df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0)
-    df["pdsh_lag1"] = g["pdsh"].shift(1)
-    df["log_posval"] = np.log(df["position_value"].abs() + 1.0)
-    df["log_pv"] = np.log(df["portfolio_value"].abs() + 1.0)
-    df["log_mktcap"] = np.log(df["market_cap"].abs() + 1.0)
+    # own-position dynamics (lagged; float32). Only lags 1-3 are used as features.
+    for k in (1, 2, 3):
+        df[f"sh_lag{k}"] = g["shares"].shift(k).astype(F32)
+    df["w_lag1"] = g["weight"].shift(1).astype(F32)
+    df["dw"] = (df["weight"] - df["w_lag1"]).astype(F32)
+    df["pdsh"] = ((df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)).astype(F32)
+    df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0).astype(F32)
+    df["pdsh_lag1"] = g["pdsh"].shift(1).astype(F32)
+    df["log_posval"] = np.log(df["position_value"].abs() + 1.0).astype(F32)
+    df["log_pv"] = np.log(df["portfolio_value"].abs() + 1.0).astype(F32)
+    df["log_mktcap"] = np.log(df["market_cap"].abs() + 1.0).astype(F32)
 
     # TARGET: sign of NEXT-quarter fractional share change (+-band). label, not a feature.
     sh_next = g["shares"].shift(-1)
     dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
-    df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band], [-1.0, 1.0], default=0.0)
+    df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band], [-1.0, 1.0], default=0.0).astype(F32)
     df.loc[dsh.isna(), "Y"] = np.nan
     df["fwd_qret"] = df["future_1q_ret"]                   # realized next-qtr return (eval only)
 
@@ -150,37 +160,31 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     nq = df.groupby("fund")["yq"].transform("nunique")
     df = df[nq >= cfg.min_years * 4]
 
-    # peer activity across the universe (lagged one quarter -> known at t)
+    # peer activity across the universe (lagged one quarter). map() -> no frame copy.
     lab = df.dropna(subset=["Y"])
     rate = lab.groupby("yq").agg(
         peer_buy=("Y", lambda s: (s > 0).mean()),
         peer_sell=("Y", lambda s: (s < 0).mean()),
         peer_hold=("Y", lambda s: (s == 0).mean())).sort_index().shift(1)
-    df = df.merge(rate, left_on="yq", right_index=True, how="left")
+    for col in ("peer_buy", "peer_sell", "peer_hold"):
+        df[col] = df["yq"].map(rate[col]).astype(F32)
 
-    # fund past-quarter return proxy (weight-weighted realized holding return)
-    df["_contrib"] = df["w_lag1"] * df["quarterly_ret"]
-    fr = df.groupby(["fund", "yq"])["_contrib"].sum().rename("fund_ret").reset_index()
-    fr["fund_ret_l1"] = fr.sort_values("yq").groupby("fund")["fund_ret"].shift(1)
-    df = df.merge(fr[["fund", "yq", "fund_ret_l1"]], on=["fund", "yq"], how="left").drop(columns="_contrib")
+    # fund past-quarter return proxy (weight-weighted). reindex-map -> no merge/copy.
+    contrib = (df["w_lag1"] * df["quarterly_ret"])
+    fr = contrib.groupby([df["fund"], df["yq"]]).sum()            # (fund,yq) -> ret
+    fr_l1 = fr.groupby(level=0).shift(1)                          # prior quarter within fund
+    key = pd.MultiIndex.from_arrays([df["fund"].to_numpy(), df["yq"].to_numpy()])
+    df["fund_ret_l1"] = fr_l1.reindex(key).to_numpy(dtype=F32, na_value=np.nan)
 
     # integer quarter index for windowing
     qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
     df["qi"] = df["yq"].map({q: i for i, q in enumerate(qs)}).astype("int32")
     df["held"] = np.int8(1)
 
-    # keep ONLY what the model + evaluation need, then make numeric columns clean
-    # float32 (huge RAM saving on a 20M-row panel; also coerces pd.NA -> np.nan).
+    # (c) PRUNE IN PLACE to only what's needed (no big .copy()). Everything already float32.
     feat = [f for f in cfg.features if f in df.columns]
-    keep = list(dict.fromkeys(["fund", "security", "yq", "qi", "held", "Y",
-                               "fwd_qret", "weight", "rank"] + feat))
-    df = df[keep].copy()
-    for c in keep:
-        if c in ("fund", "security", "yq", "qi", "held"):
-            continue
-        df[c] = pd.to_numeric(df[c], errors="coerce")          # pd.NA/nullable -> np.nan
-        if cfg.downcast:
-            df[c] = df[c].astype("float32")
+    keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_qret", "weight", "rank"] + feat)
+    df.drop(columns=[c for c in df.columns if c not in keep], inplace=True)
     if cfg.downcast:
         df["fund"] = df["fund"].astype("category")
         df["security"] = df["security"].astype("category")
