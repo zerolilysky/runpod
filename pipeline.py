@@ -75,9 +75,12 @@ class Config:
     min_train_global: int = 2000
     device: str = "auto"           # "auto" | "cpu" | "cuda"
     seed: int = 42
-    # ---- CPU performance ----
+    # ---- CPU performance / memory ----
     n_jobs: int = -1               # per-fund: parallel funds across cores (-1 = all). 1 = serial.
-    torch_threads: int = 0         # intra-op threads. 0 = auto (1 per worker for per-fund; all cores for global)
+    torch_threads: int = 0         # intra-op threads. 0 = auto
+    parallel_backend: str = "threading"  # "threading" (SHARED memory, low RAM) | "loky" (processes, needs RAM) | "serial"
+    downcast: bool = True          # float32 + categoricals -> ~halves panel RAM
+    keep_panel: bool = False       # include the (large) panel in run() output (False frees it)
     # ---- misc ----
     save_outputs: bool = True
 
@@ -163,9 +166,24 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
 
     # integer quarter index for windowing
     qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
-    qmap = {q: i for i, q in enumerate(qs)}
-    df["qi"] = df["yq"].map(qmap)
-    df["held"] = 1
+    df["qi"] = df["yq"].map({q: i for i, q in enumerate(qs)}).astype("int32")
+    df["held"] = np.int8(1)
+
+    # keep ONLY what the model + evaluation need, then make numeric columns clean
+    # float32 (huge RAM saving on a 20M-row panel; also coerces pd.NA -> np.nan).
+    feat = [f for f in cfg.features if f in df.columns]
+    keep = list(dict.fromkeys(["fund", "security", "yq", "qi", "held", "Y",
+                               "fwd_qret", "weight", "rank"] + feat))
+    df = df[keep].copy()
+    for c in keep:
+        if c in ("fund", "security", "yq", "qi", "held"):
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce")          # pd.NA/nullable -> np.nan
+        if cfg.downcast:
+            df[c] = df[c].astype("float32")
+    if cfg.downcast:
+        df["fund"] = df["fund"].astype("category")
+        df["security"] = df["security"].astype("category")
     return df
 
 
@@ -186,9 +204,11 @@ def build_sequences(sub: pd.DataFrame, feat_cols: List[str], seq_len: int):
     mask = np.zeros((N, seq_len), dtype=np.float32)
     for k in range(seq_len):                                   # k=0 newest ... last=oldest
         step = seq_len - 1 - k
-        vals = g[feat_cols].shift(k).values
-        qik = g["qi"].shift(k).values
-        heldk = g["held"].shift(k).fillna(0).values
+        # to_numpy(na_value=np.nan) turns pd.NA / nullable / pyarrow columns into
+        # plain float np.nan -- `.values` would leave pd.NA and break numpy/torch.
+        vals = g[feat_cols].shift(k).to_numpy(dtype="float32", na_value=np.nan)
+        qik = g["qi"].shift(k).to_numpy(dtype="float64", na_value=np.nan)
+        heldk = g["held"].shift(k).to_numpy(dtype="float64", na_value=0.0)
         present = (qik == (qi - k)) & (heldk > 0)
         m = present[valid].astype(np.float32)
         X[:, step, :] = np.nan_to_num(vals[valid], nan=0.0, posinf=0.0, neginf=0.0) * m[:, None]
@@ -314,6 +334,15 @@ def _iter_funds(panel):
         yield f, fp
 
 
+def _fund_index_order(panel):
+    """(fund, row-positions) pairs, largest fund first. Only integer index arrays
+    are produced (a few hundred MB for 20M rows) -- NO frame copies -- so worker
+    threads slice the SHARED panel with .take() on demand (memory-flat)."""
+    idx = panel.groupby("fund", observed=True).indices          # {fund: positions}
+    for f in sorted(idx, key=lambda k: -len(idx[k])):
+        yield f, idx[f]
+
+
 def _fund_task(fund, fp, feat, cfg, dev="cpu"):
     """All rolling windows for ONE fund. Sequences are built ONCE for the whole
     fund and sliced per window (big CPU saving vs rebuilding each window). Runs
@@ -378,41 +407,50 @@ def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
                 if verbose:
                     acc = (out.loc[out.feasible, "y_pred"] == out.loc[out.feasible, "Y"]).mean()
                     print(f"  win {wi+1} test qi[{te_lo},{te_hi}) n_te={int(te.sum()):,} feas_acc={acc:.3f}")
-    else:  # per_fund  (funds are independent -> one core per fund, 1 torch thread each)
+    else:  # per_fund  (funds are independent)
         n_funds = int(panel["fund"].nunique())
         njobs = ncore if cfg.n_jobs in (-1, 0) else cfg.n_jobs
-        # NB: iterate the groupby LAZILY (never build a list of all fund frames) so
-        # memory stays bounded on the full "All_Funds" panel.
-        if dev != "cpu" or njobs == 1:
+        backend = cfg.parallel_backend if (dev == "cpu" and njobs > 1) else "serial"
+        preds = []
+
+        if backend == "serial":
             _set_threads(cfg.torch_threads or ncore)
-            preds, acc = [], []
+            acc = []
             for done, (f, fp) in enumerate(_iter_funds(panel), 1):
-                outs = _fund_task(f, fp, feat, cfg, dev)
-                preds += outs
+                outs = _fund_task(f, fp, feat, cfg, dev); preds += outs
                 acc += [(o.loc[o.feasible, "y_pred"] == o.loc[o.feasible, "Y"]).mean() for o in outs]
                 if verbose and done % 50 == 0:
-                    print(f"  [per-fund] {done}/{n_funds} funds | running feas_acc={np.nanmean(acc):.3f}")
-        else:
-            try:
-                from joblib import Parallel, delayed
-            except Exception:
-                Parallel = None
-            if Parallel is None:
-                if verbose:
-                    print("  [per-fund] joblib not found -> serial. `pip install joblib` for multi-core.")
-                preds = []
-                for f, fp in _iter_funds(panel):
-                    preds += _fund_task(f, fp, feat, cfg, "cpu")
-            else:
-                if verbose:
-                    print(f"  [per-fund] {n_funds} funds on {njobs}/{ncore} cores (loky), lazy dispatch...")
-                # generator + bounded pre_dispatch keeps every core fed while holding
-                # only ~2*njobs fund frames in flight (memory-safe for all funds).
-                gen = (delayed(_fund_task)(f, fp, feat, cfg, "cpu")
-                       for f, fp in _iter_funds(panel))
-                results = Parallel(n_jobs=njobs, backend="loky", batch_size=1,
-                                   pre_dispatch="2*n_jobs", verbose=(5 if verbose else 0))(gen)
-                preds = [o for r in results for o in r]
+                    print(f"  [per-fund] {done}/{n_funds} | running feas_acc={np.nanmean(acc):.3f}")
+
+        elif backend == "threading":
+            # SHARED-MEMORY threads: one panel in RAM, workers .take() their fund's
+            # rows on demand. torch releases the GIL during LSTM compute, so many
+            # cores are used with ~no extra memory (fixes the OOM from process pools).
+            from concurrent.futures import ThreadPoolExecutor
+            _set_threads(1)                     # each thread's torch ops single-threaded
+            if verbose:
+                print(f"  [per-fund] {n_funds} funds on {njobs} THREADS (shared memory, low RAM)")
+
+            def _wrk(args):
+                f, ix = args
+                return _fund_task(f, panel.take(ix), feat, cfg, "cpu")
+
+            done = 0
+            with ThreadPoolExecutor(max_workers=njobs) as ex:
+                for outs in ex.map(_wrk, _fund_index_order(panel)):
+                    preds += outs; done += 1
+                    if verbose and done % 100 == 0:
+                        print(f"  [per-fund] {done}/{n_funds} funds done")
+
+        else:  # "loky" processes -- higher RAM (each worker re-imports torch)
+            from joblib import Parallel, delayed
+            _set_threads(1)
+            if verbose:
+                print(f"  [per-fund] {n_funds} funds on {njobs} loky processes (needs RAM)")
+            gen = (delayed(_fund_task)(f, fp, feat, cfg, "cpu") for f, fp in _iter_funds(panel))
+            results = Parallel(n_jobs=njobs, backend="loky", batch_size=1,
+                               pre_dispatch="2*n_jobs", verbose=(5 if verbose else 0))(gen)
+            preds = [o for r in results for o in r]
     if not preds:
         raise RuntimeError("no predictions produced -- check filters / window sizes")
     return pd.concat(preds, ignore_index=True)
@@ -529,8 +567,8 @@ def run(cfg: Config = None, verbose=True):
         for nm, tb in tables.items():
             tb.to_csv(f"{cfg.out_dir}/{nm}.csv", index=False)
         preds.to_parquet(f"{cfg.out_dir}/predictions.parquet", index=False)
-    return {"panel": panel, "predictions": preds, "metrics": clean,
-            "tables": tables, "figures": figs, "config": asdict(cfg)}
+    return {"panel": (panel if cfg.keep_panel else None), "predictions": preds,
+            "metrics": clean, "tables": tables, "figures": figs, "config": asdict(cfg)}
 
 
 def _figures(metrics, cfg):
