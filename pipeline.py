@@ -47,14 +47,31 @@ class Config:
         "position_value": "position_value", "shares_change": "shares_change",
         "close": "close", "market_cap": "market_cap", "volume": "volume",
         "isUs": "isUs", "quarterly_ret": "quarterly_ret", "past_1q_ret": "past_1q_ret",
-        "future_1q_ret": "future_1q_ret", "portfolio_value": "portfolio_value",
+        "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
+        "portfolio_value": "portfolio_value",
         "weight": "weight", "rank": "rank", "n_holdings": "n_holdings",
     })
+    # ---- evaluation timing --------------------------------------------------
+    # accuracy(t) = "did we predict the t->t+1 trade right?" -> only OBSERVABLE at t+1.
+    #   "predictive"      : sort on accuracy(t), return over t+1->t+2  (`future_2q_ret`)
+    #                       -> no overlap, freshest signal.  RECOMMENDED.
+    #   "contemporaneous" : sort on accuracy(t), return over t->t+1    (`future_1q_ret`)
+    #                       -> sort variable overlaps its own return window (look-ahead).
+    #                          Keep only as the biased benchmark for comparison.
+    #   "lagged"          : sort on accuracy(t-1), return over t->t+1  -> clean but staler.
+    # Training is independent of this -> use compare_eval_modes() to get all three
+    # from a SINGLE training run.
+    eval_mode: str = "predictive"
     # ---- sample filters (paper Sec 3.1) ----
     us_only: bool = True
     min_years: int = 7          # >7 calendar years of history
-    min_holdings: int = 10      # >=10 securities per quarter
-    n_slots: int = 100          # keep top-N ranked positions per fund-quarter
+    min_holdings: int = 10      # >=10 securities per quarter (auto-capped at max_rank)
+    # Keep only positions with rank <= max_rank (1 = largest holding).
+    #   None -> use whatever the file already contains (auto-detect, no filter)
+    #   e.g. 25 / 10 -> re-run at a tighter cross-section to compare.
+    # NOTE: changing this changes the panel, so each value needs its own training
+    # run -- see run_rank_sweep().
+    max_rank: int = None
     change_band: float = 0.01   # +-1% dead-band around zero share change
     # ---- rolling design (paper Fig 2) ----
     window_q: int = 28          # observation window
@@ -100,8 +117,8 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     inv = {v: k for k, v in cfg.col_map.items()}          # internal -> your column
     # (a) READ ONLY the raw columns we actually use (huge saving on a 20M-row file)
     want = ["fund", "date", "security", "shares", "position_value", "market_cap",
-            "quarterly_ret", "past_1q_ret", "future_1q_ret", "portfolio_value",
-            "weight", "rank", "n_holdings", "isUs"]
+            "quarterly_ret", "past_1q_ret", "future_1q_ret", "future_2q_ret",
+            "portfolio_value", "weight", "rank", "n_holdings", "isUs"]
     want_raw = [inv[c] for c in want if c in inv]
     try:
         import pyarrow.parquet as _pq
@@ -120,15 +137,20 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     if cfg.us_only and "isUs" in df.columns:
         df = df[df["isUs"].astype(bool)]
     df = df.sort_values("date").drop_duplicates(["fund", "yq", "security"], keep="last")
+    # rank cutoff: honour max_rank if given, else use whatever the file contains
+    eff_rank = None
     if "rank" in df.columns:
-        df = df[df["rank"] <= cfg.n_slots]
+        if cfg.max_rank is not None:
+            df = df[df["rank"] <= cfg.max_rank]
+        eff_rank = int(df["rank"].max()) if len(df) else 0
     df.drop(columns=[c for c in ("date", "isUs") if c in df.columns], inplace=True)
 
     # (b) DOWNCAST raw numerics to float32 UP FRONT -> every derived feature stays
     # float32, pd.NA/nullable become np.nan, and no float64 (n_cols, n_rows) block forms.
     F32 = "float32" if cfg.downcast else "float64"
     raw_num = ["shares", "position_value", "market_cap", "quarterly_ret", "past_1q_ret",
-               "future_1q_ret", "portfolio_value", "weight", "rank", "n_holdings"]
+               "future_1q_ret", "future_2q_ret", "portfolio_value", "weight", "rank",
+               "n_holdings"]
     for c in raw_num:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
             else np.array(np.nan, dtype=F32)
@@ -152,13 +174,23 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
     df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band], [-1.0, 1.0], default=0.0).astype(F32)
     df.loc[dsh.isna(), "Y"] = np.nan
-    df["fwd_qret"] = df["future_1q_ret"]                   # realized next-qtr return (eval only)
+    # Realised returns -- EVALUATION ONLY, never features. Carry BOTH so all three
+    # eval_modes can be produced from one training run.
+    df["fwd_1q"] = df["future_1q_ret"]                     # t   -> t+1
+    df["fwd_2q"] = df["future_2q_ret"]                     # t+1 -> t+2  (strictly after acc(t))
 
-    # fund-level filters
+    # fund-level filters. min_holdings must be capped at the rank cutoff: with
+    # max_rank=10 a fund can never hold more than 10 of its top-10, so an
+    # uncapped min_holdings=10 would silently empty the panel.
+    mh = cfg.min_holdings
+    if eff_rank and mh > eff_rank:
+        print(f"[data] min_holdings {mh} > max rank {eff_rank} -> capped to {eff_rank}")
+        mh = eff_rank
     cnt = df.groupby(["fund", "yq"])["security"].transform("count")
-    df = df[cnt >= cfg.min_holdings]
+    df = df[cnt >= mh]
     nq = df.groupby("fund")["yq"].transform("nunique")
     df = df[nq >= cfg.min_years * 4]
+    df.attrs["eff_rank"] = eff_rank
 
     # peer activity across the universe (lagged one quarter). map() -> no frame copy.
     lab = df.dropna(subset=["Y"])
@@ -183,7 +215,8 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
 
     # (c) PRUNE IN PLACE to only what's needed (no big .copy()). Everything already float32.
     feat = [f for f in cfg.features if f in df.columns]
-    keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_qret", "weight", "rank"] + feat)
+    keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_1q", "fwd_2q",
+                "weight", "rank"] + feat)
     df.drop(columns=[c for c in df.columns if c not in keep], inplace=True)
     if cfg.downcast:
         df["fund"] = df["fund"].astype("category")
@@ -219,7 +252,8 @@ def build_sequences(sub: pd.DataFrame, feat_cols: List[str], seq_len: int):
         mask[:, step] = m
     feasible = mask.all(axis=1)
     y = (sub["Y"].values[valid] + 1).astype(np.int64)          # {-1,0,1} -> {0,1,2}
-    meta = sub.loc[valid, ["fund", "security", "yq", "qi", "Y", "fwd_qret", "weight", "rank"]].reset_index(drop=True)
+    meta = sub.loc[valid, ["fund", "security", "yq", "qi", "Y", "fwd_1q", "fwd_2q",
+                           "weight", "rank"]].reset_index(drop=True)
     return X, mask, y, feasible, meta
 
 
@@ -466,11 +500,36 @@ def _t(x):
     return x.mean() / (x.std(ddof=1) / np.sqrt(len(x))) if len(x) > 1 and x.std() > 0 else np.nan
 
 
+def _resolve_eval(cfg, cols):
+    """eval_mode -> (return column, extra lag on the sort variable).
+
+    accuracy(t) is only observable at t+1, so it must never be paired with the
+    t->t+1 return unless it is lagged.
+      predictive      -> fwd_2q (t+1->t+2), lag 0   : no overlap, freshest signal
+      contemporaneous -> fwd_1q (t  ->t+1), lag 0   : OVERLAPS -> biased benchmark only
+      lagged          -> fwd_1q (t  ->t+1), lag 1   : clean but staler
+    """
+    m = cfg.eval_mode
+    if m == "contemporaneous":
+        return "fwd_1q", 0
+    if m == "lagged":
+        return "fwd_1q", 1
+    if m == "predictive":
+        if "fwd_2q" in cols and pd.notna(cols["fwd_2q"]):
+            return "fwd_2q", 0
+        print("[warn] eval_mode='predictive' needs `future_2q_ret`; falling back to 'lagged'")
+        return "fwd_1q", 1
+    raise ValueError(f"unknown eval_mode: {m!r}")
+
+
 def evaluate(preds: pd.DataFrame, cfg: Config):
     """Predictability + portfolio sorts (Tables X / XI / XII). Returns
-    (metrics dict, {table_name: DataFrame})."""
+    (metrics dict, {table_name: DataFrame}). Timing is set by cfg.eval_mode."""
     P = preds.copy()
     P["yq"] = P["yq"].astype("period[Q]")
+    has = {c: (P[c].notna().any() if c in P.columns else np.nan) for c in ("fwd_1q", "fwd_2q")}
+    ret_col, lag = _resolve_eval(cfg, has)
+    P["_ret"] = P[ret_col]
     feas = P[P["feasible"]]
     m = {}
     m["lstm_precision_pooled"] = float((feas.y_pred == feas.Y).mean())
@@ -480,6 +539,7 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["lstm_precision_fundavg"] = float(fp["lstm"].mean())
     m["naive_precision_fundavg"] = float(fp["naive"].mean())
     m["n_predictions"] = int(len(P)); m["n_feasible"] = int(len(feas)); m["n_funds"] = int(feas.fund.nunique())
+    m["eval_mode"] = cfg.eval_mode; m["eval_return"] = ret_col; m["eval_sort_lag"] = lag
 
     def xsq(s):
         v = s.dropna()
@@ -487,14 +547,14 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
             return pd.Series(np.nan, index=s.index)
         return (pd.qcut(v.rank(method="first"), 5, labels=False, duplicates="drop") + 1).reindex(s.index)
 
-    # ---- fund-level: predictability + benchmark-adjusted next-qtr return ----
-    P["wc"] = P["weight"] * P["fwd_qret"]
-    fq = P.groupby(["fund", "yq"]).apply(lambda d: pd.Series({
+    # ---- fund-level: predictability + benchmark-adjusted future return ----
+    P["wc"] = P["weight"] * P["_ret"]
+    fq = P.groupby(["fund", "yq"], observed=True).apply(lambda d: pd.Series({
         "fund_ret": d.wc.sum() / d.weight.sum() if d.weight.sum() > 0 else np.nan,
         "prec": (d.loc[d.feasible, "y_pred"] == d.loc[d.feasible, "Y"]).mean()})).reset_index()
     fq["abn"] = fq["fund_ret"] - fq.groupby("yq")["fund_ret"].transform("mean")   # vs universe mean
     fq = fq.sort_values(["fund", "yq"])
-    fq["prec_lag"] = fq.groupby("fund")["prec"].shift(1)
+    fq["prec_lag"] = fq.groupby("fund", observed=True)["prec"].shift(lag)
     for h in range(1, 5):
         fq[f"cabn{h}"] = fq.groupby("fund")["abn"].rolling(h).sum().shift(-(h - 1)).reset_index(0, drop=True)
     fq["Q"] = fq.groupby("yq")["prec_lag"].transform(xsq)
@@ -514,10 +574,15 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["tableX_Q5mQ1_4q"] = float(tableX.iloc[-1]["cum_abn_4q"]); m["tableX_Q5mQ1_4q_t"] = float(tableX.iloc[-1]["t_4q"])
 
     # ---- Table XI: correct vs incorrect positions ----
-    P["correct"] = (P.y_pred == P.Y).astype(int)
-    ci = P.dropna(subset=["fwd_qret"])
-    corr = ci[ci.correct == 1].groupby("yq")["fwd_qret"].mean()
-    inco = ci[ci.correct == 0].groupby("yq")["fwd_qret"].mean()
+    # TIMING handled by eval_mode: in "predictive" the return (_ret = t+1->t+2) already
+    # starts AFTER correct(t) is revealed, so lag=0. In "lagged" we shift correct by 1.
+    P = P.sort_values(["fund", "security", "yq"])
+    P["correct"] = (P.y_pred == P.Y).astype(float)
+    P["correct_s"] = P.groupby(["fund", "security"], observed=True)["correct"].shift(lag) \
+        if lag else P["correct"]
+    ci = P.dropna(subset=["_ret", "correct_s"])
+    corr = ci[ci.correct_s == 1].groupby("yq")["_ret"].mean()
+    inco = ci[ci.correct_s == 0].groupby("yq")["_ret"].mean()
     diff = (corr - inco).dropna()
     tableXI = pd.DataFrame({"portfolio": ["Correct", "Incorrect", "Correct-Incorrect"],
                             "mean_qret": [corr.mean(), inco.mean(), diff.mean()],
@@ -525,9 +590,13 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["correct_minus_incorrect"] = float(diff.mean()); m["correct_minus_incorrect_t"] = float(_t(diff))
 
     # ---- Table XII: stock quintiles on cross-fund prediction accuracy ----
-    stk = P.groupby(["security", "yq"]).agg(acc=("correct", "mean"), fwd=("fwd_qret", "first")).reset_index()
-    stk = stk.dropna(subset=["acc", "fwd"])
-    stk["Q"] = stk.groupby("yq")["acc"].transform(xsq)
+    stk = P.groupby(["security", "yq"], observed=True).agg(
+        acc=("correct", "mean"), fwd=("_ret", "first")).reset_index()
+    stk = stk.sort_values(["security", "yq"])
+    # same timing rule as above, driven by eval_mode
+    stk["acc_s"] = stk.groupby("security", observed=True)["acc"].shift(lag) if lag else stk["acc"]
+    stk = stk.dropna(subset=["acc_s", "fwd"])
+    stk["Q"] = stk.groupby("yq")["acc_s"].transform(xsq)
     stk = stk.dropna(subset=["Q"])
     rowsXII = [{"quintile": f"Q{q}", "mean_qret": stk[stk.Q == q].groupby("yq")["fwd"].mean().mean(),
                 "t": _t(stk[stk.Q == q].groupby("yq")["fwd"].mean())} for q in [1, 2, 3, 4, 5]]
@@ -541,6 +610,55 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     return m, {"tableX": tableX, "tableXI": tableXI, "tableXII": tableXII}
 
 
+def run_rank_sweep(cfg: Config = None, ranks=(10, 25), verbose=True):
+    """Run the FULL pipeline at several rank cutoffs and compare.
+
+    Unlike eval_mode, max_rank changes the panel itself (which positions exist),
+    so every cutoff needs its own training run. Returns (summary DataFrame,
+    {rank: full result dict}).
+
+    Reading it: a tighter cutoff keeps only the manager's largest, highest-conviction
+    positions. The paper argues big positions are traded more dynamically and are
+    therefore HARDER to predict -- so precision should fall as max_rank shrinks.
+    """
+    from dataclasses import replace
+    cfg = cfg or Config()
+    rows, out = [], {}
+    for r in ranks:
+        if verbose:
+            print(f"\n{'='*20} max_rank = {r} {'='*20}")
+        res = run(replace(cfg, max_rank=r, out_dir=f"{cfg.out_dir}_rank{r}"), verbose=verbose)
+        m = res["metrics"]
+        rows.append({"max_rank": r, "n_funds": m["n_funds"], "n_pred": m["n_predictions"],
+                     "LSTM_prec": m["lstm_precision_fundavg"], "naive_prec": m["naive_precision_fundavg"],
+                     "LSTM_minus_naive": m["lstm_precision_fundavg"] - m["naive_precision_fundavg"],
+                     "XII_Q1mQ5": m["tableXII_Q1mQ5"], "XII_t": m["tableXII_Q1mQ5_t"],
+                     "XI_diff": m["correct_minus_incorrect"], "XI_t": m["correct_minus_incorrect_t"]})
+        out[r] = res
+    return pd.DataFrame(rows), out
+
+
+def compare_eval_modes(preds: pd.DataFrame, cfg: Config = None,
+                       modes=("contemporaneous", "lagged", "predictive")):
+    """Re-evaluate the SAME predictions under each timing convention (training is
+    independent of it, so this is nearly free). If the spread only shows up under
+    'contemporaneous', it is same-quarter co-movement -- not predictive alpha."""
+    from dataclasses import replace
+    cfg = cfg or Config()
+    rows = []
+    for md in modes:
+        try:
+            mm, _ = evaluate(preds, replace(cfg, eval_mode=md))
+            rows.append({"eval_mode": md, "return_used": mm["eval_return"], "sort_lag": mm["eval_sort_lag"],
+                         "TableXII_Q1mQ5": mm["tableXII_Q1mQ5"], "XII_t": mm["tableXII_Q1mQ5_t"],
+                         "TableXI_corr_minus_inc": mm["correct_minus_incorrect"],
+                         "XI_t": mm["correct_minus_incorrect_t"],
+                         "TableX_Q5mQ1_4q": mm["tableX_Q5mQ1_4q"], "X_t": mm["tableX_Q5mQ1_4q_t"]})
+        except Exception as e:
+            rows.append({"eval_mode": md, "error": str(e)[:70]})
+    return pd.DataFrame(rows)
+
+
 # ============================================================ ORCHESTRATE
 def run(cfg: Config = None, verbose=True):
     """Full pipeline. Returns dict: panel, predictions, metrics, tables, figures."""
@@ -550,8 +668,9 @@ def run(cfg: Config = None, verbose=True):
     panel = load_and_prepare(cfg)
     if verbose:
         bal = panel.dropna(subset=["Y"])["Y"].value_counts(normalize=True).round(3).to_dict()
+        er = panel.attrs.get("eff_rank")
         print(f"[data] rows={len(panel):,} funds={panel.fund.nunique()} "
-              f"quarters={panel.qi.nunique()} class_balance={bal}")
+              f"quarters={panel.qi.nunique()} max_rank={er} class_balance={bal}")
     preds = run_model(panel, cfg, verbose=verbose)
     metrics, tables = evaluate(preds, cfg)
     figs = _figures(metrics, cfg)
@@ -562,7 +681,8 @@ def run(cfg: Config = None, verbose=True):
               f"fund-avg {clean['lstm_precision_fundavg']:.3f}   (paper 0.71)")
         print(f"  Naive precision: pooled {clean['naive_precision_pooled']:.3f} | "
               f"fund-avg {clean['naive_precision_fundavg']:.3f}   (paper 0.52)")
-        print(f"\n  Table XII Q1-Q5 = {clean['tableXII_Q1mQ5']*100:+.2f}%/qtr "
+        print(f"\n  [eval_mode={clean['eval_mode']} | return={clean['eval_return']} | sort_lag={clean['eval_sort_lag']}]")
+        print(f"  Table XII Q1-Q5 = {clean['tableXII_Q1mQ5']*100:+.2f}%/qtr "
               f"(t={clean['tableXII_Q1mQ5_t']:.2f})   (paper +1.06%, t=5.74)")
         print(f"  Table XI  corr-incorr = {clean['correct_minus_incorrect']*100:+.2f}%/qtr "
               f"(t={clean['correct_minus_incorrect_t']:.2f})   (paper -0.23%, t=-12.4)")
