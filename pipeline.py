@@ -48,19 +48,29 @@ class Config:
         "close": "close", "market_cap": "market_cap", "volume": "volume",
         "isUs": "isUs", "quarterly_ret": "quarterly_ret", "past_1q_ret": "past_1q_ret",
         "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
+        "future_3q_ret": "future_3q_ret", "InvTypeCode": "inv_type",
         "portfolio_value": "portfolio_value",
         "weight": "weight", "rank": "rank", "n_holdings": "n_holdings",
     })
+    # Keep only these InvTypeCode values (e.g. [401]). None = all types.
+    # When more than one type survives, InvTypeCode also becomes the CATEGORY used for
+    # peer activity rates and for benchmark-adjusting fund returns (the paper uses the
+    # Morningstar style category for both).
+    inv_type_codes: tuple = None
     # ---- evaluation timing --------------------------------------------------
-    # accuracy(t) = "did we predict the t->t+1 trade right?" -> only OBSERVABLE at t+1.
-    #   "predictive"      : sort on accuracy(t), return over t+1->t+2  (`future_2q_ret`)
-    #                       -> no overlap, freshest signal.  RECOMMENDED.
-    #   "contemporaneous" : sort on accuracy(t), return over t->t+1    (`future_1q_ret`)
-    #                       -> sort variable overlaps its own return window (look-ahead).
-    #                          Keep only as the biased benchmark for comparison.
-    #   "lagged"          : sort on accuracy(t-1), return over t->t+1  -> clean but staler.
-    # Training is independent of this -> use compare_eval_modes() to get all three
-    # from a SINGLE training run.
+    # accuracy(t) = "did we predict the t->t+1 trade right?" -> needs shares[t+1], so it
+    # is OBSERVABLE at t+1, and only PUBLIC ~45-60 days later (filing delay), i.e. partway
+    # through t+2.
+    #   "tradeable"       : accuracy(t), return over t+2->t+3 (`future_3q_ret`)
+    #                       -> also clears the filing delay. STRICTEST / truly tradeable.
+    #   "predictive"      : accuracy(t), return over t+1->t+2 (`future_2q_ret`)
+    #                       -> no window overlap, but ignores the filing delay. DEFAULT.
+    #   "contemporaneous" : accuracy(t), return over t->t+1   (`future_1q_ret`)
+    #                       -> sort variable OVERLAPS its own return window (look-ahead).
+    #                          Biased; keep only as the comparison benchmark.
+    #   "lagged"          : accuracy(t-1), return over t->t+1 -> clean but staler.
+    # Training is independent of this -> compare_eval_modes() gives all four from a
+    # SINGLE training run.
     eval_mode: str = "predictive"
     # ---- sample filters (paper Sec 3.1) ----
     us_only: bool = True
@@ -118,7 +128,8 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     # (a) READ ONLY the raw columns we actually use (huge saving on a 20M-row file)
     want = ["fund", "date", "security", "shares", "position_value", "market_cap",
             "quarterly_ret", "past_1q_ret", "future_1q_ret", "future_2q_ret",
-            "portfolio_value", "weight", "rank", "n_holdings", "isUs"]
+            "future_3q_ret", "inv_type", "portfolio_value", "weight", "rank",
+            "n_holdings", "isUs"]
     want_raw = [inv[c] for c in want if c in inv]
     try:
         import pyarrow.parquet as _pq
@@ -136,6 +147,14 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     df["yq"] = df["date"].dt.to_period("Q")
     if cfg.us_only and "isUs" in df.columns:
         df = df[df["isUs"].astype(bool)]
+    # InvTypeCode filter (compare as strings so 401 and "401" both work)
+    if cfg.inv_type_codes is not None and "inv_type" in df.columns:
+        codes = {str(c) for c in cfg.inv_type_codes}
+        before = len(df)
+        df = df[df["inv_type"].astype(str).isin(codes)]
+        print(f"[data] InvTypeCode filter {sorted(codes)}: {before:,} -> {len(df):,} rows")
+        if len(df) == 0:
+            raise ValueError(f"no rows for InvTypeCode {sorted(codes)}")
     df = df.sort_values("date").drop_duplicates(["fund", "yq", "security"], keep="last")
     # rank cutoff: honour max_rank if given, else use whatever the file contains
     eff_rank = None
@@ -149,8 +168,8 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     # float32, pd.NA/nullable become np.nan, and no float64 (n_cols, n_rows) block forms.
     F32 = "float32" if cfg.downcast else "float64"
     raw_num = ["shares", "position_value", "market_cap", "quarterly_ret", "past_1q_ret",
-               "future_1q_ret", "future_2q_ret", "portfolio_value", "weight", "rank",
-               "n_holdings"]
+               "future_1q_ret", "future_2q_ret", "future_3q_ret", "portfolio_value",
+               "weight", "rank", "n_holdings"]
     for c in raw_num:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
             else np.array(np.nan, dtype=F32)
@@ -177,7 +196,8 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     # Realised returns -- EVALUATION ONLY, never features. Carry BOTH so all three
     # eval_modes can be produced from one training run.
     df["fwd_1q"] = df["future_1q_ret"]                     # t   -> t+1
-    df["fwd_2q"] = df["future_2q_ret"]                     # t+1 -> t+2  (strictly after acc(t))
+    df["fwd_2q"] = df["future_2q_ret"]                     # t+1 -> t+2  (after acc(t) is known)
+    df["fwd_3q"] = df["future_3q_ret"]                     # t+2 -> t+3  (also after filing delay)
 
     # fund-level filters. min_holdings must be capped at the rank cutoff: with
     # max_rank=10 a fund can never hold more than 10 of its top-10, so an
@@ -192,14 +212,30 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     df = df[nq >= cfg.min_years * 4]
     df.attrs["eff_rank"] = eff_rank
 
-    # peer activity across the universe (lagged one quarter). map() -> no frame copy.
+    # Category Activity Rates (paper App. A): share-increase / -decrease / no-change
+    # rates among PEER managers, lagged one quarter. Grouped WITHIN InvTypeCode when
+    # available -- a market-wide rate is identical for every fund in a quarter and so
+    # carries no cross-sectional information at all.
     lab = df.dropna(subset=["Y"])
-    rate = lab.groupby("yq").agg(
-        peer_buy=("Y", lambda s: (s > 0).mean()),
-        peer_sell=("Y", lambda s: (s < 0).mean()),
-        peer_hold=("Y", lambda s: (s == 0).mean())).sort_index().shift(1)
-    for col in ("peer_buy", "peer_sell", "peer_hold"):
-        df[col] = df["yq"].map(rate[col]).astype(F32)
+    n_cat = df["inv_type"].nunique() if "inv_type" in df.columns else 1
+    use_cat = "inv_type" in df.columns and n_cat > 1
+    aggs = dict(peer_buy=("Y", lambda s: (s > 0).mean()),
+                peer_sell=("Y", lambda s: (s < 0).mean()),
+                peer_hold=("Y", lambda s: (s == 0).mean()))
+    if use_cat:
+        rate = lab.groupby(["inv_type", "yq"], observed=True).agg(**aggs).sort_index()
+        rate = rate.groupby(level=0).shift(1)                  # lag within category
+        key = pd.MultiIndex.from_arrays([df["inv_type"].to_numpy(), df["yq"].to_numpy()])
+        for col in ("peer_buy", "peer_sell", "peer_hold"):
+            df[col] = rate[col].reindex(key).to_numpy(dtype=F32, na_value=np.nan)
+        print(f"[data] peer rates computed within {n_cat} InvTypeCode categories")
+    else:
+        rate = lab.groupby("yq").agg(**aggs).sort_index().shift(1)
+        for col in ("peer_buy", "peer_sell", "peer_hold"):
+            df[col] = df["yq"].map(rate[col]).astype(F32)
+        if "inv_type" in df.columns:
+            print("[data] single InvTypeCode -> peer rates are market-wide "
+                  "(no cross-sectional variation; pass several codes to enable category peers)")
 
     # fund past-quarter return proxy (weight-weighted). reindex-map -> no merge/copy.
     contrib = (df["w_lag1"] * df["quarterly_ret"])
@@ -215,12 +251,14 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
 
     # (c) PRUNE IN PLACE to only what's needed (no big .copy()). Everything already float32.
     feat = [f for f in cfg.features if f in df.columns]
-    keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_1q", "fwd_2q",
-                "weight", "rank"] + feat)
+    keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
+                "inv_type", "weight", "rank"] + feat)
     df.drop(columns=[c for c in df.columns if c not in keep], inplace=True)
     if cfg.downcast:
         df["fund"] = df["fund"].astype("category")
         df["security"] = df["security"].astype("category")
+        if "inv_type" in df.columns:
+            df["inv_type"] = df["inv_type"].astype("category")
     return df
 
 
@@ -252,8 +290,9 @@ def build_sequences(sub: pd.DataFrame, feat_cols: List[str], seq_len: int):
         mask[:, step] = m
     feasible = mask.all(axis=1)
     y = (sub["Y"].values[valid] + 1).astype(np.int64)          # {-1,0,1} -> {0,1,2}
-    meta = sub.loc[valid, ["fund", "security", "yq", "qi", "Y", "fwd_1q", "fwd_2q",
-                           "weight", "rank"]].reset_index(drop=True)
+    mcols = [c for c in ["fund", "security", "yq", "qi", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
+                         "inv_type", "weight", "rank"] if c in sub.columns]
+    meta = sub.loc[valid, mcols].reset_index(drop=True)
     return X, mask, y, feasible, meta
 
 
@@ -515,10 +554,15 @@ def _resolve_eval(cfg, cols):
     if m == "lagged":
         return "fwd_1q", 1
     if m == "predictive":
-        if "fwd_2q" in cols and pd.notna(cols["fwd_2q"]):
+        if cols.get("fwd_2q") is True:
             return "fwd_2q", 0
         print("[warn] eval_mode='predictive' needs `future_2q_ret`; falling back to 'lagged'")
         return "fwd_1q", 1
+    if m == "tradeable":
+        if cols.get("fwd_3q") is True:
+            return "fwd_3q", 0
+        print("[warn] eval_mode='tradeable' needs `future_3q_ret`; falling back to 'predictive'")
+        return ("fwd_2q", 0) if cols.get("fwd_2q") is True else ("fwd_1q", 1)
     raise ValueError(f"unknown eval_mode: {m!r}")
 
 
@@ -527,7 +571,8 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     (metrics dict, {table_name: DataFrame}). Timing is set by cfg.eval_mode."""
     P = preds.copy()
     P["yq"] = P["yq"].astype("period[Q]")
-    has = {c: (P[c].notna().any() if c in P.columns else np.nan) for c in ("fwd_1q", "fwd_2q")}
+    has = {c: bool(P[c].notna().any()) if c in P.columns else False
+           for c in ("fwd_1q", "fwd_2q", "fwd_3q")}
     ret_col, lag = _resolve_eval(cfg, has)
     P["_ret"] = P[ret_col]
     feas = P[P["feasible"]]
@@ -548,11 +593,22 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
         return (pd.qcut(v.rank(method="first"), 5, labels=False, duplicates="drop") + 1).reindex(s.index)
 
     # ---- fund-level: predictability + benchmark-adjusted future return ----
+    # Benchmark = mean of PEER funds in the same InvTypeCode that quarter (the paper
+    # benchmarks against the fund's own Morningstar category). Falls back to the whole
+    # universe if there is only one category.
     P["wc"] = P["weight"] * P["_ret"]
-    fq = P.groupby(["fund", "yq"], observed=True).apply(lambda d: pd.Series({
-        "fund_ret": d.wc.sum() / d.weight.sum() if d.weight.sum() > 0 else np.nan,
-        "prec": (d.loc[d.feasible, "y_pred"] == d.loc[d.feasible, "Y"]).mean()})).reset_index()
-    fq["abn"] = fq["fund_ret"] - fq.groupby("yq")["fund_ret"].transform("mean")   # vs universe mean
+    has_cat = "inv_type" in P.columns and P["inv_type"].nunique() > 1
+
+    def _fq(d):
+        o = {"fund_ret": d.wc.sum() / d.weight.sum() if d.weight.sum() > 0 else np.nan,
+             "prec": (d.loc[d.feasible, "y_pred"] == d.loc[d.feasible, "Y"]).mean()}
+        if has_cat:
+            o["inv_type"] = d["inv_type"].iloc[0]
+        return pd.Series(o)
+    fq = P.groupby(["fund", "yq"], observed=True).apply(_fq).reset_index()
+    bench = ["inv_type", "yq"] if has_cat else ["yq"]
+    m["benchmark"] = "InvTypeCode x quarter" if has_cat else "universe x quarter"
+    fq["abn"] = fq["fund_ret"] - fq.groupby(bench, observed=True)["fund_ret"].transform("mean")
     fq = fq.sort_values(["fund", "yq"])
     fq["prec_lag"] = fq.groupby("fund", observed=True)["prec"].shift(lag)
     for h in range(1, 5):
@@ -639,7 +695,7 @@ def run_rank_sweep(cfg: Config = None, ranks=(10, 25), verbose=True):
 
 
 def compare_eval_modes(preds: pd.DataFrame, cfg: Config = None,
-                       modes=("contemporaneous", "lagged", "predictive")):
+                       modes=("contemporaneous", "lagged", "predictive", "tradeable")):
     """Re-evaluate the SAME predictions under each timing convention (training is
     independent of it, so this is nearly free). If the spread only shows up under
     'contemporaneous', it is same-quarter co-movement -- not predictive alpha."""
