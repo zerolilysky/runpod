@@ -1,131 +1,395 @@
 """
-pipeline_v2.py — the PAPER's literal architecture. DROP-IN replacement for pipeline.py.
-=======================================================================================
-    import pipeline_v2 as P          # instead of: import pipeline as P
-...and every cell of run_replication.ipynb works unchanged: same `Config`, same `run()`,
-same `run_rank_sweep()`, same `compare_eval_modes()`, same outputs / metrics / tables /
-figures.
+pipeline_v2.py — Mimicking Finance replication, the PAPER's architecture.
+=========================================================================
+Fully self-contained end-to-end pipeline: one holdings parquet in, predictability +
+portfolio sorts out. No external pulls, no dependency on any other module.
 
-ONLY the network differs. Data prep (`load_and_prepare`) and evaluation (`evaluate`) are
-imported from pipeline.py rather than duplicated, so a v1-vs-v2 difference is purely
-architectural.
+    import pipeline_v2 as P
+    cfg = P.Config(data_path="...parquet")
+    res = P.run(cfg)
 
-v1 (pipeline.py)                          v2 (this file, paper §3.3)
----------------------------------------   ------------------------------------------
-sample = ONE security's 8-qtr sequence    sample = the WHOLE cross-section, 8 qtrs
-X: [batch, 8, F]                          X: [batch, 8, N*F]     <- N flattened into input
-LSTM(F -> hidden) -> Linear(hidden, 3)    LSTM(N*F -> numcell) -> Linear(numcell, N*3)
-output: [batch, 3]                        output: [batch, N, 3]  <- the paper's (N x 3)
-N = batch dimension                       N = ARCHITECTURE dimension
-weights shared across securities          one weight set per fund-window
-~hundreds of samples per fund-window      ~13 samples per fund-window (!)
+Architecture (paper §3.3) — one LSTM per fund-window over the WHOLE cross-section:
 
-Paper quotes implemented here
------------------------------
-  "Each sample is represented as a three-dimensional tensor of shape (T,N,F) ... the
-   number of outputs is N (equal to the number of distinct security identifiers retained
-   in that window)"
+    X: [batch, T=8, N*F]  ->  LSTM(N*F -> numcell)  ->  Linear(numcell, N*3)
+                          ->  reshape [batch, N, 3] -> softmax
+
+PANEL LAYOUT — top-N AT THE LABEL QUARTER, ALIGNED BY SECURITY IDENTITY
+----------------------------------------------------------------------
+For each label quarter t: take the fund's **top-`max_rank` securities as ranked at t**,
+give each one a column (column 0 = largest at t), then walk the SAME security back through
+t-7 ... t. A quarter where that security was not held is padding (`sh_past = 0`).
+
+    N        = max_rank                    -> fixed width, never blows up with turnover
+    column j = ONE security, tracked over its own 8-quarter history
+    padding  = that security absent in that quarter (or fewer than N holdings)
+
+This satisfies both of the paper's (mutually inconsistent) descriptions where they agree,
+and is forced by the feasibility mask, which only makes sense if a column IS a security:
+
+  §3.1 "one row per quarter and one column slot per rank (id) ... ids 76-100 are empty on
+        purpose - referred to as padding. This gives us a consistent width across time."
+        -> width = max_rank, ordered by rank.  [we order columns by rank AT t]
+  §3.3 "the number of outputs is N (equal to the number of distinct security identifiers
+        retained in that window)"
+        -> columns are security identifiers.   [we track identities, not slots]
+  §3.3 "For a given identifier ... if THE SECURITY lacks CONTINUOUS PRESENCE over the full
+        eight-quarter input horizon (i.e., if any period exhibits sh_past = 0), we ... zero
+        out the sell probability"
+        -> decisive: continuous presence of a *security* is only definable if a column
+           follows one security through time.
+
+(A pure rank-slot reading — column j = whoever is rank j each quarter — would make each
+column a chimera of different stocks and would render "the security lacks continuous
+presence" meaningless, so it is not used.)
+
+Within one sample the N columns are a FIXED set of N securities; across samples (different
+label quarters) the set changes, because each label quarter picks its own top-N.
+
+OTHER PAPER DETAILS IMPLEMENTED
+-------------------------------
   "The output of the recurrent layer is passed through a dense transformation, reshaped,
    and mapped to a probability grid of dimension (N x 3) via a softmax activation."
   "The hidden dimension, denoted numcell, scales with the size of the realized
-   cross-section."
+   cross-section."                              -> numcell = clip(N, 16, numcell_cap)
   time-step mask  : "At any quarter in which ... all securities in the retained output set
                      are padding indicators (sh_past = 0 ...), we mask the entire time step
                      from recurrence."
   feasibility mask: "If the security lacks continuous presence over the full eight-quarter
                      input horizon ... zero out the sell probability p_-1 and renormalize."
   naive baseline  : "the naive classifier predicts the max(frequency) class observed across
-                     all securities and time steps."
+                     all securities and time steps."   -> computed PER FUND per window.
 
-Honest caveats
+NO LOOK-AHEAD
+-------------
+* Target Y_t = sign of the t -> t+1 share change (a label, never a feature).
+* Every feature is observable at quarter t (own past trades via `pdsh`; peer rates lagged).
+* Forward returns are used ONLY for evaluation, and `eval_mode` controls their timing.
+* Rolling windows split chronologically; the scaler is fit on train rows only.
+
+HONEST CAVEATS
 --------------
-1. Heavily over-parameterised. N=25, F=20 -> LSTM input 500 wide, head emits N*3=75
-   (~50k+ params) trained on only ~13 sequences per window (20 train quarters minus the
-   8-quarter lookback). N=100 -> ~840k params on 13 samples. Expect overfitting and
-   likely WEAKER results than v1. That is a property of the paper's design, not a bug.
-   Use `max_stock` to cap N.
-2. PyTorch's nn.LSTM has no true *recurrent* dropout (its `dropout` arg only applies
-   between stacked layers), so "dropout and recurrent dropout, each 0.25" is approximated
-   with input + output dropout.
-3. `model_mode="global"` is not applicable here (N is fund-specific); it is accepted and
-   ignored with a note, so the notebook's comparison cell still runs.
+1. This design is heavily over-parameterised: N=25,F=20 -> LSTM input 500 wide, head emits
+   N*3=75 (~50k params) trained on only ~13 sequences per window (20 train quarters minus
+   the 8-quarter lookback). Expect overfitting. Two levers: lower `max_rank` (N is the
+   template width), or use `model_mode="global"`, which pools every fund's samples into
+   one model per window (~13 x #funds samples) — only possible because N is fixed at
+   max_rank, so all funds share the same (N*F) -> (N*3) shape.
+2. torch's nn.LSTM has no true *recurrent* dropout (its `dropout` arg only applies between
+   stacked layers), so "dropout and recurrent dropout, each 0.25" is approximated with
+   input + output dropout.
 """
 from __future__ import annotations
-import os, json
-from dataclasses import dataclass, asdict, replace
+import os, json, warnings
+from dataclasses import dataclass, field, asdict, replace
 from typing import List
 import numpy as np
 import pandas as pd
 
-import pipeline as V1
-# reuse the shared layers verbatim -> identical data prep + identical evaluation
-from pipeline import load_and_prepare, evaluate, compare_eval_modes, build_sequences  # noqa: F401
+warnings.filterwarnings("ignore")
 
 
-# ============================================================ CONFIG (same name & API)
+# ============================================================ CONFIG
 @dataclass
-class Config(V1.Config):
-    """Everything from pipeline.Config, plus the paper-architecture knobs."""
-    # Cap on N (retained security identifiers per fund-window). The paper ties the cap
-    # "dynamically to the realized cross-sectional size in that window"; None = every
-    # distinct security held in the window. Lower it to tame the parameter count.
-    max_stock: int = None
-    numcell_cap: int = 128        # numcell = clip(N, 16, numcell_cap)
-    min_samples: int = 6          # skip a fund-window with fewer sequences than this
-    val_frac: float = 0.2         # last X% of TRAIN sequences (chronological) = validation
+class Config:
+    # ---- data ----
+    data_path: str = ("manager_holdings/master_batches_returnfiltered/"
+                      "panel_holdings_All_Funds_filter_rank.parquet")
+    out_dir: str = "outputs_v2"
+    col_map: dict = field(default_factory=lambda: {
+        "fund": "fund", "date": "date", "security": "security", "shares": "shares",
+        "position_value": "position_value", "market_cap": "market_cap", "isUs": "isUs",
+        "quarterly_ret": "quarterly_ret", "past_1q_ret": "past_1q_ret",
+        "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
+        "future_3q_ret": "future_3q_ret", "InvTypeCode": "inv_type",
+        "portfolio_value": "portfolio_value", "weight": "weight", "rank": "rank",
+        "n_holdings": "n_holdings",
+    })
+    # Keep only these InvTypeCode values (e.g. (401,)). None = all.
+    # With >1 type surviving, InvTypeCode also becomes the CATEGORY for peer activity
+    # rates and for benchmark-adjusting fund returns (the paper's Morningstar category).
+    inv_type_codes: tuple = None
+
+    # ---- evaluation timing --------------------------------------------------
+    # accuracy(t) needs shares[t+1] -> OBSERVABLE at t+1, PUBLIC ~45-60 days later.
+    #   "tradeable"       : accuracy(t), return t+2->t+3 (`future_3q_ret`) - clears filing delay
+    #   "predictive"      : accuracy(t), return t+1->t+2 (`future_2q_ret`) - no overlap. DEFAULT
+    #   "contemporaneous" : accuracy(t), return t->t+1   - OVERLAPS -> biased benchmark only
+    #   "lagged"          : accuracy(t-1), return t->t+1 - clean but staler
+    # Training is independent of this -> compare_eval_modes() gives all four from one run.
+    eval_mode: str = "predictive"
+
+    # ---- sample filters (paper §3.1) ----
+    us_only: bool = True
+    min_years: int = 7          # >7 calendar years of history
+    min_holdings: int = 10      # >=10 securities per quarter (auto-capped at max_rank)
+    max_rank: int = None        # keep rank <= max_rank. None = whatever the file has
+    change_band: float = 0.01   # +-1% dead-band around zero share change
+
+    # ---- rolling design (paper Fig 2) ----
+    window_q: int = 28          # observation window
+    train_q: int = 20           # train quarters within a window
+    test_q: int = 8             # test quarters within a window
+    seq_len: int = 8            # LSTM input sequence length (quarters)
+    step: int = 8               # quarters to advance each window (1 = fully overlapping)
+
+    # ---- model (paper architecture) ----
+    # N is fixed at max_rank, so every fund has the SAME input
+    # (N*F) and output (N*3) shape -> weights can be shared across funds.
+    #   "per_fund" : one LSTM per fund-window (the paper's design; ~13 samples each)
+    #   "global"   : one LSTM per window, pooled over all funds (~13 x #funds samples ->
+    #                far less overfitting, but more memory: all funds' tensors per window)
+    model_mode: str = "per_fund"
+    numcell_cap: int = 128      # numcell = clip(N, 16, numcell_cap)
+    dropout: float = 0.25
+    max_epochs: int = 50        # paper caps at 50
+    patience: int = 50          # paper's early-stopping patience
+    lr: float = 3e-3
+    batch: int = 64             # sequences per step (there are only ~13 per window)
+    min_samples: int = 6        # skip a fund-window with fewer train sequences
+    val_frac: float = 0.2       # last X% of TRAIN sequences (chronological) = validation
+    device: str = "auto"        # "auto" | "cpu" | "cuda"
+    seed: int = 42
+
+    # ---- CPU performance / memory ----
+    n_jobs: int = -1                     # funds in parallel (-1 = all cores). 1 = serial
+    torch_threads: int = 0               # intra-op threads. 0 = auto
+    parallel_backend: str = "threading"  # "threading" (SHARED memory, low RAM) | "serial"
+    downcast: bool = True                # float32 + categoricals -> ~halves panel RAM
+    keep_panel: bool = False             # include the (large) panel in run() output
+    save_outputs: bool = True
+
+    @property
+    def features(self) -> List[str]:
+        return ["weight", "w_lag1", "dw", "rank", "log_posval", "log_pv", "log_mktcap",
+                "quarterly_ret", "past_1q_ret", "pdsh", "pdsh_sign", "pdsh_lag1",
+                "sh_lag1", "sh_lag2", "sh_lag3",
+                "peer_buy", "peer_sell", "peer_hold", "n_holdings", "fund_ret_l1"]
 
 
-ConfigV2 = Config          # alias
+# ============================================================ DATA + FEATURES
+def load_and_prepare(cfg: Config) -> pd.DataFrame:
+    """Load the panel, build the target and all (lagged) features. Memory-lean:
+    reads only needed columns, float32 throughout, prunes in place."""
+    inv = {v: k for k, v in cfg.col_map.items()}
+    want = ["fund", "date", "security", "shares", "position_value", "market_cap",
+            "quarterly_ret", "past_1q_ret", "future_1q_ret", "future_2q_ret",
+            "future_3q_ret", "inv_type", "portfolio_value", "weight", "rank",
+            "n_holdings", "isUs"]
+    want_raw = [inv[c] for c in want if c in inv]
+    try:
+        import pyarrow.parquet as _pq
+        avail = set(_pq.ParquetFile(cfg.data_path).schema.names)
+        use = [c for c in want_raw if c in avail]
+        df = pd.read_parquet(cfg.data_path, columns=use or None)
+    except Exception:
+        df = pd.read_parquet(cfg.data_path)
+    df = df.rename(columns={inv[c]: c for c in cfg.col_map.values() if inv[c] in df.columns})
+    miss = [c for c in ["fund", "date", "security", "shares"] if c not in df.columns]
+    if miss:
+        raise ValueError(f"missing required columns after mapping: {miss}")
+
+    df["date"] = pd.to_datetime(df["date"])
+    df["yq"] = df["date"].dt.to_period("Q")
+    if cfg.us_only and "isUs" in df.columns:
+        df = df[df["isUs"].astype(bool)]
+    if cfg.inv_type_codes is not None and "inv_type" in df.columns:
+        codes = {str(c) for c in cfg.inv_type_codes}
+        before = len(df)
+        df = df[df["inv_type"].astype(str).isin(codes)]
+        print(f"[data] InvTypeCode filter {sorted(codes)}: {before:,} -> {len(df):,} rows")
+        if len(df) == 0:
+            raise ValueError(f"no rows for InvTypeCode {sorted(codes)}")
+    df = df.sort_values("date").drop_duplicates(["fund", "yq", "security"], keep="last")
+    eff_rank = None
+    if "rank" in df.columns:
+        if cfg.max_rank is not None:
+            df = df[df["rank"] <= cfg.max_rank]
+        eff_rank = int(df["rank"].max()) if len(df) else 0
+    df.drop(columns=[c for c in ("date", "isUs") if c in df.columns], inplace=True)
+
+    # float32 up front -> derived features stay float32; pd.NA/nullable -> np.nan
+    F32 = "float32" if cfg.downcast else "float64"
+    raw_num = ["shares", "position_value", "market_cap", "quarterly_ret", "past_1q_ret",
+               "future_1q_ret", "future_2q_ret", "future_3q_ret", "portfolio_value",
+               "weight", "rank", "n_holdings"]
+    for c in raw_num:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
+            else np.array(np.nan, dtype=F32)
+    df = df.sort_values(["fund", "security", "yq"]).reset_index(drop=True)
+    g = df.groupby(["fund", "security"], sort=False)
+
+    for k in (1, 2, 3):
+        df[f"sh_lag{k}"] = g["shares"].shift(k).astype(F32)
+    df["w_lag1"] = g["weight"].shift(1).astype(F32)
+    df["dw"] = (df["weight"] - df["w_lag1"]).astype(F32)
+    # PAST realised share change INTO quarter t (known at t) -- the paper's core signal
+    df["pdsh"] = ((df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)).astype(F32)
+    df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0).astype(F32)
+    df["pdsh_lag1"] = g["pdsh"].shift(1).astype(F32)
+    df["log_posval"] = np.log(df["position_value"].abs() + 1.0).astype(F32)
+    df["log_pv"] = np.log(df["portfolio_value"].abs() + 1.0).astype(F32)
+    df["log_mktcap"] = np.log(df["market_cap"].abs() + 1.0).astype(F32)
+
+    # TARGET: sign of NEXT-quarter fractional share change (+-band). label, not a feature.
+    sh_next = g["shares"].shift(-1)
+    dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
+    df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band],
+                        [-1.0, 1.0], default=0.0).astype(F32)
+    df.loc[dsh.isna(), "Y"] = np.nan
+    # realised returns -- EVALUATION ONLY. Carry all three so every eval_mode works.
+    df["fwd_1q"] = df["future_1q_ret"]                    # t   -> t+1
+    df["fwd_2q"] = df["future_2q_ret"]                    # t+1 -> t+2 (after acc(t) known)
+    df["fwd_3q"] = df["future_3q_ret"]                    # t+2 -> t+3 (after filing delay)
+
+    # fund-level filters (min_holdings capped at the rank cutoff)
+    mh = cfg.min_holdings
+    if eff_rank and mh > eff_rank:
+        print(f"[data] min_holdings {mh} > max rank {eff_rank} -> capped to {eff_rank}")
+        mh = eff_rank
+    cnt = df.groupby(["fund", "yq"])["security"].transform("count")
+    df = df[cnt >= mh]
+    nq = df.groupby("fund")["yq"].transform("nunique")
+    df = df[nq >= cfg.min_years * 4]
+
+    # Category Activity Rates (paper App. A), lagged one quarter, within InvTypeCode.
+    lab = df.dropna(subset=["Y"])
+    n_cat = df["inv_type"].nunique() if "inv_type" in df.columns else 1
+    aggs = dict(peer_buy=("Y", lambda s: (s > 0).mean()),
+                peer_sell=("Y", lambda s: (s < 0).mean()),
+                peer_hold=("Y", lambda s: (s == 0).mean()))
+    if "inv_type" in df.columns and n_cat > 1:
+        rate = lab.groupby(["inv_type", "yq"], observed=True).agg(**aggs).sort_index()
+        rate = rate.groupby(level=0).shift(1)                   # lag within category
+        key = pd.MultiIndex.from_arrays([df["inv_type"].to_numpy(), df["yq"].to_numpy()])
+        for col in ("peer_buy", "peer_sell", "peer_hold"):
+            df[col] = rate[col].reindex(key).to_numpy(dtype=F32, na_value=np.nan)
+        print(f"[data] peer rates computed within {n_cat} InvTypeCode categories")
+    else:
+        rate = lab.groupby("yq").agg(**aggs).sort_index().shift(1)
+        for col in ("peer_buy", "peer_sell", "peer_hold"):
+            df[col] = df["yq"].map(rate[col]).astype(F32)
+        if "inv_type" in df.columns:
+            print("[data] single InvTypeCode -> peer rates are market-wide "
+                  "(no cross-sectional variation; pass several codes for category peers)")
+
+    # fund past-quarter return proxy (reindex-map -> no merge/copy)
+    contrib = (df["w_lag1"] * df["quarterly_ret"])
+    fr = contrib.groupby([df["fund"], df["yq"]]).sum()
+    fr_l1 = fr.groupby(level=0).shift(1)
+    key = pd.MultiIndex.from_arrays([df["fund"].to_numpy(), df["yq"].to_numpy()])
+    df["fund_ret_l1"] = fr_l1.reindex(key).to_numpy(dtype=F32, na_value=np.nan)
+
+    qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
+    df["qi"] = df["yq"].map({q: i for i, q in enumerate(qs)}).astype("int32")
+    df["held"] = np.int8(1)
+
+    feat = [f for f in cfg.features if f in df.columns]
+    keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
+                "inv_type", "weight", "rank"] + feat)
+    df.drop(columns=[c for c in df.columns if c not in keep], inplace=True)
+    if cfg.downcast:
+        df["fund"] = df["fund"].astype("category")
+        df["security"] = df["security"].astype("category")
+        if "inv_type" in df.columns:
+            df["inv_type"] = df["inv_type"].astype("category")
+    df.attrs["eff_rank"] = eff_rank
+    return df
 
 
-# ============================================================ TENSOR BUILDER
+# ============================================================ TENSORS (T, N, F)
 def build_window_tensors(fp: pd.DataFrame, feat: List[str], cfg: Config,
-                         tr_lo: int, te_hi: int):
-    """Build the paper's (T, N, F) samples for ONE fund-window.
+                         tr_lo: int, te_hi: int, n_slots: int):
+    """The paper's (T, N, F) samples for ONE fund-window.
+
+    For each label quarter t: columns = the fund's top-`n_slots` securities AS RANKED AT t
+    (column 0 = largest at t). Each column then follows THAT SAME security back through
+    t-7 ... t; quarters where it was not held are padding (sh_past = 0). Within a sample
+    the N columns are therefore a FIXED set of N securities.
+
     Returns X [S,T,N,F], held_seq [S,T,N], step_mask [S,T], feas [S,N],
-            y [S,N] ({0,1,2}, -1 = ignore), qi_lab [S], secs (len N) — or None.
+            y [S,N] ({0,1,2}, -1 = ignore/empty), qi_lab [S],
+            sec_lab [S,N] (category codes, -1 = empty column), cats — or None.
     """
-    seq = cfg.seq_len
+    seq, N, F = cfg.seq_len, int(n_slots), len(feat)
     qmin, qmax = tr_lo - seq + 1, te_hi - 1
     sub = fp[(fp["qi"] >= qmin) & (fp["qi"] <= qmax)]
+    sub = sub[sub["rank"].notna()]
     if sub.empty:
         return None
-    # retained security set = "distinct security identifiers retained in that window"
-    if cfg.max_stock is not None and sub["security"].nunique() > cfg.max_stock:
-        keep = (sub.groupby("security", observed=True)["weight"].mean()
-                   .sort_values(ascending=False).head(cfg.max_stock).index)
-        sub = sub[sub["security"].isin(keep)]
-    secs = list(pd.unique(sub["security"]))
-    N, F = len(secs), len(feat)
-    if N == 0:
-        return None
     Q = qmax - qmin + 1
-    si = {s: i for i, s in enumerate(secs)}
 
-    G = np.zeros((Q, N, F), dtype=np.float32)
-    held = np.zeros((Q, N), dtype=np.float32)
-    Yg = np.full((Q, N), np.nan, dtype=np.float32)
-    pq = (sub["qi"].to_numpy() - qmin).astype(int)
-    ps = sub["security"].map(si).to_numpy().astype(int)
-    G[pq, ps, :] = sub[feat].to_numpy(dtype="float32", na_value=0.0)
-    held[pq, ps] = 1.0
-    Yg[pq, ps] = sub["Y"].to_numpy(dtype="float32", na_value=np.nan)
+    # ---- dense lookup over every security seen in the window: [Q, M, .] ----
+    s = sub["security"]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        cats, gcodes = s.cat.categories, s.cat.codes.to_numpy()
+    else:
+        cats = pd.Index(pd.unique(s))
+        gcodes = s.map({c: i for i, c in enumerate(cats)}).to_numpy()
+    uniq = pd.unique(gcodes)                       # global codes present in this window
+    loc = {c: i for i, c in enumerate(uniq)}       # global code -> local column in lookup
+    M = len(uniq)
+    lidx = np.array([loc[c] for c in gcodes], dtype=int)
+    q = (sub["qi"].to_numpy() - qmin).astype(int)
 
+    Gall = np.zeros((Q, M, F), dtype=np.float32)
+    Hall = np.zeros((Q, M), dtype=np.float32)
+    Yall = np.full((Q, M), np.nan, dtype=np.float32)
+    # to_numpy(na_value=...) turns pd.NA / nullable columns into plain floats
+    Gall[q, lidx, :] = sub[feat].to_numpy(dtype="float32", na_value=0.0)
+    Hall[q, lidx] = 1.0
+    Yall[q, lidx] = sub["Y"].to_numpy(dtype="float32", na_value=np.nan)
+
+    qi_arr, rk_arr = sub["qi"].to_numpy(), sub["rank"].to_numpy()
     labs = [t for t in range(tr_lo, te_hi) if (t - qmin) >= seq - 1]
-    if not labs:
+    Xs, Hs, Ys, Cs, keep = [], [], [], [], []
+    for t in labs:
+        i = t - qmin
+        m = qi_arr == t
+        if not m.any():
+            continue
+        # this quarter's top-N securities, ordered by rank at t
+        order = np.argsort(rk_arr[m], kind="stable")[:N]
+        cols = lidx[m][order]                      # the FIXED security set for this sample
+        k = len(cols)
+        Xi = np.zeros((seq, N, F), dtype=np.float32)
+        Hi = np.zeros((seq, N), dtype=np.float32)
+        yi = np.full(N, -1, dtype=np.int64)
+        ci = np.full(N, -1, dtype=np.int64)
+        # same securities walked back through the 8-quarter horizon; gaps stay 0 (padding)
+        Xi[:, :k, :] = Gall[i - seq + 1:i + 1, cols, :]
+        Hi[:, :k] = Hall[i - seq + 1:i + 1, cols]
+        yv = Yall[i, cols]
+        ok = ~np.isnan(yv)
+        yi[:k][ok] = (yv[ok] + 1).astype(np.int64)
+        ci[:k] = uniq[cols]
+        Xs.append(Xi); Hs.append(Hi); Ys.append(yi); Cs.append(ci); keep.append(t)
+    if not Xs:
         return None
-    idx = [t - qmin for t in labs]
-    X = np.stack([G[i - seq + 1:i + 1] for i in idx])              # [S,T,N,F]
-    hs = np.stack([held[i - seq + 1:i + 1] for i in idx])          # [S,T,N]
-    step_mask = (hs.sum(axis=2) > 0).astype(np.float32)            # [S,T] all-padding -> 0
-    feas = (hs.min(axis=1) > 0)                                    # [S,N] present all T steps
-    ylab = np.stack([Yg[i] for i in idx])
-    hlab = np.stack([held[i] for i in idx])
-    y = np.where((hlab > 0) & ~np.isnan(ylab), ylab + 1, -1).astype(np.int64)
-    return X, hs, step_mask, feas, y, np.array(labs), secs
+    X = np.stack(Xs)                                   # [S,T,N,F]
+    hs = np.stack(Hs)                                  # [S,T,N]
+    step_mask = (hs.sum(axis=2) > 0).astype(np.float32)  # [S,T] all-padding quarter -> 0
+    feas = (hs.min(axis=1) > 0)                        # [S,N] THIS security held all T steps
+    y = np.stack(Ys)                                   # [S,N]
+    sec_lab = np.stack(Cs)                             # [S,N]
+    return X, hs, step_mask, feas, y, np.array(keep), sec_lab, cats
 
 
 # ============================================================ MODEL
+def _device(cfg):
+    import torch
+    if cfg.device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return cfg.device
+
+
+def _set_threads(n):
+    import torch
+    try:
+        torch.set_num_threads(max(1, int(n)))
+    except Exception:
+        pass
+
+
 def _make_panel_lstm(N, F, numcell, dropout):
     import torch.nn as nn
 
@@ -147,8 +411,10 @@ def _make_panel_lstm(N, F, numcell, dropout):
     return PanelLSTM()
 
 
-def _train_predict_v2(X, hs, step_mask, feas, y, labs, secs, tr, te, cfg, dev):
-    """Fit one PanelLSTM on the train sequences; return test predictions as rows."""
+def _train_predict(X, hs, step_mask, feas, y, labs, sec_lab, cats, fund_arr, tr, te, cfg, dev):
+    """Fit one PanelLSTM on the train sequences; return test predictions as rows.
+    `fund_arr` [S] labels each sample's fund (one fund in per_fund mode, many in global),
+    so the naive baseline stays PER FUND in both modes and the comparison is like-for-like."""
     import torch
     S, T, N, F = X.shape
     Xtr, htr = X[tr], hs[tr].astype(bool)
@@ -167,7 +433,7 @@ def _train_predict_v2(X, hs, step_mask, feas, y, labs, secs, tr, te, cfg, dev):
 
     Xt = torch.from_numpy(Xf); yt = torch.from_numpy(y); mt = torch.from_numpy(step_mask)
     tr_i = np.where(tr)[0]
-    nval = int(len(tr_i) * cfg.val_frac)                 # chronological split (time series)
+    nval = int(len(tr_i) * cfg.val_frac)                 # chronological (never shuffle)
     use_val = nval >= 1 and len(tr_i) - nval >= 2
     trn_i, val_i = (tr_i[:-nval], tr_i[-nval:]) if use_val else (tr_i, tr_i[:0])
 
@@ -202,105 +468,348 @@ def _train_predict_v2(X, hs, step_mask, feas, y, labs, secs, tr, te, cfg, dev):
     with torch.no_grad():
         P = torch.softmax(model(Xt[te_i].to(dev), mt[te_i].to(dev)), dim=2).cpu().numpy()
 
-    # naive: max(frequency) class across ALL securities and time steps of the train window
-    ytr = y[tr]; ytr = ytr[ytr >= 0]
-    naive = float(np.bincount(ytr, minlength=3).argmax() - 1) if ytr.size else 0.0
+    # naive: PER FUND, max(frequency) class across all securities and time steps of the
+    # fund's training window ("the naive classifier predicts the max(frequency) class
+    # observed across all securities and time steps").
+    naive_map = {}
+    for f in np.unique(fund_arr[tr]):
+        yy = y[tr & (fund_arr == f)]
+        yy = yy[yy >= 0]
+        naive_map[f] = float(np.bincount(yy, minlength=3).argmax() - 1) if yy.size else 0.0
 
     rows = []
     for k, s in enumerate(te_i):
         p = P[k].copy()
-        p[~feas[s], 0] = 0.0                      # feasibility: can't sell what you don't hold
+        p[~feas[s], 0] = 0.0                  # feasibility: can't sell what you don't hold
         p = p / p.sum(1, keepdims=True)
-        valid = np.where(y[s] >= 0)[0]
+        valid = np.where((y[s] >= 0) & (sec_lab[s] >= 0))[0]
         if valid.size == 0:
             continue
         rows.append(pd.DataFrame({
-            "security": [secs[j] for j in valid],
+            "fund": fund_arr[s],
+            "security": cats[sec_lab[s][valid]],      # whoever occupies the slot at t
             "qi": int(labs[s]),
+            "slot": valid + 1,                        # = rank at the label quarter
             "y_pred": p[valid].argmax(1) - 1,
             "p_sell": p[valid, 0], "p_hold": p[valid, 1], "p_buy": p[valid, 2],
             "feasible": feas[s][valid],
-            "y_naive": naive,
+            "y_naive": naive_map.get(fund_arr[s], 0.0),
         }))
     return pd.concat(rows, ignore_index=True) if rows else None
 
 
-# ============================================================ PER-FUND DRIVER
-def _fund_task_v2(fund, fp, feat, cfg, dev="cpu"):
-    V1._set_threads(1)
+# ============================================================ WALK-FORWARD
+def _windows(qi_min, qi_max, cfg):
+    for c in range(qi_min + cfg.window_q, qi_max + 2, cfg.step):
+        yield c - cfg.window_q, c - cfg.test_q, c - cfg.test_q, c   # tr_lo,tr_hi,te_lo,te_hi
+
+
+def _iter_funds(panel):
+    """(fund, sub-frame), LARGEST fund first (longest-job-first -> no idle cores at the tail)."""
+    order = panel["fund"].value_counts().index
+    cat = pd.Categorical(panel["fund"], categories=order, ordered=True)
+    for f, fp in panel.groupby(cat, sort=True, observed=True):
+        yield f, fp
+
+
+def _fund_index_order(panel):
+    """(fund, row-positions), largest first. Only index arrays -> worker threads .take()
+    their fund's rows from the SHARED panel on demand (memory-flat)."""
+    idx = panel.groupby("fund", observed=True).indices
+    for f in sorted(idx, key=lambda k: -len(idx[k])):
+        yield f, idx[f]
+
+
+def _fund_task(fund, fp, feat, cfg, n_slots, dev="cpu"):
+    """All rolling windows for ONE fund. Single-threaded (parallelism is across funds)."""
+    _set_threads(1)
     ql = np.array(sorted(fp["qi"].unique()))
     if len(ql) < cfg.window_q:
         return []
     outs = []
-    for tr_lo, tr_hi, te_lo, te_hi in V1._windows(int(ql[0]), int(ql[-1]), cfg):
-        t = build_window_tensors(fp, feat, cfg, tr_lo, te_hi)
+    for tr_lo, tr_hi, te_lo, te_hi in _windows(int(ql[0]), int(ql[-1]), cfg):
+        t = build_window_tensors(fp, feat, cfg, tr_lo, te_hi, n_slots)
         if t is None:
             continue
-        X, hs, sm, feas, y, labs, secs = t
+        X, hs, sm, feas, y, labs, sec_lab, cats = t
         tr = (labs >= tr_lo) & (labs < tr_hi)
         te = (labs >= te_lo) & (labs < te_hi)
         if tr.sum() < cfg.min_samples or te.sum() == 0:
             continue
-        out = _train_predict_v2(X, hs, sm, feas, y, labs, secs, tr, te, cfg, dev)
+        fund_arr = np.array([fund] * len(labs), dtype=object)
+        out = _train_predict(X, hs, sm, feas, y, labs, sec_lab, cats, fund_arr,
+                             tr, te, cfg, dev)
         if out is not None and len(out):
-            out["fund"] = fund
             outs.append(out)
     return outs
 
 
+def _global_window(panel, feat, cfg, n_slots, tr_lo, tr_hi, te_lo, te_hi, dev):
+    """ONE model per window, pooled across ALL funds. Only possible because N is fixed
+    at max_rank, so every fund shares the same (N*F) -> (N*3) shape."""
+    Xs, hss, sms, fes, ys, lbs, sls, funds = [], [], [], [], [], [], [], []
+    cats = None
+    for f, fp in _iter_funds(panel):
+        ql = fp["qi"].to_numpy()
+        if ql.min() > tr_lo or ql.max() < te_lo:      # fund not alive across this window
+            continue
+        t = build_window_tensors(fp, feat, cfg, tr_lo, te_hi, n_slots)
+        if t is None:
+            continue
+        X, hs, sm, feas, y, labs, sec_lab, c = t
+        cats = c
+        Xs.append(X); hss.append(hs); sms.append(sm); fes.append(feas)
+        ys.append(y); lbs.append(labs); sls.append(sec_lab)
+        funds.append(np.array([f] * len(labs), dtype=object))
+    if not Xs:
+        return None
+    X = np.concatenate(Xs); hs = np.concatenate(hss); sm = np.concatenate(sms)
+    feas = np.concatenate(fes); y = np.concatenate(ys); labs = np.concatenate(lbs)
+    sec_lab = np.concatenate(sls); fund_arr = np.concatenate(funds)
+    tr = (labs >= tr_lo) & (labs < tr_hi)
+    te = (labs >= te_lo) & (labs < te_hi)
+    if tr.sum() < cfg.min_samples or te.sum() == 0:
+        return None
+    return _train_predict(X, hs, sm, feas, y, labs, sec_lab, cats, fund_arr, tr, te, cfg, dev)
+
+
 def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
-    """Walk-forward, one PanelLSTM per fund-window. Same output schema as
-    pipeline.run_model, so pipeline.evaluate() works unchanged."""
+    """Walk-forward. `per_fund` = one PanelLSTM per
+    fund-window (paper); `global` = one PanelLSTM per window pooled across funds
+    (possible because N is fixed at the template width). Returns OOS predictions."""
     import torch
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
-    dev = V1._device(cfg)
+    dev = _device(cfg)
     feat = [f for f in cfg.features if f in panel.columns]
     ncore = os.cpu_count() or 1
     njobs = ncore if cfg.n_jobs in (-1, 0) else cfg.n_jobs
     n_funds = int(panel["fund"].nunique())
-    if cfg.model_mode == "global":
-        print("[model-v2] note: the paper architecture is inherently per fund-window "
-              "(N is fund-specific) -> 'global' not applicable; running per_fund.")
+    n_slots = int(panel.attrs.get("eff_rank") or panel["rank"].max())
     if verbose:
-        print(f"[model-v2] paper (T,N,F)->(N x 3) | device={dev} F={len(feat)} "
-              f"funds={n_funds} cores={ncore}")
+        print(f"[model] paper (T,N,F)->(N x 3) | mode={cfg.model_mode} "
+              f"device={dev} N={n_slots} F={len(feat)} -> LSTM in {n_slots*len(feat)}, "
+              f"out {n_slots*3} | funds={n_funds} cores={ncore}")
 
     preds = []
-    if dev != "cpu" or njobs == 1 or cfg.parallel_backend == "serial":
-        V1._set_threads(cfg.torch_threads or ncore)
-        for i, (f, fp) in enumerate(V1._iter_funds(panel), 1):
-            preds += _fund_task_v2(f, fp, feat, cfg, dev)
+    if cfg.model_mode == "global":
+        _set_threads(cfg.torch_threads or ncore)
+        Nq = int(panel["qi"].max()) + 1
+        wins = list(_windows(0, Nq - 1, cfg))
+        for wi, (tr_lo, tr_hi, te_lo, te_hi) in enumerate(wins, 1):
+            out = _global_window(panel, feat, cfg, n_slots, tr_lo, tr_hi, te_lo, te_hi, dev)
+            if out is not None and len(out):
+                preds.append(out)
+                if verbose:
+                    a = (out.loc[out.feasible, "y_pred"] == out.loc[out.feasible, "Y"]).mean() \
+                        if "Y" in out else float("nan")
+                    print(f"  win {wi}/{len(wins)} test qi[{te_lo},{te_hi}) n={len(out):,}")
+    elif dev != "cpu" or njobs == 1 or cfg.parallel_backend == "serial":
+        _set_threads(cfg.torch_threads or ncore)
+        for i, (f, fp) in enumerate(_iter_funds(panel), 1):
+            preds += _fund_task(f, fp, feat, cfg, n_slots, dev)
             if verbose and i % 50 == 0:
-                print(f"  [v2] {i}/{n_funds} funds")
+                print(f"  {i}/{n_funds} funds")
     else:
+        # SHARED-MEMORY threads: one panel in RAM; torch releases the GIL during compute
         from concurrent.futures import ThreadPoolExecutor
-        V1._set_threads(1)
+        _set_threads(1)
         if verbose:
-            print(f"  [v2] {n_funds} funds on {njobs} THREADS (shared memory, low RAM)")
+            print(f"  {n_funds} funds on {njobs} THREADS (shared memory, low RAM)")
 
         def _wrk(a):
             f, ix = a
-            return _fund_task_v2(f, panel.take(ix), feat, cfg, "cpu")
+            return _fund_task(f, panel.take(ix), feat, cfg, n_slots, "cpu")
         done = 0
         with ThreadPoolExecutor(max_workers=njobs) as ex:
-            for outs in ex.map(_wrk, V1._fund_index_order(panel)):
+            for outs in ex.map(_wrk, _fund_index_order(panel)):
                 preds += outs; done += 1
                 if verbose and done % 100 == 0:
-                    print(f"  [v2] {done}/{n_funds} funds done")
+                    print(f"  {done}/{n_funds} funds done")
     if not preds:
-        raise RuntimeError("v2 produced no predictions -- window too short, or raise max_stock "
-                           "/ lower min_samples")
+        raise RuntimeError("no predictions -- window too short, or lower min_samples")
     out = pd.concat(preds, ignore_index=True)
-    # attach the evaluation columns (Y, returns, weight, rank, inv_type) from the panel
     cols = [c for c in ["fund", "security", "qi", "yq", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
                         "inv_type", "weight", "rank"] if c in panel.columns]
     return out.merge(panel[cols], on=["fund", "security", "qi"], how="left")
 
 
-# ============================================================ ORCHESTRATE (same API)
+# ============================================================ EVALUATION
+def _t(x):
+    x = np.asarray(x, float); x = x[~np.isnan(x)]
+    return x.mean() / (x.std(ddof=1) / np.sqrt(len(x))) if len(x) > 1 and x.std() > 0 else np.nan
+
+
+def _resolve_eval(cfg, cols):
+    """eval_mode -> (return column, extra lag on the sort variable)."""
+    m = cfg.eval_mode
+    if m == "contemporaneous":
+        return "fwd_1q", 0
+    if m == "lagged":
+        return "fwd_1q", 1
+    if m == "predictive":
+        if cols.get("fwd_2q"):
+            return "fwd_2q", 0
+        print("[warn] eval_mode='predictive' needs `future_2q_ret`; falling back to 'lagged'")
+        return "fwd_1q", 1
+    if m == "tradeable":
+        if cols.get("fwd_3q"):
+            return "fwd_3q", 0
+        print("[warn] eval_mode='tradeable' needs `future_3q_ret`; falling back to 'predictive'")
+        return ("fwd_2q", 0) if cols.get("fwd_2q") else ("fwd_1q", 1)
+    raise ValueError(f"unknown eval_mode: {m!r}")
+
+
+def evaluate(preds: pd.DataFrame, cfg: Config):
+    """Predictability + portfolio sorts (Tables X / XI / XII). Timing = cfg.eval_mode."""
+    P = preds.copy()
+    P["yq"] = P["yq"].astype("period[Q]")
+    has = {c: bool(P[c].notna().any()) if c in P.columns else False
+           for c in ("fwd_1q", "fwd_2q", "fwd_3q")}
+    ret_col, lag = _resolve_eval(cfg, has)
+    P["_ret"] = P[ret_col]
+    feas = P[P["feasible"]]
+    m = {}
+    m["lstm_precision_pooled"] = float((feas.y_pred == feas.Y).mean())
+    m["naive_precision_pooled"] = float((feas.y_naive == feas.Y).mean())
+    fp = feas.groupby("fund", observed=True).apply(lambda d: pd.Series({
+        "lstm": (d.y_pred == d.Y).mean(), "naive": (d.y_naive == d.Y).mean()}))
+    m["lstm_precision_fundavg"] = float(fp["lstm"].mean())
+    m["naive_precision_fundavg"] = float(fp["naive"].mean())
+    m["n_predictions"] = int(len(P)); m["n_feasible"] = int(len(feas))
+    m["n_funds"] = int(feas.fund.nunique())
+    m["eval_mode"] = cfg.eval_mode; m["eval_return"] = ret_col; m["eval_sort_lag"] = lag
+
+    def xsq(s):
+        v = s.dropna()
+        if v.nunique() < 5:
+            return pd.Series(np.nan, index=s.index)
+        return (pd.qcut(v.rank(method="first"), 5, labels=False, duplicates="drop") + 1).reindex(s.index)
+
+    # ---- fund-level: predictability + benchmark-adjusted future return ----
+    P["wc"] = P["weight"] * P["_ret"]
+    has_cat = "inv_type" in P.columns and P["inv_type"].nunique() > 1
+
+    def _fq(d):
+        o = {"fund_ret": d.wc.sum() / d.weight.sum() if d.weight.sum() > 0 else np.nan,
+             "prec": (d.loc[d.feasible, "y_pred"] == d.loc[d.feasible, "Y"]).mean()}
+        if has_cat:
+            o["inv_type"] = d["inv_type"].iloc[0]
+        return pd.Series(o)
+    fq = P.groupby(["fund", "yq"], observed=True).apply(_fq).reset_index()
+    bench = ["inv_type", "yq"] if has_cat else ["yq"]
+    m["benchmark"] = "InvTypeCode x quarter" if has_cat else "universe x quarter"
+    fq["abn"] = fq["fund_ret"] - fq.groupby(bench, observed=True)["fund_ret"].transform("mean")
+    fq = fq.sort_values(["fund", "yq"])
+    fq["prec_lag"] = fq.groupby("fund", observed=True)["prec"].shift(lag)
+    for h in range(1, 5):
+        fq[f"cabn{h}"] = fq.groupby("fund")["abn"].rolling(h).sum().shift(-(h - 1)).reset_index(0, drop=True)
+    fq["Q"] = fq.groupby("yq")["prec_lag"].transform(xsq)
+    fqq = fq.dropna(subset=["Q"])
+    rowsX = []
+    for q in [1, 2, 3, 4, 5]:
+        r = {"quintile": f"Q{q}"}
+        for h in range(1, 5):
+            s = fqq[fqq.Q == q].groupby("yq")[f"cabn{h}"].mean()
+            r[f"cum_abn_{h}q"] = s.mean(); r[f"t_{h}q"] = _t(s)
+        rowsX.append(r)
+    r = {"quintile": "Q5-Q1"}
+    for h in range(1, 5):
+        d = (fqq[fqq.Q == 5].groupby("yq")[f"cabn{h}"].mean()
+             - fqq[fqq.Q == 1].groupby("yq")[f"cabn{h}"].mean()).dropna()
+        r[f"cum_abn_{h}q"] = d.mean(); r[f"t_{h}q"] = _t(d)
+    rowsX.append(r)
+    tableX = pd.DataFrame(rowsX)
+    m["tableX_Q5mQ1_4q"] = float(tableX.iloc[-1]["cum_abn_4q"])
+    m["tableX_Q5mQ1_4q_t"] = float(tableX.iloc[-1]["t_4q"])
+
+    # ---- Table XI: correct vs incorrect positions ----
+    # accuracy(t) is only observable at t+1; eval_mode decides whether the return window
+    # already starts after that ("predictive"/"tradeable") or the flag must be lagged.
+    P = P.sort_values(["fund", "security", "yq"])
+    P["correct"] = (P.y_pred == P.Y).astype(float)
+    P["correct_s"] = P.groupby(["fund", "security"], observed=True)["correct"].shift(lag) \
+        if lag else P["correct"]
+    ci = P.dropna(subset=["_ret", "correct_s"])
+    corr = ci[ci.correct_s == 1].groupby("yq")["_ret"].mean()
+    inco = ci[ci.correct_s == 0].groupby("yq")["_ret"].mean()
+    diff = (corr - inco).dropna()
+    tableXI = pd.DataFrame({"portfolio": ["Correct", "Incorrect", "Correct-Incorrect"],
+                            "mean_qret": [corr.mean(), inco.mean(), diff.mean()],
+                            "t": [_t(corr), _t(inco), _t(diff)]})
+    m["correct_minus_incorrect"] = float(diff.mean())
+    m["correct_minus_incorrect_t"] = float(_t(diff))
+
+    # ---- Table XII: stock quintiles on cross-fund prediction accuracy ----
+    stk = P.groupby(["security", "yq"], observed=True).agg(
+        acc=("correct", "mean"), fwd=("_ret", "first")).reset_index()
+    stk = stk.sort_values(["security", "yq"])
+    stk["acc_s"] = stk.groupby("security", observed=True)["acc"].shift(lag) if lag else stk["acc"]
+    stk = stk.dropna(subset=["acc_s", "fwd"])
+    stk["Q"] = stk.groupby("yq")["acc_s"].transform(xsq)
+    stk = stk.dropna(subset=["Q"])
+    rowsXII = [{"quintile": f"Q{q}", "mean_qret": stk[stk.Q == q].groupby("yq")["fwd"].mean().mean(),
+                "t": _t(stk[stk.Q == q].groupby("yq")["fwd"].mean())} for q in [1, 2, 3, 4, 5]]
+    ls = (stk[stk.Q == 1].groupby("yq")["fwd"].mean()
+          - stk[stk.Q == 5].groupby("yq")["fwd"].mean()).dropna()
+    rowsXII.append({"quintile": "Q1-Q5", "mean_qret": ls.mean(), "t": _t(ls)})
+    tableXII = pd.DataFrame(rowsXII)
+    m["tableXII_Q1mQ5"] = float(ls.mean()); m["tableXII_Q1mQ5_t"] = float(_t(ls))
+    m["_ls_cum"] = ls.sort_index().cumsum()
+    m["_fund_prec"] = fp
+    return m, {"tableX": tableX, "tableXI": tableXI, "tableXII": tableXII}
+
+
+def compare_eval_modes(preds: pd.DataFrame, cfg: Config = None,
+                       modes=("contemporaneous", "lagged", "predictive", "tradeable")):
+    """Re-evaluate the SAME predictions under each timing convention (training is
+    independent of it, so this is nearly free). If the spread only shows up under
+    'contemporaneous', it is same-quarter co-movement -- not predictive alpha."""
+    cfg = cfg or Config()
+    rows = []
+    for md in modes:
+        try:
+            mm, _ = evaluate(preds, replace(cfg, eval_mode=md))
+            rows.append({"eval_mode": md, "return_used": mm["eval_return"],
+                         "sort_lag": mm["eval_sort_lag"],
+                         "TableXII_Q1mQ5": mm["tableXII_Q1mQ5"], "XII_t": mm["tableXII_Q1mQ5_t"],
+                         "TableXI_corr_minus_inc": mm["correct_minus_incorrect"],
+                         "XI_t": mm["correct_minus_incorrect_t"],
+                         "TableX_Q5mQ1_4q": mm["tableX_Q5mQ1_4q"], "X_t": mm["tableX_Q5mQ1_4q_t"]})
+        except Exception as e:
+            rows.append({"eval_mode": md, "error": str(e)[:70]})
+    return pd.DataFrame(rows)
+
+
+# ============================================================ FIGURES
+def _figures(metrics, cfg):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    paths = {}
+    if cfg.save_outputs:
+        os.makedirs(cfg.out_dir, exist_ok=True)
+    fp = metrics["_fund_prec"]
+    fig1, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(fp["naive"].dropna(), bins=30, alpha=.5, label=f"Naive ({fp['naive'].mean():.2f})", color="tab:red")
+    ax.hist(fp["lstm"].dropna(), bins=30, alpha=.6, label=f"LSTM ({fp['lstm'].mean():.2f})", color="tab:blue")
+    ax.axvline(.5, ls="--", c="k", lw=1)
+    ax.set_xlabel("per-fund precision"); ax.set_ylabel("# funds")
+    ax.set_title("Fund-level trade-direction predictability (paper architecture)"); ax.legend()
+    fig1.tight_layout()
+    fig2, ax2 = plt.subplots(figsize=(7, 4))
+    metrics["_ls_cum"].plot(ax=ax2)
+    ax2.set_title("Cumulative Q1-Q5 (least - most predictable stocks)")
+    ax2.set_ylabel("cumulative quarterly return"); fig2.tight_layout()
+    if cfg.save_outputs:
+        p1, p2 = f"{cfg.out_dir}/fig_precision_dist.png", f"{cfg.out_dir}/fig_stock_ls.png"
+        fig1.savefig(p1, dpi=130); fig2.savefig(p2, dpi=130)
+        paths = {"precision_dist": p1, "stock_ls": p2}
+    return {"precision_dist": fig1, "stock_ls": fig2, "paths": paths}
+
+
+# ============================================================ ORCHESTRATE
 def run(cfg: Config = None, verbose=True):
-    """Identical contract to pipeline.run() — returns
-    {panel, predictions, metrics, tables, figures, config}."""
+    """Full pipeline. Returns {panel, predictions, metrics, tables, figures, config}."""
     cfg = cfg or Config()
     if cfg.save_outputs:
         os.makedirs(cfg.out_dir, exist_ok=True)
@@ -312,11 +821,11 @@ def run(cfg: Config = None, verbose=True):
               f"class_balance={bal}")
     preds = run_model(panel, cfg, verbose=verbose)
     metrics, tables = evaluate(preds, cfg)
-    figs = V1._figures(metrics, cfg)
+    figs = _figures(metrics, cfg)
     clean = {k: v for k, v in metrics.items() if not k.startswith("_")}
-    clean["architecture"] = "v2_paper_(T,N,F)->(Nx3)"
+    clean["architecture"] = "paper_(T,N,F)->(Nx3)"
     if verbose:
-        print("\n=== PREDICTABILITY (v2 = paper architecture) ===")
+        print("\n=== PREDICTABILITY ===")
         print(f"  LSTM  precision: pooled {clean['lstm_precision_pooled']:.3f} | "
               f"fund-avg {clean['lstm_precision_fundavg']:.3f}   (paper 0.71)")
         print(f"  Naive precision: pooled {clean['naive_precision_pooled']:.3f} | "
@@ -337,7 +846,8 @@ def run(cfg: Config = None, verbose=True):
 
 
 def run_rank_sweep(cfg: Config = None, ranks=(10, 25), verbose=True):
-    """Same API as pipeline.run_rank_sweep, but trains the v2 architecture."""
+    """Run the FULL pipeline at several rank cutoffs. max_rank changes the panel itself,
+    so every cutoff needs its own training run."""
     cfg = cfg or Config()
     rows, out = [], {}
     for r in ranks:
@@ -352,26 +862,6 @@ def run_rank_sweep(cfg: Config = None, ranks=(10, 25), verbose=True):
                      "XI_diff": m["correct_minus_incorrect"], "XI_t": m["correct_minus_incorrect_t"]})
         out[r] = res
     return pd.DataFrame(rows), out
-
-
-def compare_v1_v2(cfg: Config = None, verbose=True):
-    """Train BOTH architectures on the same panel + same evaluation -> any difference is
-    purely architectural."""
-    cfg = cfg or Config()
-    r2 = run(cfg, verbose=verbose)
-    cfg_v1 = V1.Config(**{k: v for k, v in asdict(cfg).items()
-                          if k in V1.Config.__dataclass_fields__})
-    r1 = V1.run(cfg_v1, verbose=verbose)
-    rows = []
-    for nm, r in (("v1 (shared weights, per security)", r1),
-                  ("v2 (paper, (T,N,F)->(Nx3))", r2)):
-        m = r["metrics"]
-        rows.append({"architecture": nm, "n_pred": m["n_predictions"], "n_funds": m["n_funds"],
-                     "LSTM_prec": m["lstm_precision_fundavg"],
-                     "naive_prec": m["naive_precision_fundavg"],
-                     "LSTM_minus_naive": m["lstm_precision_fundavg"] - m["naive_precision_fundavg"],
-                     "XII_Q1mQ5": m["tableXII_Q1mQ5"], "XII_t": m["tableXII_Q1mQ5_t"]})
-    return pd.DataFrame(rows), {"v1": r1, "v2": r2}
 
 
 if __name__ == "__main__":
