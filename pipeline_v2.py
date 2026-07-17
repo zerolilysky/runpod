@@ -50,7 +50,7 @@ OTHER PAPER DETAILS IMPLEMENTED
   "The output of the recurrent layer is passed through a dense transformation, reshaped,
    and mapped to a probability grid of dimension (N x 3) via a softmax activation."
   "The hidden dimension, denoted numcell, scales with the size of the realized
-   cross-section."                              -> numcell = clip(N, 16, numcell_cap)
+   cross-section."                              -> hidden = clip(N, 16, hidden_cap)
   time-step mask  : "At any quarter in which ... all securities in the retained output set
                      are padding indicators (sh_past = 0 ...), we mask the entire time step
                      from recurrence."
@@ -139,7 +139,10 @@ class Config:
     #   "global"   : one LSTM per window, pooled over all funds (~13 x #funds samples ->
     #                far less overfitting, but more memory: all funds' tensors per window)
     model_mode: str = "per_fund"
-    numcell_cap: int = 128      # numcell = clip(N, 16, numcell_cap)
+    # The paper calls this `numcell`: hidden = clip(N, 16, hidden_cap), i.e. it "scales
+    # with the size of the realized cross-section". Same field name as pipeline.py so the
+    # SAME notebook runs against either module.
+    hidden_cap: int = 128
     dropout: float = 0.25
     max_epochs: int = 50        # paper caps at 50
     patience: int = 50          # paper's early-stopping patience
@@ -149,6 +152,17 @@ class Config:
     val_frac: float = 0.2       # last X% of TRAIN sequences (chronological) = validation
     device: str = "auto"        # "auto" | "cpu" | "cuda"
     seed: int = 42
+
+    # ---- accepted for drop-in compatibility with pipeline.py, UNUSED here ----
+    # (kept so the identical notebook/config runs against either module)
+    hidden: int = 64             # v1 only: v2 derives hidden = clip(N, 16, hidden_cap)
+    min_seq_per_fund: int = 120  # v1 only: v2 uses `min_samples` (panel-sequences, ~13/window)
+    min_train_global: int = 2000 # v1 only: same
+    numcell_cap: int = None      # alias for hidden_cap; if set, it wins
+
+    def __post_init__(self):
+        if self.numcell_cap is not None:      # allow the paper's own name
+            self.hidden_cap = self.numcell_cap
 
     # ---- CPU performance / memory ----
     n_jobs: int = -1                     # funds in parallel (-1 = all cores). 1 = serial
@@ -426,7 +440,7 @@ def _train_predict(X, hs, step_mask, feas, y, labs, sec_lab, cats, fund_arr, tr,
     Xz = ((X - mu) / sd).astype(np.float32) * hs[..., None]
     Xf = Xz.reshape(S, T, N * F)
 
-    numcell = int(np.clip(N, 16, cfg.numcell_cap))       # "scales with the cross-section"
+    numcell = int(np.clip(N, 16, cfg.hidden_cap))       # "scales with the cross-section"
     model = _make_panel_lstm(N, F, numcell, cfg.dropout).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     lossf = torch.nn.CrossEntropyLoss(ignore_index=-1)   # -1 = padded / unlabelled slot
