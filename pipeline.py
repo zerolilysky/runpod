@@ -188,11 +188,53 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     df["log_pv"] = np.log(df["portfolio_value"].abs() + 1.0).astype(F32)
     df["log_mktcap"] = np.log(df["market_cap"].abs() + 1.0).astype(F32)
 
+    # calendar quarter index (needed to tell "next row" from "next QUARTER" below)
+    _qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
+    df["qi_tmp"] = df["yq"].map({q: i for i, q in enumerate(_qs)}).astype("int32")
+
     # TARGET: sign of NEXT-quarter fractional share change (+-band). label, not a feature.
+    #
+    # FULL EXITS. `shift(-1)` is NaN when the position is absent next quarter, for two very
+    # different reasons:
+    #   (a) the manager SOLD OUT (or it fell past max_rank) while the fund keeps reporting
+    #       -> shares[t+1] = 0. This is a genuine SELL -- in fact the strongest one.
+    #   (b) the FUND itself stops reporting (end of sample / closure) -> truly unknown.
+    # Dropping both silently deletes the most decisive sell signals and biases the class
+    # balance toward buy/hold. The paper handles this with a monthly forward-filled grid
+    # + padding (sh_past = 0); we recover it directly: if the fund is still present at
+    # t+1, an absent position means zero shares.
+    # `shift(-1)` returns the group's NEXT ROW, which is only t+1 if the position was
+    # actually reported that quarter. Three cases must be told apart:
+    #   (i)   next row IS t+1                      -> normal
+    #   (ii)  next row is t+2 or later (a GAP)     -> the position was absent at t+1
+    #         (sold, or fell past max_rank) and came back later. Using that later row
+    #         computes the label over the WRONG horizon and hides a real exit.
+    #   (iii) no next row at all                   -> exit, or the fund stopped reporting
+    # For (ii) and (iii): if the FUND is still reporting at t+1, an absent position means
+    # zero shares -> a genuine SELL. Only "the fund itself is gone" stays NaN.
+    # ONE RULE: the label needs shares at EXACTLY t+1. If the position is not in the
+    # panel at t+1, drop the row (Y = NaN) -- never guess.
+    #
+    # Why not call it a SELL: with a rank cutoff (e.g. rank <= 25) a position can vanish
+    # simply by falling past the cutoff while the manager sold nothing, and the truncated
+    # data cannot tell that apart from a real exit. Dropping keeps the labels honest.
+    # Cost: genuine full exits (the strongest sells) are not learned. Documented tradeoff.
+    #
+    # NB `shift(-1)` returns the group's NEXT ROW, which is t+2/t+5/... when there is a
+    # gap. Using it would compute the label over the WRONG horizon, so we require
+    # qi_next == qi + 1 explicitly.
     sh_next = g["shares"].shift(-1)
+    qi_next = g["qi_tmp"].shift(-1)
+    has_next = (qi_next == df["qi_tmp"] + 1)
+    sh_next = sh_next.where(has_next, np.nan)
     dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
     df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band], [-1.0, 1.0], default=0.0).astype(F32)
     df.loc[dsh.isna(), "Y"] = np.nan
+    n_drop = int((~has_next).sum())
+    if n_drop:
+        gap = int(((~has_next) & qi_next.notna()).sum())
+        print(f"[data] no position at t+1 -> label dropped: {n_drop:,} rows "
+              f"({n_drop/len(df)*100:.1f}%; {gap:,} of them reappear at t+2 or later)")
     # Realised returns -- EVALUATION ONLY, never features. Carry BOTH so all three
     # eval_modes can be produced from one training run.
     df["fwd_1q"] = df["future_1q_ret"]                     # t   -> t+1
@@ -251,6 +293,7 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
 
     # (c) PRUNE IN PLACE to only what's needed (no big .copy()). Everything already float32.
     feat = [f for f in cfg.features if f in df.columns]
+    df.drop(columns=["qi_tmp"], inplace=True, errors="ignore")
     keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
                 "inv_type", "weight", "rank"] + feat)
     df.drop(columns=[c for c in df.columns if c not in keep], inplace=True)
