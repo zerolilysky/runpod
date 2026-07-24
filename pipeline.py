@@ -49,6 +49,7 @@ class Config:
         "isUs": "isUs", "quarterly_ret": "quarterly_ret", "past_1q_ret": "past_1q_ret",
         "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
         "future_3q_ret": "future_3q_ret", "InvTypeCode": "inv_type",
+        "future_1q_shares_change_pct": "chg_pct",   # t -> t+1 % change in shares (target)
         "portfolio_value": "portfolio_value",
         "weight": "weight", "rank": "rank", "n_holdings": "n_holdings",
     })
@@ -82,7 +83,18 @@ class Config:
     # NOTE: changing this changes the panel, so each value needs its own training
     # run -- see run_rank_sweep().
     max_rank: int = None
-    change_band: float = 0.01   # +-1% dead-band around zero share change
+    change_band: float = 0.01   # +-1% dead-band around zero share change (in FRACTION units)
+    # Units of `future_1q_shares_change_pct`: "auto" detects fraction (0.05) vs percent
+    # (5.0) and normalises to a fraction so change_band is always a fraction. Or force
+    # "fraction" / "percent".
+    target_pct_scale: str = "auto"
+    # Feasibility (a security held in ALL seq_len quarters, so "sell" is a feasible action).
+    # ONE switch, applied CONSISTENTLY to every accuracy quantity:
+    #   True  -> _train_predict zeroes the sell prob for infeasible rows, AND precision /
+    #            Table X prec / Table XI / Table XII all restrict to feasible rows.
+    #   False -> no sell-zeroing, and ALL tables use every labelled row.
+    # Never feasible in some tables and not others.
+    feasible_only: bool = False
     # ---- rolling design (paper Fig 2) ----
     window_q: int = 28          # observation window
     train_q: int = 20           # train quarters within a window
@@ -119,6 +131,28 @@ class Config:
                 "peer_buy", "peer_sell", "peer_hold", "n_holdings", "fund_ret_l1"]
 
 
+# ============================================================ helpers
+def _shift_exact(df, keys, col, k, qcol="yq"):
+    """Shift `col` by EXACTLY k quarters within `keys`, using the calendar quarter
+    `qcol`. A plain groupby().shift(k) returns the previous *row*, which after a gap
+    can be 3 or 20 quarters back -- silently leaking a stale value. Rows whose true
+    t-k quarter is missing are set to NaN."""
+    if k == 0:
+        return df[col]
+    g = df.groupby(keys, observed=True)
+    v = g[col].shift(k)
+    q = g[qcol].shift(k)
+    return v.where(q == df[qcol] - k)
+
+
+def _at_prev_quarter(df, keys, series_by_key_q, k=1):
+    """Look up `series_by_key_q` (indexed by keys+quarter) at (keys, yq - k) for every
+    row of df. Exact-quarter, gap-safe -- no row shifting."""
+    arrs = [df[c].to_numpy() for c in keys] + [(df["yq"] - k).to_numpy()]
+    idx = pd.MultiIndex.from_arrays(arrs)
+    return series_by_key_q.reindex(idx).to_numpy()
+
+
 # ============================================================ DATA + FEATURES
 def load_and_prepare(cfg: Config) -> pd.DataFrame:
     """Load the panel, build the target and all (lagged) features. Returns a tidy
@@ -128,7 +162,7 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     # (a) READ ONLY the raw columns we actually use (huge saving on a 20M-row file)
     want = ["fund", "date", "security", "shares", "position_value", "market_cap",
             "quarterly_ret", "past_1q_ret", "future_1q_ret", "future_2q_ret",
-            "future_3q_ret", "inv_type", "portfolio_value", "weight", "rank",
+            "future_3q_ret", "chg_pct", "inv_type", "portfolio_value", "weight", "rank",
             "n_holdings", "isUs"]
     want_raw = [inv[c] for c in want if c in inv]
     try:
@@ -168,73 +202,58 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     # float32, pd.NA/nullable become np.nan, and no float64 (n_cols, n_rows) block forms.
     F32 = "float32" if cfg.downcast else "float64"
     raw_num = ["shares", "position_value", "market_cap", "quarterly_ret", "past_1q_ret",
-               "future_1q_ret", "future_2q_ret", "future_3q_ret", "portfolio_value",
+               "future_1q_ret", "future_2q_ret", "future_3q_ret", "chg_pct", "portfolio_value",
                "weight", "rank", "n_holdings"]
     for c in raw_num:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
             else np.array(np.nan, dtype=F32)
     df = df.sort_values(["fund", "security", "yq"]).reset_index(drop=True)
-    g = df.groupby(["fund", "security"], sort=False)
+    keys = ["fund", "security"]
 
-    # own-position dynamics (lagged; float32). Only lags 1-3 are used as features.
+    # own-position dynamics -- lagged by EXACT quarters (NaN when t-k is missing, so a
+    # gap never leaks a stale value into pdsh / sh_lag).
     for k in (1, 2, 3):
-        df[f"sh_lag{k}"] = g["shares"].shift(k).astype(F32)
-    df["w_lag1"] = g["weight"].shift(1).astype(F32)
+        df[f"sh_lag{k}"] = _shift_exact(df, keys, "shares", k).astype(F32)
+    df["w_lag1"] = _shift_exact(df, keys, "weight", 1).astype(F32)
     df["dw"] = (df["weight"] - df["w_lag1"]).astype(F32)
     df["pdsh"] = ((df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)).astype(F32)
     df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0).astype(F32)
-    df["pdsh_lag1"] = g["pdsh"].shift(1).astype(F32)
+    df["pdsh_lag1"] = _shift_exact(df, keys, "pdsh", 1).astype(F32)
     df["log_posval"] = np.log(df["position_value"].abs() + 1.0).astype(F32)
     df["log_pv"] = np.log(df["portfolio_value"].abs() + 1.0).astype(F32)
     df["log_mktcap"] = np.log(df["market_cap"].abs() + 1.0).astype(F32)
 
-    # calendar quarter index (needed to tell "next row" from "next QUARTER" below)
-    _qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
-    df["qi_tmp"] = df["yq"].map({q: i for i, q in enumerate(_qs)}).astype("int32")
-
-    # TARGET: sign of NEXT-quarter fractional share change (+-band). label, not a feature.
+    # ---------------------------------------------------------------- TARGET
+    # Y = sign of the t -> t+1 fractional share change, with a +-change_band dead-band:
+    # {-1 sell, 0 hold, +1 buy}. A label, never a feature.
     #
-    # FULL EXITS. `shift(-1)` is NaN when the position is absent next quarter, for two very
-    # different reasons:
-    #   (a) the manager SOLD OUT (or it fell past max_rank) while the fund keeps reporting
-    #       -> shares[t+1] = 0. This is a genuine SELL -- in fact the strongest one.
-    #   (b) the FUND itself stops reporting (end of sample / closure) -> truly unknown.
-    # Dropping both silently deletes the most decisive sell signals and biases the class
-    # balance toward buy/hold. The paper handles this with a monthly forward-filled grid
-    # + padding (sh_past = 0); we recover it directly: if the fund is still present at
-    # t+1, an absent position means zero shares.
-    # `shift(-1)` returns the group's NEXT ROW, which is only t+1 if the position was
-    # actually reported that quarter. Three cases must be told apart:
-    #   (i)   next row IS t+1                      -> normal
-    #   (ii)  next row is t+2 or later (a GAP)     -> the position was absent at t+1
-    #         (sold, or fell past max_rank) and came back later. Using that later row
-    #         computes the label over the WRONG horizon and hides a real exit.
-    #   (iii) no next row at all                   -> exit, or the fund stopped reporting
-    # For (ii) and (iii): if the FUND is still reporting at t+1, an absent position means
-    # zero shares -> a genuine SELL. Only "the fund itself is gone" stays NaN.
-    # ONE RULE: the label needs shares at EXACTLY t+1. If the position is not in the
-    # panel at t+1, drop the row (Y = NaN) -- never guess.
-    #
-    # Why not call it a SELL: with a rank cutoff (e.g. rank <= 25) a position can vanish
-    # simply by falling past the cutoff while the manager sold nothing, and the truncated
-    # data cannot tell that apart from a real exit. Dropping keeps the labels honest.
-    # Cost: genuine full exits (the strongest sells) are not learned. Documented tradeoff.
-    #
-    # NB `shift(-1)` returns the group's NEXT ROW, which is t+2/t+5/... when there is a
-    # gap. Using it would compute the label over the WRONG horizon, so we require
-    # qi_next == qi + 1 explicitly.
-    sh_next = g["shares"].shift(-1)
-    qi_next = g["qi_tmp"].shift(-1)
-    has_next = (qi_next == df["qi_tmp"] + 1)
-    sh_next = sh_next.where(has_next, np.nan)
-    dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
-    df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band], [-1.0, 1.0], default=0.0).astype(F32)
+    # Preferred source: the data's own `future_1q_shares_change_pct`. It is already the
+    # t->t+1 change and encodes a FULL EXIT as -100%, so genuine sells (incl. positions
+    # that leave the panel) are captured -- nothing is silently dropped.
+    # Fallback (older files without it): shares[t+1] - shares[t], requiring EXACTLY t+1
+    # (a gap -> the row is dropped, never guessed across the gap).
+    if "chg_pct" in df.columns and df["chg_pct"].notna().any():
+        chg = df["chg_pct"].astype("float64")
+        scale = cfg.target_pct_scale
+        if scale == "auto":
+            med = float(chg[chg.abs() > 1e-9].abs().median())
+            scale = "percent" if (np.isfinite(med) and med > 1.5) else "fraction"
+        if scale == "percent":
+            chg = chg / 100.0                      # -> fraction, so change_band is a fraction
+        print(f"[data] target from future_1q_shares_change_pct (units detected: {scale})")
+        dsh = chg
+    else:
+        sh_next = _shift_exact(df, keys, "shares", -1)     # exact t+1 only
+        dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
+        drop = int((sh_next.isna() & df["shares"].notna()).sum())
+        print(f"[data] no chg_pct column -> target from shares[t+1] (exact t+1); "
+              f"{drop:,} rows dropped (position absent at t+1)")
+    df["Y"] = np.select([dsh <= -cfg.change_band, dsh >= cfg.change_band],
+                        [-1.0, 1.0], default=0.0).astype(F32)
     df.loc[dsh.isna(), "Y"] = np.nan
-    n_drop = int((~has_next).sum())
-    if n_drop:
-        gap = int(((~has_next) & qi_next.notna()).sum())
-        print(f"[data] no position at t+1 -> label dropped: {n_drop:,} rows "
-              f"({n_drop/len(df)*100:.1f}%; {gap:,} of them reappear at t+2 or later)")
+    bal = pd.Series(df["Y"]).value_counts(normalize=True)
+    print(f"[data] class balance  sell {bal.get(-1.0, 0):.3f} | hold {bal.get(0.0, 0):.3f} "
+          f"| buy {bal.get(1.0, 0):.3f}  (labelled {int(df['Y'].notna().sum()):,})")
     # Realised returns -- EVALUATION ONLY, never features. Carry BOTH so all three
     # eval_modes can be produced from one training run.
     df["fwd_1q"] = df["future_1q_ret"]                     # t   -> t+1
@@ -265,26 +284,23 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
                 peer_sell=("Y", lambda s: (s < 0).mean()),
                 peer_hold=("Y", lambda s: (s == 0).mean()))
     if use_cat:
-        rate = lab.groupby(["inv_type", "yq"], observed=True).agg(**aggs).sort_index()
-        rate = rate.groupby(level=0).shift(1)                  # lag within category
-        key = pd.MultiIndex.from_arrays([df["inv_type"].to_numpy(), df["yq"].to_numpy()])
-        for col in ("peer_buy", "peer_sell", "peer_hold"):
-            df[col] = rate[col].reindex(key).to_numpy(dtype=F32, na_value=np.nan)
+        rate = lab.groupby(["inv_type", "yq"], observed=True).agg(**aggs)   # index (inv_type, yq)
+        for col in ("peer_buy", "peer_sell", "peer_hold"):                  # look up (inv_type, yq-1)
+            df[col] = pd.Series(_at_prev_quarter(df, ["inv_type"], rate[col], 1), index=df.index).astype(F32)
         print(f"[data] peer rates computed within {n_cat} InvTypeCode categories")
     else:
-        rate = lab.groupby("yq").agg(**aggs).sort_index().shift(1)
+        rate = lab.groupby("yq").agg(**aggs)                    # index yq (no row-shift)
+        prevq = df["yq"] - 1                                    # exact previous quarter
         for col in ("peer_buy", "peer_sell", "peer_hold"):
-            df[col] = df["yq"].map(rate[col]).astype(F32)
+            df[col] = prevq.map(rate[col]).astype(F32)
         if "inv_type" in df.columns:
             print("[data] single InvTypeCode -> peer rates are market-wide "
                   "(no cross-sectional variation; pass several codes to enable category peers)")
 
-    # fund past-quarter return proxy (weight-weighted). reindex-map -> no merge/copy.
+    # fund past-quarter return proxy (weight-weighted). exact-quarter lookup, no row-shift.
     contrib = (df["w_lag1"] * df["quarterly_ret"])
-    fr = contrib.groupby([df["fund"], df["yq"]]).sum()            # (fund,yq) -> ret
-    fr_l1 = fr.groupby(level=0).shift(1)                          # prior quarter within fund
-    key = pd.MultiIndex.from_arrays([df["fund"].to_numpy(), df["yq"].to_numpy()])
-    df["fund_ret_l1"] = fr_l1.reindex(key).to_numpy(dtype=F32, na_value=np.nan)
+    fr = contrib.groupby([df["fund"], df["yq"]]).sum()          # index (fund, yq)
+    df["fund_ret_l1"] = pd.Series(_at_prev_quarter(df, ["fund"], fr, 1), index=df.index).astype(F32)
 
     # integer quarter index for windowing
     qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
@@ -421,8 +437,9 @@ def _train_predict(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev):
             chunks.append(torch.softmax(model(Xt[bi].to(dev), mt[bi].to(dev)), 1).cpu().numpy())
     P = np.concatenate(chunks) if chunks else np.zeros((0, 3))
     m = meta.iloc[te_i].copy()
-    infeas = ~feas[te_i]
-    P[infeas, 0] = 0.0; P = P / P.sum(1, keepdims=True)
+    if cfg.feasible_only:                       # prohibit "sell" for infeasible securities
+        infeas = ~feas[te_i]
+        P[infeas, 0] = 0.0; P = P / P.sum(1, keepdims=True)
     m["p_sell"], m["p_hold"], m["p_buy"] = P[:, 0], P[:, 1], P[:, 2]
     m["y_pred"] = P.argmax(1) - 1
     m["feasible"] = feas[te_i]
@@ -618,15 +635,19 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
            for c in ("fwd_1q", "fwd_2q", "fwd_3q")}
     ret_col, lag = _resolve_eval(cfg, has)
     P["_ret"] = P[ret_col]
-    feas = P[P["feasible"]]
+    # ONE feasibility switch -> the row set used for EVERY accuracy quantity (precision,
+    # Table X prec, Table XI, Table XII). Never feasible in some tables and not others.
+    E = P[P["feasible"]] if cfg.feasible_only else P
     m = {}
-    m["lstm_precision_pooled"] = float((feas.y_pred == feas.Y).mean())
-    m["naive_precision_pooled"] = float((feas.y_naive == feas.Y).mean())
-    fp = feas.groupby("fund").apply(lambda d: pd.Series({
+    m["lstm_precision_pooled"] = float((E.y_pred == E.Y).mean())
+    m["naive_precision_pooled"] = float((E.y_naive == E.Y).mean())
+    fp = E.groupby("fund", observed=True).apply(lambda d: pd.Series({
         "lstm": (d.y_pred == d.Y).mean(), "naive": (d.y_naive == d.Y).mean()}))
     m["lstm_precision_fundavg"] = float(fp["lstm"].mean())
     m["naive_precision_fundavg"] = float(fp["naive"].mean())
-    m["n_predictions"] = int(len(P)); m["n_feasible"] = int(len(feas)); m["n_funds"] = int(feas.fund.nunique())
+    m["feasible_only"] = cfg.feasible_only
+    m["n_predictions"] = int(len(P)); m["n_used"] = int(len(E))
+    m["n_feasible"] = int(P["feasible"].sum()); m["n_funds"] = int(E.fund.nunique())
     m["eval_mode"] = cfg.eval_mode; m["eval_return"] = ret_col; m["eval_sort_lag"] = lag
 
     def xsq(s):
@@ -634,6 +655,16 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
         if v.nunique() < 5:
             return pd.Series(np.nan, index=s.index)
         return (pd.qcut(v.rank(method="first"), 5, labels=False, duplicates="drop") + 1).reindex(s.index)
+
+    def lag_q(d, keys, col, k):
+        """Lag `col` by EXACTLY k quarters within `keys`. A plain groupby().shift(k)
+        would return the previous *row*, which after gaps can be 3 or 20 quarters back
+        -- silently sorting on a stale signal. Rows without a true t-k are set to NaN."""
+        if k == 0:
+            return d[col]
+        v = d.groupby(keys, observed=True)[col].shift(k)
+        q = d.groupby(keys, observed=True)["yq"].shift(k)
+        return v.where(q == d["yq"] - k, np.nan)
 
     # ---- fund-level: predictability + benchmark-adjusted future return ----
     # Benchmark = mean of PEER funds in the same InvTypeCode that quarter (the paper
@@ -643,8 +674,9 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     has_cat = "inv_type" in P.columns and P["inv_type"].nunique() > 1
 
     def _fq(d):
+        sub = d[d.feasible] if cfg.feasible_only else d       # prec respects the switch
         o = {"fund_ret": d.wc.sum() / d.weight.sum() if d.weight.sum() > 0 else np.nan,
-             "prec": (d.loc[d.feasible, "y_pred"] == d.loc[d.feasible, "Y"]).mean()}
+             "prec": (sub.y_pred == sub.Y).mean()}            # fund_ret uses ALL positions
         if has_cat:
             o["inv_type"] = d["inv_type"].iloc[0]
         return pd.Series(o)
@@ -653,9 +685,17 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["benchmark"] = "InvTypeCode x quarter" if has_cat else "universe x quarter"
     fq["abn"] = fq["fund_ret"] - fq.groupby(bench, observed=True)["fund_ret"].transform("mean")
     fq = fq.sort_values(["fund", "yq"])
-    fq["prec_lag"] = fq.groupby("fund", observed=True)["prec"].shift(lag)
+    fq["prec_lag"] = lag_q(fq, "fund", "prec", lag)
+    # forward cumulative abnormal return over [t, t+h-1], QUARTER-AWARE: NaN if any of
+    # those quarters is missing for the fund (never sum across a gap).
+    abn_lut = fq.set_index(["fund", "yq"])["abn"]
     for h in range(1, 5):
-        fq[f"cabn{h}"] = fq.groupby("fund")["abn"].rolling(h).sum().shift(-(h - 1)).reset_index(0, drop=True)
+        tot = np.zeros(len(fq)); ok = np.ones(len(fq), dtype=bool)
+        for j in range(h):
+            a = _at_prev_quarter(fq, ["fund"], abn_lut, -j)   # abn at t+j
+            miss = pd.isna(a); ok &= ~miss
+            tot = tot + np.where(miss, 0.0, a)
+        fq[f"cabn{h}"] = np.where(ok, tot, np.nan)
     fq["Q"] = fq.groupby("yq")["prec_lag"].transform(xsq)
     rowsX = []
     for q in [1, 2, 3, 4, 5]:
@@ -672,14 +712,13 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     tableX = pd.DataFrame(rowsX)
     m["tableX_Q5mQ1_4q"] = float(tableX.iloc[-1]["cum_abn_4q"]); m["tableX_Q5mQ1_4q_t"] = float(tableX.iloc[-1]["t_4q"])
 
-    # ---- Table XI: correct vs incorrect positions ----
+    # ---- Table XI: correct vs incorrect positions ----  (same E subset as precision)
     # TIMING handled by eval_mode: in "predictive" the return (_ret = t+1->t+2) already
     # starts AFTER correct(t) is revealed, so lag=0. In "lagged" we shift correct by 1.
-    P = P.sort_values(["fund", "security", "yq"])
-    P["correct"] = (P.y_pred == P.Y).astype(float)
-    P["correct_s"] = P.groupby(["fund", "security"], observed=True)["correct"].shift(lag) \
-        if lag else P["correct"]
-    ci = P.dropna(subset=["_ret", "correct_s"])
+    Pe = E.sort_values(["fund", "security", "yq"]).copy()
+    Pe["correct"] = (Pe.y_pred == Pe.Y).astype(float)
+    Pe["correct_s"] = lag_q(Pe, ["fund", "security"], "correct", lag)
+    ci = Pe.dropna(subset=["_ret", "correct_s"])
     corr = ci[ci.correct_s == 1].groupby("yq")["_ret"].mean()
     inco = ci[ci.correct_s == 0].groupby("yq")["_ret"].mean()
     diff = (corr - inco).dropna()
@@ -689,11 +728,11 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["correct_minus_incorrect"] = float(diff.mean()); m["correct_minus_incorrect_t"] = float(_t(diff))
 
     # ---- Table XII: stock quintiles on cross-fund prediction accuracy ----
-    stk = P.groupby(["security", "yq"], observed=True).agg(
+    stk = Pe.groupby(["security", "yq"], observed=True).agg(
         acc=("correct", "mean"), fwd=("_ret", "first")).reset_index()
     stk = stk.sort_values(["security", "yq"])
-    # same timing rule as above, driven by eval_mode
-    stk["acc_s"] = stk.groupby("security", observed=True)["acc"].shift(lag) if lag else stk["acc"]
+    # same timing rule as above, driven by eval_mode (exact-quarter lag)
+    stk["acc_s"] = lag_q(stk, "security", "acc", lag)
     stk = stk.dropna(subset=["acc_s", "fwd"])
     stk["Q"] = stk.groupby("yq")["acc_s"].transform(xsq)
     stk = stk.dropna(subset=["Q"])
