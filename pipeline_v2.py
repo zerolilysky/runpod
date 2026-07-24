@@ -130,6 +130,13 @@ class Config:
     # Table X prec, Table XI, Table XII) and to the sell-zeroing in prediction.
     # False -> no sell-zeroing, all tables use every labelled row. True -> feasible-only everywhere.
     feasible_only: bool = False
+    # "auto"/"chg_pct" = target from future_1q_shares_change_pct if present; "shares" = force
+    # the old shares[t+1]-shares[t] label (exact t+1). Use to A/B the target change.
+    target_source: str = "auto"
+    # Fill for a missing prior quarter in lag features (sh_lag*, w_lag1, pdsh, pdsh_lag1).
+    # "ffill" (default) = forward-fill the last-known level across the gap (a level should
+    # persist, not reset). "zero" = old exact-quarter -> NaN -> 0-spike (distorts; A/B only).
+    lag_fill: str = "ffill"
 
     # ---- rolling design (paper Fig 2) ----
     window_q: int = 28          # observation window
@@ -205,6 +212,15 @@ def _at_prev_quarter(df, keys, series_by_key_q, k=1):
     return series_by_key_q.reindex(pd.MultiIndex.from_arrays(arrs)).to_numpy()
 
 
+def _dense_ffill(agg, keycol, allq):
+    """Reindex an aggregate (keycol + 'yq', observed quarters only) onto the dense
+    keycol x allq grid and forward-fill within keycol, so a (keycol, yq-1) lookup returns
+    the last-observed value <= yq-1 (past info only) instead of NaN -> 0."""
+    keys_u = agg.index.get_level_values(keycol).unique()
+    idx = pd.MultiIndex.from_product([keys_u, allq], names=[keycol, "yq"])
+    return agg.reindex(idx).groupby(level=keycol).ffill()
+
+
 def load_and_prepare(cfg: Config) -> pd.DataFrame:
     """Load the panel, build the target and all (lagged) features. Memory-lean:
     reads only needed columns, float32 throughout, prunes in place."""
@@ -256,15 +272,32 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     df = df.sort_values(["fund", "security", "yq"]).reset_index(drop=True)
     keys = ["fund", "security"]
 
-    # own-position dynamics -- lagged by EXACT quarters (gap never leaks a stale value)
-    for k in (1, 2, 3):
-        df[f"sh_lag{k}"] = _shift_exact(df, keys, "shares", k).astype(F32)
-    df["w_lag1"] = _shift_exact(df, keys, "weight", 1).astype(F32)
-    df["dw"] = (df["weight"] - df["w_lag1"]).astype(F32)
-    # PAST realised share change INTO quarter t (known at t) -- the paper's core signal
-    df["pdsh"] = ((df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)).astype(F32)
-    df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0).astype(F32)
-    df["pdsh_lag1"] = _shift_exact(df, keys, "pdsh", 1).astype(F32)
+    # own-position dynamics. LEVEL features fed as context -> a missing prior quarter must
+    # be FORWARD-FILLED (carry last-known level across the gap), not reset to 0. df is
+    # sorted by (fund, security, yq) with one row per OBSERVED quarter, so
+    # groupby(keys).shift(k) is exactly forward-fill using only past info. This differs
+    # from the TARGET (exact-quarter): a change/label must never be fabricated across a
+    # gap, but a level should persist. A NaN lag at a present quarter would be zero-filled
+    # in build_panel/sequences and read as a real 0 -> a gap fakes a jump from an empty
+    # position, distorting the panel. lag_fill="zero" reproduces that old behaviour (A/B).
+    _ff = getattr(cfg, "lag_fill", "ffill") == "ffill"
+    g = df.groupby(keys, observed=True)
+    if _ff:
+        for k in (1, 2, 3):
+            df[f"sh_lag{k}"] = g["shares"].shift(k).fillna(df["shares"]).astype(F32)
+        df["w_lag1"] = g["weight"].shift(1).fillna(df["weight"]).astype(F32)
+        df["dw"] = (df["weight"] - df["w_lag1"]).astype(F32)
+        df["pdsh"] = ((df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)).astype(F32)
+        df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0).astype(F32)
+        df["pdsh_lag1"] = df.groupby(keys, observed=True)["pdsh"].shift(1).fillna(0.0).astype(F32)
+    else:  # "zero": old exact-quarter -> NaN -> 0-spike (distorted; A/B only)
+        for k in (1, 2, 3):
+            df[f"sh_lag{k}"] = _shift_exact(df, keys, "shares", k).astype(F32)
+        df["w_lag1"] = _shift_exact(df, keys, "weight", 1).astype(F32)
+        df["dw"] = (df["weight"] - df["w_lag1"]).astype(F32)
+        df["pdsh"] = ((df["shares"] - df["sh_lag1"]) / (df["sh_lag1"].abs() + 1.0)).astype(F32)
+        df["pdsh_sign"] = np.sign(df["pdsh"]).fillna(0.0).astype(F32)
+        df["pdsh_lag1"] = _shift_exact(df, keys, "pdsh", 1).astype(F32)
     df["log_posval"] = np.log(df["position_value"].abs() + 1.0).astype(F32)
     df["log_pv"] = np.log(df["portfolio_value"].abs() + 1.0).astype(F32)
     df["log_mktcap"] = np.log(df["market_cap"].abs() + 1.0).astype(F32)
@@ -274,7 +307,9 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     # Preferred: the data's `future_1q_shares_change_pct` (already t->t+1, and a FULL EXIT
     # is -100%, so sells are captured -- nothing silently dropped). Fallback: shares[t+1]
     # requiring EXACTLY t+1 (drop on a gap, never guess).
-    if "chg_pct" in df.columns and df["chg_pct"].notna().any():
+    _use_chg = (getattr(cfg, "target_source", "auto") in ("auto", "chg_pct")
+                and "chg_pct" in df.columns and df["chg_pct"].notna().any())
+    if _use_chg:
         chg = df["chg_pct"].astype("float64")
         scale = cfg.target_pct_scale
         if scale == "auto":
@@ -317,13 +352,19 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     aggs = dict(peer_buy=("Y", lambda s: (s > 0).mean()),
                 peer_sell=("Y", lambda s: (s < 0).mean()),
                 peer_hold=("Y", lambda s: (s == 0).mean()))
+    _ff = getattr(cfg, "lag_fill", "ffill") == "ffill"
+    allq = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
     if "inv_type" in df.columns and n_cat > 1:
         rate = lab.groupby(["inv_type", "yq"], observed=True).agg(**aggs)   # index (inv_type, yq)
+        if _ff:                                                # carry last-known rate across gaps
+            rate = _dense_ffill(rate, "inv_type", allq)
         for col in ("peer_buy", "peer_sell", "peer_hold"):                  # look up (inv_type, yq-1)
             df[col] = pd.Series(_at_prev_quarter(df, ["inv_type"], rate[col], 1), index=df.index).astype(F32)
         print(f"[data] peer rates computed within {n_cat} InvTypeCode categories")
     else:
         rate = lab.groupby("yq").agg(**aggs)                    # index yq (no row-shift)
+        if _ff:
+            rate = rate.reindex(allq).ffill()
         prevq = df["yq"] - 1
         for col in ("peer_buy", "peer_sell", "peer_hold"):
             df[col] = prevq.map(rate[col]).astype(F32)
@@ -331,9 +372,12 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
             print("[data] single InvTypeCode -> peer rates are market-wide "
                   "(no cross-sectional variation; pass several codes for category peers)")
 
-    # fund past-quarter return proxy (exact-quarter lookup, no row-shift)
+    # fund past-quarter return proxy (exact-quarter lookup; forward-filled across a gap)
     contrib = (df["w_lag1"] * df["quarterly_ret"])
     fr = contrib.groupby([df["fund"], df["yq"]]).sum()          # index (fund, yq)
+    fr.index = fr.index.set_names(["fund", "yq"])
+    if _ff:
+        fr = _dense_ffill(fr, "fund", allq)
     df["fund_ret_l1"] = pd.Series(_at_prev_quarter(df, ["fund"], fr, 1), index=df.index).astype(F32)
 
     qs = pd.PeriodIndex(sorted(df["yq"].unique()), freq="Q")
@@ -530,10 +574,12 @@ def _train_predict(X, hs, step_mask, feas, y, labs, sec_lab, cats, fund_arr, tr,
     # fund's training window ("the naive classifier predicts the max(frequency) class
     # observed across all securities and time steps").
     naive_map = {}
+    gy = y[tr]; gy = gy[gy >= 0]                        # global train majority: unbiased fallback
+    gmaj = float(np.bincount(gy, minlength=3).argmax() - 1) if gy.size else 0.0   # (not 0/"hold")
     for f in np.unique(fund_arr[tr]):
         yy = y[tr & (fund_arr == f)]
         yy = yy[yy >= 0]
-        naive_map[f] = float(np.bincount(yy, minlength=3).argmax() - 1) if yy.size else 0.0
+        naive_map[f] = float(np.bincount(yy, minlength=3).argmax() - 1) if yy.size else gmaj
 
     rows = []
     for k, s in enumerate(te_i):
@@ -552,7 +598,7 @@ def _train_predict(X, hs, step_mask, feas, y, labs, sec_lab, cats, fund_arr, tr,
             "y_pred": p[valid].argmax(1) - 1,
             "p_sell": p[valid, 0], "p_hold": p[valid, 1], "p_buy": p[valid, 2],
             "feasible": feas[s][valid],
-            "y_naive": naive_map.get(fund_arr[s], 0.0),
+            "y_naive": naive_map.get(fund_arr[s], gmaj),
         }))
     return pd.concat(rows, ignore_index=True) if rows else None
 
@@ -762,8 +808,10 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
 
     def _fq(d):
         sub = d[d.feasible] if cfg.feasible_only else d       # prec respects the switch
-        o = {"fund_ret": d.wc.sum() / d.weight.sum() if d.weight.sum() > 0 else np.nan,
-             "prec": (sub.y_pred == sub.Y).mean()}            # fund_ret uses ALL positions
+        rm = d["_ret"].notna()                                # weighted mean over AVAILABLE returns:
+        wsum = float(d.loc[rm, "weight"].sum())               # missing-return position out of BOTH
+        o = {"fund_ret": d.loc[rm, "wc"].sum() / wsum if wsum > 0 else np.nan,  # num AND denom (else
+             "prec": (sub.y_pred == sub.Y).mean()}            # it dilutes fund_ret toward 0)
         if has_cat:
             o["inv_type"] = d["inv_type"].iloc[0]
         return pd.Series(o)
@@ -819,7 +867,8 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
 
     # ---- Table XII: stock quintiles on cross-fund prediction accuracy ----
     stk = Pe.groupby(["security", "yq"], observed=True).agg(
-        acc=("correct", "mean"), fwd=("_ret", "first")).reset_index()
+        acc=("correct", "mean"), fwd=("_ret", "mean")).reset_index()   # mean skips per-fund NaN
+
     stk = stk.sort_values(["security", "yq"])
     stk["acc_s"] = lag_q(stk, "security", "acc", lag)
     stk = stk.dropna(subset=["acc_s", "fwd"])
