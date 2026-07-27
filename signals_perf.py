@@ -99,13 +99,27 @@ class Config:
     # Restrict the cross-section to rows where the signal is non-zero. The counts
     # have a large mass at 0, which otherwise dominates the bottom bucket.
     nonzero_only: bool = False
+    # What to do with a security-quarter whose FORWARD return is missing (the
+    # security vanished from the returns file -- typically a delisting).
+    #   "drop" (default) listwise deletion, before the buckets are formed
+    #   "zero"           treat the missing return as 0 (survivorship-neutral in the
+    #                    sense that the name stays in the sort, but it assumes a
+    #                    delisting was a flat outcome, which it rarely is)
+    missing_return: str = "drop"
+    # "significantly over-bought" thresholds for the z-score signal families
+    z_threshold: float = 1.0              # z above this = a conspicuous tilt
+    ts_min_history: int = 4               # quarters of own history before a
+                                          # time-series z is defined
     min_names: int = 20                   # skip a quarter with too few names
     split: str = "2014Q1"                 # discovery < split <= validation
     ann: int = 4                          # quarters per year (annualisation)
     chunksize: int = 5_000_000            # rows per read_csv chunk
 
     signals: tuple = ("n_buy", "n_funds", "frac_buy", "n_buy_resid",
-                      "net_buy", "n_sell")
+                      "net_buy", "n_sell",
+                      # z-score families: intensity of the tilt, not its direction
+                      "frac_zaw_hi", "frac_ts_aw_hi",
+                      "mean_z_aw", "mean_z_ts_aw")
 
     @property
     def panels_dir(self) -> str:
@@ -210,6 +224,44 @@ def _bucket(x: pd.Series, n_bins: int, tie_break: str):
         return None
 
 
+def _zscore_within(x: pd.Series, keys: List[pd.Series]) -> pd.Series:
+    """Cross-sectional z of `x` within each group -- how conspicuous is this
+    position INSIDE the fund's own book this quarter."""
+    g = x.groupby(keys, sort=False)
+    mu, sd = g.transform("mean"), g.transform("std")
+    return (x - mu) / sd.where(sd > 0)
+
+
+def _zscore_vs_own_past(df: pd.DataFrame, value: str, keys: List[str],
+                        min_history: int) -> pd.Series:
+    """z of `value` against the group's OWN STRICTLY PRIOR history.
+
+    Answers "does this quarter look unusual for THIS fund in THIS name", which the
+    cross-sectional z cannot: a fund that always holds 8% of one stock is not
+    over-buying it, it is just concentrated.
+
+    Vectorised with cumulative sums (expanding() would crawl on a 37M-row panel).
+    The current row is removed from its own mean and sd, so there is no look-ahead
+    and no self-inclusion.
+
+    Caveat: "past" means past OBSERVATIONS of this pair, which for a position the
+    fund exited and re-entered can straddle a gap. That is the right notion for a
+    long-run average, unlike a one-quarter lag, which must be a strict join.
+    """
+    d = df.sort_values(keys + ["qi"])
+    v = d[value]
+    g = v.groupby([d[k] for k in keys], sort=False)
+    n_past = g.cumcount()                                  # rows strictly before
+    sum_past = g.cumsum() - v
+    sq_past = (v ** 2).groupby([d[k] for k in keys], sort=False).cumsum() - v ** 2
+    mu = sum_past / n_past.where(n_past > 0)
+    var = (sq_past / n_past.where(n_past > 0) - mu ** 2) * (
+        n_past / (n_past - 1).where(n_past > 1))
+    sd = np.sqrt(var.where(var > 0))
+    z = (v - mu) / sd
+    return z.where(n_past >= min_history).reindex(df.index)
+
+
 def _strict_join(df: pd.DataFrame, keys: List[str], value_cols: List[str],
                  offset: int, suffix_map: Dict[str, str]) -> pd.DataFrame:
     """Attach values from exactly `offset` quarters away via an explicit join.
@@ -238,7 +290,8 @@ def load_panels(cfg: Config) -> pd.DataFrame:
             avail = list(pq.ParquetFile(p).schema.names)
             fund_col = next((c for c in FUND_ID_CANDIDATES if c in avail), None)
             want = [c for c in [fund_col, "day", "security", "InvTypeCode", "isUs",
-                                "ShsHldVal", "MARKET_CAP"] if c and c in avail]
+                                "ShsHldVal", "MARKET_CAP", "SharesHld"]
+                    if c and c in avail]
             df = pd.read_parquet(p, columns=want or None)
         except Exception:
             df = pd.read_parquet(p)
@@ -265,7 +318,10 @@ def load_panels(cfg: Config) -> pd.DataFrame:
 
     df["security"] = _norm_id(df["security"])
     df["fund"] = _norm_id(df["fund"])
-    for c in ("position_value", "market_cap"):
+    if "SharesHld" not in df.columns:
+        df["SharesHld"] = np.nan
+    df = df.rename(columns={"SharesHld": "shares"})
+    for c in ("position_value", "market_cap", "shares"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     df = df[df["position_value"] > 0]
 
@@ -334,7 +390,7 @@ def load_returns(cfg: Config) -> pd.DataFrame:
     print(f"[load] returns: {n_raw:,} raw rows -> {len(r):,} security-quarters "
           f"({r.security.nunique():,} securities, median {r.n_days.median():.0f} "
           f"days/quarter)")
-    return r[["security", "yq", "qi", "quarterly_ret", "future_1q_ret",
+    return r[["security", "yq", "qi", "n_days", "quarterly_ret", "future_1q_ret",
               "future_2q_ret", "future_3q_ret"]]
 
 
@@ -361,11 +417,25 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
     # ---- the (fund, security, quarter) grid to measure changes on ----------
     # The panel only contains HELD positions, so an exit just vanishes. Build the
     # union {held at t} u {held at t-1} per fund and fill absent sides with 0.
-    cur = df[["fund", "security", "qi", "active_weight"]].copy()
+    # Four things a fund's "position" can be measured by. They are NOT equivalent:
+    #   active_weight  w_real - w_ref : tilt vs a cap-weighted version of the book
+    #   weight         w_real         : portfolio weight -- rises when the stock
+    #                                   outperforms even if the fund never traded
+    #   market_weight  w_ref          : the stock's share of the book's total cap.
+    #                                   Identical for every fund holding it, so as a
+    #                                   "buy" rule it is a placebo, included as one
+    #   shares         SharesHld      : the actual position size. The only one
+    #                                   immune to price moves -- but sensitive to
+    #                                   splits if SharesHld is not split-adjusted
+    LEVELS = ["active_weight", "weight", "market_weight", "shares"]
+    df["weight"] = df["w_real"]
+    df["market_weight"] = df["w_ref"]
+    keep = ["fund", "security", "qi"] + LEVELS
+    cur = df[keep].copy()
     cur["held_now"] = True
-    prev = df[["fund", "security", "qi", "active_weight"]].copy()
+    prev = df[keep].copy()
     prev["qi"] += 1                                  # STRICT one-quarter lag
-    prev = prev.rename(columns={"active_weight": "aw_lag1"})
+    prev = prev.rename(columns={c: f"{c}_lag1" for c in LEVELS})
     prev["held_prev"] = True
 
     if cfg.absent_is_zero:
@@ -376,20 +446,32 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
         u = u.merge(fq, on=["fund", "qi"], how="inner")
         u["held_now"] = u["held_now"].fillna(False)
         u["held_prev"] = u["held_prev"].fillna(False)
-        u["active_weight"] = u["active_weight"].fillna(0.0)   # exited  -> 0
-        u["aw_lag1"] = u["aw_lag1"].fillna(0.0)               # initiated -> was 0
+        for c in LEVELS:                       # absent on either side -> 0
+            u[c] = u[c].fillna(0.0)
+            u[f"{c}_lag1"] = u[f"{c}_lag1"].fillna(0.0)
     else:
         u = cur.merge(prev, on=["fund", "security", "qi"], how="left")
         u = u.merge(df[["fund", "qi", "yq"]].drop_duplicates(),
                     on=["fund", "qi"], how="left")
         u["held_prev"] = u["held_prev"].fillna(False)
 
-    u["d_aw"] = u["active_weight"] - u["aw_lag1"]
-    # A fund must still HOLD the name to be buying it. Without this guard, exiting
-    # an UNDERweight position (a < 0 -> 0) shows up as d_aw > 0 and would be
-    # miscounted as a purchase.
-    u["buy"] = (u["d_aw"] > 0) & u["held_now"]
-    u["sell"] = (u["d_aw"] < 0) & u["held_prev"]
+    # one buy/sell flag per definition of "position"
+    SUF = {"active_weight": "aw", "weight": "w", "market_weight": "mw",
+           "shares": "sh"}
+    for c in LEVELS:
+        d = u[c] - u[f"{c}_lag1"]
+        u[f"d_{SUF[c]}"] = d
+        # A fund must still HOLD the name to be buying it. Without this guard,
+        # exiting an UNDERweight position (a < 0 -> 0) shows up as d > 0 and would
+        # be miscounted as a purchase.
+        u[f"buy_{SUF[c]}"] = (d > 0) & u["held_now"]
+        u[f"sell_{SUF[c]}"] = (d < 0) & u["held_prev"]
+    u["d_aw"] = u["d_aw"]                       # the default definition
+    u["buy"] = u["buy_aw"]
+    u["sell"] = u["sell_aw"]
+    # two definitions of "holds it at all"
+    u["hold_w"] = u["held_now"] & (u["weight"] > 0)
+    u["hold_aw"] = u["held_now"] & (u["active_weight"] > 0)
 
     n_exit = int((~u["held_now"] & u["held_prev"]).sum())
     n_init = int((u["held_now"] & ~u["held_prev"]).sum())
@@ -397,15 +479,62 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
           f"({n_init / max(len(u), 1):.1%}) | exits {n_exit:,} "
           f"({n_exit / max(len(u), 1):.1%}) | absent_is_zero={cfg.absent_is_zero}")
 
+    # ---------- z-score families: how CONSPICUOUS is the tilt? ----------------
+    # n_buy/n_funds are headcounts of direction. These instead measure INTENSITY:
+    #   cross-sectional  is this position unusual inside the fund's own book now?
+    #   time-series      is it unusual for this fund in this name vs its own past?
+    h = u[u["held_now"]].copy()
+    k = cfg.z_threshold
+    h["z_aw"] = _zscore_within(h["active_weight"], [h["fund"], h["qi"]])
+    h["z_w"] = _zscore_within(h["weight"], [h["fund"], h["qi"]])
+    h["z_ts_aw"] = _zscore_vs_own_past(h, "active_weight", ["fund", "security"],
+                                       cfg.ts_min_history)
+    h["z_ts_w"] = _zscore_vs_own_past(h, "weight", ["fund", "security"],
+                                      cfg.ts_min_history)
+    for c in ("z_aw", "z_w", "z_ts_aw", "z_ts_w"):
+        h[f"{c}_hi"] = h[c] > k
+
+    zq = h.groupby(["security", "yq"], observed=True).agg(
+        n_holders=("fund", "size"),
+        # share of holders for whom this name is a conspicuous overweight
+        frac_zaw_hi=("z_aw_hi", "mean"),
+        frac_zw_hi=("z_w_hi", "mean"),
+        # share for whom it looks unusually large vs their OWN history in it
+        frac_ts_aw_hi=("z_ts_aw_hi", "mean"),
+        frac_ts_w_hi=("z_ts_w_hi", "mean"),
+        # continuous versions: no threshold, no ties, usually better behaved
+        mean_z_aw=("z_aw", "mean"),
+        mean_z_w=("z_w", "mean"),
+        mean_z_ts_aw=("z_ts_aw", "mean"),
+        mean_z_ts_w=("z_ts_w", "mean"),
+        n_ts_defined=("z_ts_aw", "count"),
+    ).reset_index()
+    print(f"[signal] z-scores: cross-sectional defined on "
+          f"{h['z_aw'].notna().mean():.1%} of held rows, time-series on "
+          f"{h['z_ts_aw'].notna().mean():.1%} (needs >{cfg.ts_min_history}q history)")
+
     sq = u.groupby(["security", "yq"], observed=True).agg(
         n_funds=("held_now", "sum"),       # coverage: funds actually holding at t
         n_active=("fund", "size"),         # held at t OR t-1: the rate denominator
-        n_buy=("buy", "sum"),              # buying
+        n_buy=("buy", "sum"),              # buying  (== n_buy_aw)
         n_sell=("sell", "sum"),            # selling, now including full exits
+        # --- n_buy under each definition of "position" ---
+        n_buy_aw=("buy_aw", "sum"),
+        n_buy_w=("buy_w", "sum"),
+        n_buy_mw=("buy_mw", "sum"),
+        n_buy_sh=("buy_sh", "sum"),
+        # --- n_funds under each definition of "holds it" ---
+        n_funds_w=("hold_w", "sum"),
+        n_funds_aw=("hold_aw", "sum"),
     ).reset_index()
+    for c in ("n_buy_aw", "n_buy_w", "n_buy_mw", "n_buy_sh",
+              "n_funds_w", "n_funds_aw"):
+        sq[c] = sq[c].astype("int64")
     sq["n_funds"] = sq["n_funds"].astype("int64")
     sq["frac_buy"] = sq["n_buy"] / sq["n_active"].where(sq["n_active"] > 0)
     sq["net_buy"] = sq["n_buy"] - sq["n_sell"]
+
+    sq = sq.merge(zq, on=["security", "yq"], how="left")
 
     # market cap comes from the HELD rows (an all-exited name has none that quarter)
     mcap = (df.groupby(["security", "yq"], observed=True)["market_cap"]
@@ -439,7 +568,14 @@ def decile_spread(sq: pd.DataFrame, signal: str, horizon: int,
                   cfg: Config) -> pd.Series:
     """Per-quarter return of (top decile - bottom decile) sorted on `signal`."""
     ret = RET_COL[horizon]
-    d = sq[["yq", "security", signal, ret, "market_cap"]].dropna(subset=[signal, ret])
+    d = sq[["yq", "security", signal, ret, "market_cap"]].dropna(subset=[signal])
+    if cfg.missing_return == "zero":
+        d = d.assign(**{ret: d[ret].fillna(0.0)})
+    elif cfg.missing_return == "drop":
+        d = d.dropna(subset=[ret])
+    else:
+        raise ValueError(f"missing_return must be drop|zero, "
+                         f"got {cfg.missing_return!r}")
     if cfg.nonzero_only:
         d = d[d[signal] != 0]
 
@@ -570,6 +706,12 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
                         n_buckets=int(vc.size), bottom=int(vc.iloc[0]),
                         top=int(vc.iloc[-1]),
                         max_share=float(vc.max() / len(x))))
+    if verbose:
+        try:
+            print_missing_report(sq, cfg, cfg.signals[0])
+        except Exception as e:
+            print(f"[warn] missing_report failed: {type(e).__name__}: {e}")
+
     if bal and verbose:
         bdf = pd.DataFrame(bal)
         print(f"\n=== bucket balance in {last} (tie_break={cfg.tie_break!r}) ===")
@@ -592,6 +734,80 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
                     "ann_return"]].round(4).to_string())
     return Result(stock_q=sq, perf=perf, spreads=spreads, corr=corr)
 
+
+
+def missing_report(sq: pd.DataFrame, cfg: Config = Config(),
+                   signal: str = "n_buy") -> Dict[str, pd.DataFrame]:
+    """How much data does the sort silently throw away, and is it random?
+
+    decile_spread() does `dropna(subset=[signal, ret])`, so any security-quarter
+    without a forward return is dropped listwise, before the buckets are formed. A
+    forward return goes missing when the security has NO row in the returns file
+    that quarter -- i.e. it delisted (acquired, bankrupt, moved).
+
+    That is not random. Delisting returns are extreme, and delisting is likelier
+    for names funds are dumping -- so missingness can correlate with the signal.
+    Simulated with a plausible pattern (27% delisting in the lowest n_buy decile vs
+    3% in the highest, -40% delisting return), dropping them turned a true +6.8%
+    spread into -0.7%: the SIGN FLIPPED.
+
+    Returns three frames:
+      by_column  overall NaN rate per return column
+      by_bucket  NaN rate per signal decile -- if this slopes, the drop is biased
+      partial    quarters built from few trading days (a stub, not a quarter)
+    """
+    rets = [c for c in ("quarterly_ret", "future_1q_ret", "future_2q_ret",
+                        "future_3q_ret") if c in sq.columns]
+    by_column = pd.DataFrame([
+        dict(column=c, n=len(sq), n_missing=int(sq[c].isna().sum()),
+             pct_missing=float(sq[c].isna().mean())) for c in rets])
+
+    rows = []
+    if signal in sq.columns:
+        for c in rets:
+            d = sq[[signal, c, "yq"]].dropna(subset=[signal])
+            b = _bucket(d[signal], cfg.n_bins, cfg.tie_break)
+            if b is None:
+                continue
+            g = d.assign(bucket=b, miss=d[c].isna()).groupby("bucket")["miss"].mean()
+            for k, v in g.items():
+                rows.append(dict(column=c, bucket=int(k), pct_missing=float(v)))
+    by_bucket = (pd.DataFrame(rows).pivot(index="bucket", columns="column",
+                                          values="pct_missing")
+                 if rows else pd.DataFrame())
+
+    partial = pd.DataFrame()
+    if "n_days" in sq.columns:
+        nd = sq["n_days"].dropna()
+        partial = pd.DataFrame([dict(
+            median_days=float(nd.median()),
+            pct_under_20_days=float((nd < 20).mean()),
+            pct_under_40_days=float((nd < 40).mean()),
+            n_quarter_stubs=int((nd < 20).sum()))])
+    return dict(by_column=by_column, by_bucket=by_bucket, partial=partial)
+
+
+def print_missing_report(sq: pd.DataFrame, cfg: Config = Config(),
+                         signal: str = "n_buy") -> None:
+    r = missing_report(sq, cfg, signal)
+    print("\n=== missing returns: what the sort drops ===")
+    print(r["by_column"].round(4).to_string(index=False))
+    if len(r["by_bucket"]):
+        print(f"\nNaN rate by {signal} decile (0 = lowest). A SLOPE here means the "
+              f"drop is not random:")
+        print(r["by_bucket"].round(4).to_string())
+        c = "future_1q_ret"
+        if c in r["by_bucket"].columns:
+            b = r["by_bucket"][c]
+            lo, hi = b.iloc[0], b.iloc[-1]
+            print(f"  bottom decile {lo:.1%} vs top decile {hi:.1%}"
+                  f"  (ratio {lo / max(hi, 1e-9):.1f}x)")
+            if abs(lo - hi) > 0.02:
+                print("  [warn] missingness is correlated with the signal -- the "
+                      "listwise drop is a DELISTING BIAS, not a neutral filter")
+    if len(r["partial"]):
+        print("\nquarters built from partial data (delisting stubs):")
+        print(r["partial"].round(4).to_string(index=False))
 
 
 # ================================================================= ROBUSTNESS
@@ -641,6 +857,88 @@ def sweep(sq: pd.DataFrame, cfg: Config, signals=None, horizons=(1, 2, 3),
             print(f"  [{i}/{len(combos)}] tie_break={tb:7s} size_groups={ng} "
                   f"nonzero_only={nz}", flush=True)
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------- missing-return policy comparison
+def sweep_missing(sq: pd.DataFrame, cfg: Config, signals=None, horizons=(1, 2, 3),
+                  tie_break: str = "average", size_groups: int = 3) -> pd.DataFrame:
+    """Drop the missing forward returns, or call them zero?
+
+    "drop" is listwise deletion of securities that vanished from the returns file
+    -- overwhelmingly delistings. That is the standard silent choice and it is a
+    survivorship filter: delisting is non-random and correlates with the signal.
+    "zero" keeps the name in the sort but asserts the delisting outcome was flat,
+    which is generous to bankruptcies and stingy to takeovers.
+
+    Neither is right. If they DISAGREE, the result depends on dead companies and
+    the honest fix is real delisting returns (CRSP DLRET), not a choice between
+    these two.
+    """
+    from dataclasses import replace
+    signals = list(signals or cfg.signals)
+    split = pd.Period(cfg.split, freq="Q")
+    rows = []
+    for policy in ("drop", "zero"):
+        c = replace(cfg, missing_return=policy, tie_break=tie_break,
+                    size_groups=size_groups, size_neutral=(size_groups > 1))
+        for sig in signals:
+            if sig not in sq.columns:
+                continue
+            for h in horizons:
+                sp = decile_spread(sq, sig, h, c)
+                if len(sp) < 8:
+                    continue
+                for sample in ("discovery", "validation", "all"):
+                    perf = performance(sp[_sample_mask(sp.index, sample, split)],
+                                       h, c)
+                    if perf.get("n_quarters", 0) < 8:
+                        continue
+                    perf.update(signal=sig, horizon=h, sample=sample,
+                                missing_return=policy)
+                    rows.append(perf)
+    res = pd.DataFrame(rows)
+    if len(res):
+        piv = res[res["sample"] == "all"].pivot_table(
+            index=["signal", "horizon"], columns="missing_return", values="t_nw")
+        if {"drop", "zero"}.issubset(piv.columns):
+            piv["delta"] = piv["zero"] - piv["drop"]
+            piv["sign_flip"] = (piv["drop"] * piv["zero"]) < 0
+        res.attrs["summary"] = piv
+    return res
+
+
+# ------------------------------------------- alternative signal definitions
+BUY_DEFS = {
+    "n_buy_aw": "active_weight rose  (default: tilt vs cap-weighted book)",
+    "n_buy_w": "weight rose          (contaminated: rises on price alone)",
+    "n_buy_mw": "market_weight rose   (PLACEBO: identical for all funds)",
+    "n_buy_sh": "shares rose          (the actual trade; split-sensitive)",
+}
+HOLD_DEFS = {
+    "n_funds_w": "weight > 0         (holds it at all)",
+    "n_funds_aw": "active_weight > 0  (OVERweights it vs cap)",
+}
+
+
+def sweep_definitions(sq: pd.DataFrame, cfg: Config, horizons=(1, 2, 3),
+                      tie_break: str = "average", size_groups: int = 3,
+                      which: str = "buy") -> pd.DataFrame:
+    """Same machinery, different definition of 'bought' / 'holds'.
+
+    which='buy'  -> n_buy under active_weight / weight / market_weight / shares
+    which='hold' -> n_funds under weight>0 / active_weight>0
+
+    n_buy_mw is a deliberate placebo: market_weight is a property of the SECURITY,
+    so every fund holding it gets the same flag and the "count of buyers" collapses
+    to a rescaled holder count. If it scores like the others, the signal is not
+    about fund behaviour.
+    """
+    defs = BUY_DEFS if which == "buy" else HOLD_DEFS
+    sigs = [k for k in defs if k in sq.columns]
+    res = sweep_missing(sq, cfg, sigs, horizons, tie_break, size_groups)
+    if len(res):
+        res["definition"] = res["signal"].map(defs)
+    return res
 
 
 def sweep_table(res: pd.DataFrame, signal: str, horizon: int = 1,
