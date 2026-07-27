@@ -87,7 +87,18 @@ class Config:
 
     horizons: tuple = (1, 2, 3)           # t->t+1, t+1->t+2, t+2->t+3
     n_bins: int = 10                      # decile sort
-    size_neutral: bool = True             # sort within market-cap terciles
+    # how to bucket TIED signal values (n_buy/n_funds are integer counts, so ties
+    # are pervasive). "average" never splits a tied group; "first" sorts ties by
+    # row order == security id == listing age, which is a real bias. See _bucket.
+    tie_break: str = "random"
+    # Market-cap neutralisation: sort inside `size_groups` cap groups and average.
+    # 1 = none. n_buy correlates ~0.58 with log cap, and a tercile still spans a
+    # ~60x cap range, so 3 removes only about two thirds of the size leakage.
+    size_groups: int = 3
+    size_neutral: bool = True             # deprecated alias; False -> size_groups=1
+    # Restrict the cross-section to rows where the signal is non-zero. The counts
+    # have a large mass at 0, which otherwise dominates the bottom bucket.
+    nonzero_only: bool = False
     min_names: int = 20                   # skip a quarter with too few names
     split: str = "2014Q1"                 # discovery < split <= validation
     ann: int = 4                          # quarters per year (annualisation)
@@ -158,6 +169,45 @@ def _find_returns(cfg: Config) -> str:
     raise FileNotFoundError(
         f"returns csv not found. looked for {cfg.returns_csv} under {cfg.root} "
         f"and {cfg.panels_dir}")
+
+
+def _bucket(x: pd.Series, n_bins: int, tie_break: str):
+    """Cross-sectional buckets, 0 = lowest. Handles TIED signal values honestly.
+
+    n_buy and n_funds are integer COUNTS, so a large share of the cross-section
+    shares a value. rank(method="first") then splits a tied group by DataFrame row
+    order -- and rows are ordered by security id, which proxies listing age. That
+    silently sorts on firm age inside every tied group; measured on synthetic data
+    with a modest age/return relation it produced a spurious spread of ~6 sd.
+
+      "random"  (default) ties are ordered by a hash of the row's IDENTITY, so
+                buckets are equal-sized and the result is exactly invariant to row
+                order. Ties are split arbitrarily -- but arbitrarily is unbiased,
+                and it keeps every signal on the same 10%/10% footing.
+      "average" tied values share a rank, so a bucket edge can never fall inside a
+                tied group. Never splits a tie, but for a heavily discrete signal
+                the buckets become wildly uneven: on a Poisson(1.5) draw the
+                "bottom decile" swallowed 57% of the cross-section, which is no
+                longer a decile sort and is not comparable across signals.
+      "first"   the old row-order behaviour. Kept only for comparison.
+    """
+    if tie_break == "average":
+        r = x.rank(method="average")
+    elif tie_break == "random":
+        # The jitter must be keyed to the row's IDENTITY, not its position -- a
+        # position-keyed permutation is still a function of row order and keeps the
+        # very bias this is meant to remove.
+        j = pd.Series([hash((3407, v)) % 1_000_003 for v in x.index], index=x.index)
+        o = pd.DataFrame({"x": x, "j": j}).sort_values(["x", "j"]).index
+        r = pd.Series(np.arange(len(o)), index=o).reindex(x.index)
+    elif tie_break == "first":
+        r = x.rank(method="first")
+    else:
+        raise ValueError(f"tie_break must be average|random|first, got {tie_break!r}")
+    try:
+        return pd.qcut(r, n_bins, labels=False, duplicates="drop")
+    except (ValueError, IndexError):
+        return None
 
 
 def _strict_join(df: pd.DataFrame, keys: List[str], value_cols: List[str],
@@ -390,25 +440,29 @@ def decile_spread(sq: pd.DataFrame, signal: str, horizon: int,
     """Per-quarter return of (top decile - bottom decile) sorted on `signal`."""
     ret = RET_COL[horizon]
     d = sq[["yq", "security", signal, ret, "market_cap"]].dropna(subset=[signal, ret])
+    if cfg.nonzero_only:
+        d = d[d[signal] != 0]
 
     def _bin(x: pd.DataFrame) -> float:
         if len(x) < cfg.min_names:
             return np.nan
-        b = pd.qcut(x[signal].rank(method="first"), cfg.n_bins,
-                    labels=False, duplicates="drop")
-        if b.nunique() < 2:
+        b = _bucket(x[signal], cfg.n_bins, cfg.tie_break)
+        if b is None or b.nunique() < 2:
             return np.nan
         return x.loc[b == b.max(), ret].mean() - x.loc[b == b.min(), ret].mean()
 
+    ng = cfg.size_groups if cfg.size_neutral else 1
+
     def _quarter(q: pd.DataFrame) -> float:
-        if not cfg.size_neutral:
+        if ng <= 1:
             return _bin(q)
         q = q.dropna(subset=["market_cap"])
         if len(q) < cfg.min_names:
             return np.nan
-        terc = pd.qcut(q["market_cap"].rank(method="first"), 3,
-                       labels=False, duplicates="drop")
-        vals = [_bin(sub) for _, sub in q.groupby(terc)]
+        grp = _bucket(q["market_cap"], ng, cfg.tie_break)
+        if grp is None:
+            return _bin(q)
+        vals = [_bin(sub) for _, sub in q.groupby(grp)]
         vals = [v for v in vals if np.isfinite(v)]
         return float(np.mean(vals)) if vals else np.nan
 
@@ -468,11 +522,24 @@ def run(cfg: Config = Config(), verbose: bool = True) -> Result:
     panel = load_panels(cfg)
     returns = load_returns(cfg)
     sq = build_stock_quarter(panel, returns, cfg)
+    del panel
+    return evaluate(sq, cfg, verbose=verbose)
 
+
+def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
+             verbose: bool = True) -> Result:
+    """Evaluate an ALREADY-BUILT security-quarter frame.
+
+    Split out from run() so a notebook (or the robustness sweep) can build `sq`
+    once and re-evaluate it under many configurations without re-reading 23
+    parquet files each time.
+    """
     split = pd.Period(cfg.split, freq="Q")
     rows: List[dict] = []
     spreads: Dict[str, pd.Series] = {}
     for sig in cfg.signals:
+        if sig not in sq.columns:
+            continue
         for h in cfg.horizons:
             sp = decile_spread(sq, sig, h, cfg)
             spreads[f"{sig}|h{h}"] = sp
@@ -488,6 +555,30 @@ def run(cfg: Config = Config(), verbose: bool = True) -> Result:
     perf = perf[[c for c in front if c in perf.columns] +
                 [c for c in perf.columns if c not in front]]
 
+    # how tied is each signal? a nearly-degenerate sort is worth seeing.
+    bal = []
+    last = sq["yq"].max()
+    for sig in cfg.signals:
+        x = sq.loc[sq["yq"].eq(last), sig].dropna()
+        if len(x) < cfg.min_names:
+            continue
+        b = _bucket(x, cfg.n_bins, cfg.tie_break)
+        if b is None:
+            continue
+        vc = b.value_counts().sort_index()
+        bal.append(dict(signal=sig, n=len(x), n_distinct=int(x.nunique()),
+                        n_buckets=int(vc.size), bottom=int(vc.iloc[0]),
+                        top=int(vc.iloc[-1]),
+                        max_share=float(vc.max() / len(x))))
+    if bal and verbose:
+        bdf = pd.DataFrame(bal)
+        print(f"\n=== bucket balance in {last} (tie_break={cfg.tie_break!r}) ===")
+        print(bdf.round(3).to_string(index=False))
+        bad = bdf[bdf.max_share > 0.25]
+        if len(bad):
+            print(f"[warn] heavily tied: {list(bad.signal)} -- one bucket holds "
+                  f">25% of the cross-section, so this is not really a decile sort")
+
     c = sq[["n_buy", "n_funds", "frac_buy", "market_cap"]].dropna()
     corr = c.assign(log_mktcap=np.log(c.market_cap.where(c.market_cap > 0)))[
         ["n_buy", "n_funds", "frac_buy", "log_mktcap"]].corr()
@@ -501,6 +592,85 @@ def run(cfg: Config = Config(), verbose: bool = True) -> Result:
                     "ann_return"]].round(4).to_string())
     return Result(stock_q=sq, perf=perf, spreads=spreads, corr=corr)
 
+
+
+# ================================================================= ROBUSTNESS
+TIE_BREAKS = ("first", "average", "random")
+SIZE_GROUPS = (1, 2, 3, 4, 5)
+NONZERO = (False, True)
+
+
+def sweep(sq: pd.DataFrame, cfg: Config, signals=None, horizons=(1, 2, 3),
+          tie_breaks=TIE_BREAKS, size_groups=SIZE_GROUPS, nonzero=NONZERO,
+          verbose: bool = True) -> pd.DataFrame:
+    """Re-run portfolio formation across every arbitrary construction choice.
+
+    Same signal, same data -- only the choices differ. A result that holds across
+    the grid is a result; one that appears in a few cells is a choice. On a
+    synthetic signal built to carry ZERO information, |t| >= 2 still showed up in
+    83% of the 30 cells, so this grid is not optional for the count signals.
+
+    `sq` is built once by build_stock_quarter(); only formation is repeated.
+    """
+    from dataclasses import replace
+    import itertools
+
+    signals = list(signals or cfg.signals)
+    split = pd.Period(cfg.split, freq="Q")
+    rows = []
+    combos = list(itertools.product(tie_breaks, size_groups, nonzero))
+    for i, (tb, ng, nz) in enumerate(combos, 1):
+        c = replace(cfg, tie_break=tb, size_groups=ng, size_neutral=(ng > 1),
+                    nonzero_only=nz)
+        for sig in signals:
+            if sig not in sq.columns:
+                continue
+            for h in horizons:
+                sp = decile_spread(sq, sig, h, c)
+                if len(sp) < 8:
+                    continue
+                for sample in ("discovery", "validation", "all"):
+                    perf = performance(sp[_sample_mask(sp.index, sample, split)],
+                                       h, c)
+                    if perf.get("n_quarters", 0) < 8:
+                        continue
+                    perf.update(signal=sig, horizon=h, sample=sample,
+                                tie_break=tb, size_groups=ng, nonzero_only=nz)
+                    rows.append(perf)
+        if verbose:
+            print(f"  [{i}/{len(combos)}] tie_break={tb:7s} size_groups={ng} "
+                  f"nonzero_only={nz}", flush=True)
+    return pd.DataFrame(rows)
+
+
+def sweep_table(res: pd.DataFrame, signal: str, horizon: int = 1,
+                sample: str = "all", value: str = "t_nw") -> pd.DataFrame:
+    """One readable grid: (nonzero_only, tie_break) x size_groups."""
+    d = res[(res.signal == signal) & (res.horizon == horizon)
+            & (res["sample"] == sample)]
+    if d.empty:
+        return pd.DataFrame()
+    return d.pivot_table(index=["nonzero_only", "tie_break"],
+                         columns="size_groups", values=value)
+
+
+def sweep_verdict(res: pd.DataFrame, signals=None, horizon: int = 1,
+                  sample: str = "all") -> pd.DataFrame:
+    """Per signal: does anything survive the grid, or is it a construction choice?"""
+    out = []
+    for sig in (signals or res.signal.unique()):
+        d = res[(res.signal == sig) & (res.horizon == horizon)
+                & (res["sample"] == sample)]
+        t = d["t_nw"].dropna()
+        if t.empty:
+            continue
+        out.append(dict(signal=sig, horizon=horizon, n_cells=len(t),
+                        t_min=t.min(), t_max=t.max(), t_median=t.median(),
+                        share_abs_t_ge2=float((t.abs() >= 2).mean()),
+                        sign_flips=bool(t.min() < 0 < t.max()),
+                        robust=bool((t.abs() >= 2).all()
+                                    and not (t.min() < 0 < t.max()))))
+    return pd.DataFrame(out)
 
 if __name__ == "__main__":
     import argparse
