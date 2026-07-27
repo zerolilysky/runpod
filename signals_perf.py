@@ -118,8 +118,12 @@ class Config:
     signals: tuple = ("n_buy", "n_funds", "frac_buy", "n_buy_resid",
                       "net_buy", "n_sell",
                       # z-score families: intensity of the tilt, not its direction
+                      # fraction / count / continuous, cross-sectional and vs own past
                       "frac_zaw_hi", "frac_ts_aw_hi",
-                      "mean_z_aw", "mean_z_ts_aw")
+                      "n_zaw_hi", "n_ts_aw_hi",
+                      "n_zaw_hi_resid", "n_ts_aw_hi_resid",
+                      "mean_z_aw", "mean_z_ts_aw",
+                      "sum_z_aw", "sum_z_ts_aw")
 
     @property
     def panels_dir(self) -> str:
@@ -496,19 +500,46 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
 
     zq = h.groupby(["security", "yq"], observed=True).agg(
         n_holders=("fund", "size"),
-        # share of holders for whom this name is a conspicuous overweight
+        # ---- FRACTION: share of holders for whom the tilt is conspicuous ------
         frac_zaw_hi=("z_aw_hi", "mean"),
         frac_zw_hi=("z_w_hi", "mean"),
-        # share for whom it looks unusually large vs their OWN history in it
         frac_ts_aw_hi=("z_ts_aw_hi", "mean"),
         frac_ts_w_hi=("z_ts_w_hi", "mean"),
-        # continuous versions: no threshold, no ties, usually better behaved
+        # ---- COUNT: how MANY funds, not what share --------------------------
+        # These inherit the coverage problem that made n_buy ~= n_funds: a widely
+        # held name has more funds above any threshold simply because it has more
+        # holders. Compare each against n_holders before believing it.
+        n_zaw_hi=("z_aw_hi", "sum"),
+        n_zw_hi=("z_w_hi", "sum"),
+        n_ts_aw_hi=("z_ts_aw_hi", "sum"),
+        n_ts_w_hi=("z_ts_w_hi", "sum"),
+        # ---- CONTINUOUS: no threshold, no ties, usually better behaved -------
         mean_z_aw=("z_aw", "mean"),
         mean_z_w=("z_w", "mean"),
         mean_z_ts_aw=("z_ts_aw", "mean"),
         mean_z_ts_w=("z_ts_w", "mean"),
+        # summed z: a count-like continuous measure (intensity x breadth)
+        sum_z_aw=("z_aw", "sum"),
+        sum_z_ts_aw=("z_ts_aw", "sum"),
         n_ts_defined=("z_ts_aw", "count"),
     ).reset_index()
+    for c in ("n_zaw_hi", "n_zw_hi", "n_ts_aw_hi", "n_ts_w_hi"):
+        zq[c] = zq[c].astype("int64")
+    # count signals with coverage projected out, the same control n_buy_resid gets
+    zq["log_nh"] = np.log(zq["n_holders"].clip(lower=1))
+
+    def _resid_z(gg, col):
+        x, y = gg["log_nh"], gg[col]
+        m = x.notna() & y.notna()
+        if m.sum() < 30:
+            return pd.Series(np.nan, index=gg.index)
+        b0, b1 = np.polyfit(x[m], y[m], 1)
+        return y - (b0 * x + b1)
+
+    for col in ("n_zaw_hi", "n_ts_aw_hi"):
+        zq[f"{col}_resid"] = zq.groupby("yq", group_keys=False).apply(
+            _resid_z, col)
+    zq = zq.drop(columns=["log_nh"])
     print(f"[signal] z-scores: cross-sectional defined on "
           f"{h['z_aw'].notna().mean():.1%} of held rows, time-series on "
           f"{h['z_ts_aw'].notna().mean():.1%} (needs >{cfg.ts_min_history}q history)")
@@ -728,7 +759,11 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
     if verbose:
         print("\n=== signal correlations (why n_buy ~ coverage) ===")
         print(corr.round(3).to_string())
-        print("\n=== performance (full sample) ===")
+        n_all = int((perf["sample"] == "all").sum())
+        print(f"\n=== performance: sample=='all' ONLY ({n_all} of {len(perf)} rows) "
+              f"===")
+        print("    the returned .perf also holds 'discovery' and 'validation' rows;"
+              "\n    filter it, e.g. perf[perf['sample'] == 'all']")
         show = perf[perf["sample"] == "all"].set_index(["signal", "horizon"])
         print(show[["n_quarters", "mean_q", "t_nw", "sharpe_ann", "hit",
                     "ann_return"]].round(4).to_string())
