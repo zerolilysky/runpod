@@ -963,6 +963,51 @@ def print_missing_report(sq: pd.DataFrame, cfg: Config = Config(),
         print(r["partial"].round(4).to_string(index=False))
 
 
+# ------------------------------------------------- combining several signals
+def combine_signal(sq: pd.DataFrame, signals: List[str], how: str = "z",
+                   weights: List[float] = None) -> pd.Series:
+    """Average several signals into one, AFTER putting them on a common scale.
+
+    Raw averaging is meaningless here: n_funds runs 1..500 while max_own runs
+    0..1, so the mean is just n_funds. Both options standardise WITHIN each
+    quarter first, so the combination is cross-sectional and uses no future data.
+
+      how="z"    per-quarter z-score, then average. Keeps relative magnitude, so
+                 an extreme outlier still dominates.
+      how="rank" per-quarter rank in [0,1], then average. Outlier-proof, and it
+                 makes the two signals contribute equally by construction.
+    """
+    w = np.asarray(weights if weights else [1.0] * len(signals), dtype=float)
+    w = w / w.sum()
+    parts = []
+    for sig in signals:
+        x = sq[sig]
+        g = x.groupby(sq["yq"], sort=False)
+        if how == "z":
+            mu, sd = g.transform("mean"), g.transform("std")
+            parts.append((x - mu) / sd.where(sd > 0))
+        elif how == "rank":
+            parts.append(g.transform(lambda v: v.rank(pct=True)))
+        else:
+            raise ValueError("how must be 'z' or 'rank'")
+    out = sum(wi * pi for wi, pi in zip(w, parts))
+    return out.rename("+".join(signals))
+
+
+def combine_returns(spreads: Dict[str, pd.Series],
+                    weights: List[float] = None) -> pd.Series:
+    """Average several strategies' per-quarter RETURN series (late combination).
+
+    Distinct from combine_signal(), which merges the signals first and forms ONE
+    portfolio. Averaging returns keeps N portfolios and blends their P&L; the
+    resulting Sharpe follows (S1+S2)/sqrt(2+2*rho), NOT S1+S2.
+    """
+    df = pd.DataFrame(spreads).dropna()
+    w = np.asarray(weights if weights else [1.0] * df.shape[1], dtype=float)
+    w = w / w.sum()
+    return (df * w).sum(axis=1)
+
+
 # ================================================================= ROBUSTNESS
 TIE_BREAKS = ("first", "average", "random")
 SIZE_GROUPS = (1, 2, 3, 4, 5)
