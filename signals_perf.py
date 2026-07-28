@@ -85,6 +85,10 @@ ALL_SIGNALS = (
     # continuous: no threshold, no ties
     "mean_z_aw", "mean_z_w", "mean_z_ts_aw", "mean_z_ts_w",
     "mean_abs_z_aw", "mean_abs_z_ts_aw", "sum_z_aw", "sum_z_ts_aw",
+    # how much of the company these institutions own (a LEVEL, not a count)
+    "inst_own", "max_own", "mean_own",
+    # how much they DISAGREE about it
+    "disp_aw", "disp_w", "disp_z_aw", "disp_aw_cv",
 )
 
 
@@ -479,13 +483,16 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
     #                                   immune to price moves -- but sensitive to
     #                                   splits if SharesHld is not split-adjusted
     LEVELS = ["active_weight", "weight", "market_weight", "shares"]
+    # carried through for the ownership/dispersion aggregates, but NOT differenced
+    CARRY = ["position_value", "market_cap"]
     df["weight"] = df["w_real"]
     df["market_weight"] = df["w_ref"]
-    keep = ["fund", "security", "qi"] + LEVELS
+    keep = ["fund", "security", "qi"] + LEVELS + CARRY
     cur = df[keep].copy()
     cur["held_now"] = True
     prev = df[keep].copy()
     prev["qi"] += 1                                  # STRICT one-quarter lag
+    prev = prev.drop(columns=CARRY)          # only the current value is needed
     prev = prev.rename(columns={c: f"{c}_lag1" for c in LEVELS})
     prev["held_prev"] = True
 
@@ -550,10 +557,27 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
                                                 # hypothesis: attention/disagreement
                                                 # rather than direction.
 
+    # ---------- ownership level and disagreement -----------------------------
+    # inst_own : sum of position_value / market_cap -- what SHARE of the company
+    #            these institutions collectively hold. A level, not a flow, and
+    #            genuinely different from n_funds (a count): 3 funds each holding
+    #            10% outrank 300 funds holding 0.01% apiece.
+    # disp_aw  : cross-fund sd of active_weight in the security -- how much funds
+    #            DISAGREE about it. High = contested, low = consensus.
+    h["own_frac"] = (h["position_value"] / h["market_cap"]).where(h["market_cap"] > 0)
+
     zq = h.groupby(["security", "yq"], observed=True).agg(
         # NOTE: no n_holders here -- it was identical to n_funds (verified on every
         # row). Coverage is n_funds; the rate denominator is n_active.
         _n_hold=("fund", "size"),
+        # ---- institutional ownership share ----
+        inst_own=("own_frac", "sum"),
+        max_own=("own_frac", "max"),          # the largest single holder's stake
+        mean_own=("own_frac", "mean"),
+        # ---- disagreement across funds ----
+        disp_aw=("active_weight", "std"),     # sd of the tilt across holders
+        disp_w=("weight", "std"),
+        disp_z_aw=("z_aw", "std"),            # sd of the normalised tilt
         # ---- FRACTION: share of holders for whom the tilt is conspicuous ------
         frac_zaw_hi=("z_aw_hi", "mean"),
         frac_zw_hi=("z_w_hi", "mean"),
@@ -604,6 +628,12 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
     for col in ("n_zaw_hi", "n_ts_aw_hi", "n_zaw_abs_hi", "n_ts_aw_abs_hi"):
         zq[f"{col}_resid"] = zq.groupby("yq", group_keys=False).apply(
             _resid_z, col)
+    # dispersion scaled by the mean tilt: is the disagreement large RELATIVE to
+    # how big the tilts are? (raw sd rises mechanically with tilt size)
+    if {"disp_aw", "mean_z_aw"}.issubset(zq.columns):
+        zq["disp_aw_cv"] = zq["disp_aw"] / zq["mean_z_aw"].abs().where(
+            zq["mean_z_aw"].abs() > 1e-12)
+
     # |residual|: not "more overweighters than expected" but "ABNORMALLY MANY OR
     # FEW". A stock whose overweighter count is far below what its coverage
     # predicts is just as unusual as one far above -- this scores both.
