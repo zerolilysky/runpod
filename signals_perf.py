@@ -122,6 +122,12 @@ class Config:
                       "frac_zaw_hi", "frac_ts_aw_hi",
                       "n_zaw_hi", "n_ts_aw_hi",
                       "n_zaw_hi_resid", "n_ts_aw_hi_resid",
+                      # |z| > k : conspicuous either way (attention, not direction)
+                      "frac_zaw_abs_hi", "n_zaw_abs_hi", "n_zaw_abs_hi_resid",
+                      "frac_ts_aw_abs_hi", "n_ts_aw_abs_hi", "n_ts_aw_abs_hi_resid",
+                      "mean_abs_z_aw", "mean_abs_z_ts_aw",
+                      # |residual|: abnormally MANY OR FEW overweighters
+                      "n_zaw_hi_resid_abs", "n_ts_aw_hi_resid_abs",
                       "mean_z_aw", "mean_z_ts_aw",
                       "sum_z_aw", "sum_z_ts_aw")
 
@@ -496,7 +502,12 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
     h["z_ts_w"] = _zscore_vs_own_past(h, "weight", ["fund", "security"],
                                       cfg.ts_min_history)
     for c in ("z_aw", "z_w", "z_ts_aw", "z_ts_w"):
-        h[f"{c}_hi"] = h[c] > k
+        h[f"{c}_hi"] = h[c] > k                 # conspicuously OVER-weight
+        h[f"{c}_abs_hi"] = h[c].abs() > k       # conspicuous EITHER WAY -- funds
+                                                # hold a strong view on this name,
+                                                # over- or under-weight. A different
+                                                # hypothesis: attention/disagreement
+                                                # rather than direction.
 
     zq = h.groupby(["security", "yq"], observed=True).agg(
         n_holders=("fund", "size"),
@@ -513,17 +524,26 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
         n_zw_hi=("z_w_hi", "sum"),
         n_ts_aw_hi=("z_ts_aw_hi", "sum"),
         n_ts_w_hi=("z_ts_w_hi", "sum"),
+        # ---- |z| > k : conspicuous in EITHER direction ----------------------
+        frac_zaw_abs_hi=("z_aw_abs_hi", "mean"),
+        frac_ts_aw_abs_hi=("z_ts_aw_abs_hi", "mean"),
+        n_zaw_abs_hi=("z_aw_abs_hi", "sum"),
+        n_ts_aw_abs_hi=("z_ts_aw_abs_hi", "sum"),
         # ---- CONTINUOUS: no threshold, no ties, usually better behaved -------
         mean_z_aw=("z_aw", "mean"),
         mean_z_w=("z_w", "mean"),
         mean_z_ts_aw=("z_ts_aw", "mean"),
         mean_z_ts_w=("z_ts_w", "mean"),
+        # continuous |z|: average conspicuousness, no threshold
+        mean_abs_z_aw=("z_aw", lambda x: float(np.nanmean(np.abs(x)))),
+        mean_abs_z_ts_aw=("z_ts_aw", lambda x: float(np.nanmean(np.abs(x)))),
         # summed z: a count-like continuous measure (intensity x breadth)
         sum_z_aw=("z_aw", "sum"),
         sum_z_ts_aw=("z_ts_aw", "sum"),
         n_ts_defined=("z_ts_aw", "count"),
     ).reset_index()
-    for c in ("n_zaw_hi", "n_zw_hi", "n_ts_aw_hi", "n_ts_w_hi"):
+    for c in ("n_zaw_hi", "n_zw_hi", "n_ts_aw_hi", "n_ts_w_hi",
+              "n_zaw_abs_hi", "n_ts_aw_abs_hi"):
         zq[c] = zq[c].astype("int64")
     # count signals with coverage projected out, the same control n_buy_resid gets
     zq["log_nh"] = np.log(zq["n_holders"].clip(lower=1))
@@ -536,9 +556,16 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
         b0, b1 = np.polyfit(x[m], y[m], 1)
         return y - (b0 * x + b1)
 
-    for col in ("n_zaw_hi", "n_ts_aw_hi"):
+    for col in ("n_zaw_hi", "n_ts_aw_hi", "n_zaw_abs_hi", "n_ts_aw_abs_hi"):
         zq[f"{col}_resid"] = zq.groupby("yq", group_keys=False).apply(
             _resid_z, col)
+    # |residual|: not "more overweighters than expected" but "ABNORMALLY MANY OR
+    # FEW". A stock whose overweighter count is far below what its coverage
+    # predicts is just as unusual as one far above -- this scores both.
+    for col in ("n_zaw_hi_resid", "n_ts_aw_hi_resid", "n_zaw_abs_hi_resid",
+                "n_ts_aw_abs_hi_resid"):
+        if col in zq.columns:
+            zq[f"{col}_abs"] = zq[col].abs()
     zq = zq.drop(columns=["log_nh"])
     print(f"[signal] z-scores: cross-sectional defined on "
           f"{h['z_aw'].notna().mean():.1%} of held rows, time-series on "
