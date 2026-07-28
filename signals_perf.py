@@ -115,21 +115,10 @@ class Config:
     ann: int = 4                          # quarters per year (annualisation)
     chunksize: int = 5_000_000            # rows per read_csv chunk
 
-    signals: tuple = ("n_buy", "n_funds", "frac_buy", "n_buy_resid",
-                      "net_buy", "n_sell",
-                      # z-score families: intensity of the tilt, not its direction
-                      # fraction / count / continuous, cross-sectional and vs own past
-                      "frac_zaw_hi", "frac_ts_aw_hi",
-                      "n_zaw_hi", "n_ts_aw_hi",
-                      "n_zaw_hi_resid", "n_ts_aw_hi_resid",
-                      # |z| > k : conspicuous either way (attention, not direction)
-                      "frac_zaw_abs_hi", "n_zaw_abs_hi", "n_zaw_abs_hi_resid",
-                      "frac_ts_aw_abs_hi", "n_ts_aw_abs_hi", "n_ts_aw_abs_hi_resid",
-                      "mean_abs_z_aw", "mean_abs_z_ts_aw",
-                      # |residual|: abnormally MANY OR FEW overweighters
-                      "n_zaw_hi_resid_abs", "n_ts_aw_hi_resid_abs",
-                      "mean_z_aw", "mean_z_ts_aw",
-                      "sum_z_aw", "sum_z_ts_aw")
+    # None (default) = evaluate EVERY signal column found in the frame. Pass an
+    # explicit tuple only to restrict. A hand-maintained list silently drops newly
+    # added signals, which is exactly how this went wrong before.
+    signals: tuple | None = None
 
     @property
     def panels_dir(self) -> str:
@@ -232,6 +221,30 @@ def _bucket(x: pd.Series, n_bins: int, tie_break: str):
         return pd.qcut(r, n_bins, labels=False, duplicates="drop")
     except (ValueError, IndexError):
         return None
+
+
+# columns that are keys, outcomes or bookkeeping -- never signals
+NON_SIGNAL = {"security", "yq", "qi", "market_cap", "n_days", "sample",
+              "log_nh", "log_nf",          # regression helpers, not signals
+              "quarterly_ret", "future_1q_ret", "future_2q_ret", "future_3q_ret",
+              "n_ts_defined"}
+
+
+def _nanmean_abs(x) -> float:
+    """Mean |x| ignoring NaN; NaN when nothing is defined (no warning)."""
+    v = np.abs(np.asarray(x, dtype="float64"))
+    v = v[np.isfinite(v)]
+    return float(v.mean()) if v.size else np.nan
+
+
+def all_signals(sq: pd.DataFrame) -> list:
+    """Every numeric column of `sq` that is a candidate signal.
+
+    Used when Config.signals is None so that adding a signal to
+    build_stock_quarter() is enough -- no second list to keep in sync.
+    """
+    return [c for c in sq.columns
+            if c not in NON_SIGNAL and pd.api.types.is_numeric_dtype(sq[c])]
 
 
 def _zscore_within(x: pd.Series, keys: List[pd.Series]) -> pd.Series:
@@ -535,8 +548,10 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
         mean_z_ts_aw=("z_ts_aw", "mean"),
         mean_z_ts_w=("z_ts_w", "mean"),
         # continuous |z|: average conspicuousness, no threshold
-        mean_abs_z_aw=("z_aw", lambda x: float(np.nanmean(np.abs(x)))),
-        mean_abs_z_ts_aw=("z_ts_aw", lambda x: float(np.nanmean(np.abs(x)))),
+        # nanmean of an all-NaN group is NaN by design (no history yet), so the
+        # empty-slice warning is suppressed rather than papered over with a 0
+        mean_abs_z_aw=("z_aw", lambda x: _nanmean_abs(x)),
+        mean_abs_z_ts_aw=("z_ts_aw", lambda x: _nanmean_abs(x)),
         # summed z: a count-like continuous measure (intensity x breadth)
         sum_z_aw=("z_aw", "sum"),
         sum_z_ts_aw=("z_ts_aw", "sum"),
@@ -729,9 +744,10 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
     parquet files each time.
     """
     split = pd.Period(cfg.split, freq="Q")
+    signals = list(cfg.signals) if cfg.signals else all_signals(sq)
     rows: List[dict] = []
     spreads: Dict[str, pd.Series] = {}
-    for sig in cfg.signals:
+    for sig in signals:
         if sig not in sq.columns:
             continue
         for h in cfg.horizons:
@@ -752,7 +768,7 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
     # how tied is each signal? a nearly-degenerate sort is worth seeing.
     bal = []
     last = sq["yq"].max()
-    for sig in cfg.signals:
+    for sig in signals:
         x = sq.loc[sq["yq"].eq(last), sig].dropna()
         if len(x) < cfg.min_names:
             continue
@@ -766,7 +782,7 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
                         max_share=float(vc.max() / len(x))))
     if verbose:
         try:
-            print_missing_report(sq, cfg, cfg.signals[0])
+            print_missing_report(sq, cfg, signals[0])
         except Exception as e:
             print(f"[warn] missing_report failed: {type(e).__name__}: {e}")
 
@@ -893,7 +909,7 @@ def sweep(sq: pd.DataFrame, cfg: Config, signals=None, horizons=(1, 2, 3),
     from dataclasses import replace
     import itertools
 
-    signals = list(signals or cfg.signals)
+    signals = list(signals or cfg.signals or all_signals(sq))
     split = pd.Period(cfg.split, freq="Q")
     rows = []
     combos = list(itertools.product(tie_breaks, size_groups, nonzero))
@@ -937,7 +953,7 @@ def sweep_missing(sq: pd.DataFrame, cfg: Config, signals=None, horizons=(1, 2, 3
     these two.
     """
     from dataclasses import replace
-    signals = list(signals or cfg.signals)
+    signals = list(signals or cfg.signals or all_signals(sq))
     split = pd.Period(cfg.split, freq="Q")
     rows = []
     for policy in ("drop", "zero"):
