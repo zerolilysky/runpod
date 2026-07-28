@@ -66,7 +66,7 @@ RETURNS_NAME_CANDIDATES = ("return_data_v2.csv", "returns_data_v2.csv",
 # actually finds in the frame, so this list going stale is not fatal.
 ALL_SIGNALS = (
     # counts and rates of trading / holding
-    "n_funds", "n_active", "n_holders", "n_buy", "n_sell", "frac_buy", "net_buy",
+    "n_funds", "n_active", "n_buy", "n_sell", "frac_buy", "net_buy",
     "n_buy_resid",
     # what counts as a "buy": active weight / weight / market weight / shares
     "n_buy_aw", "n_buy_w", "n_buy_mw", "n_buy_sh",
@@ -551,7 +551,9 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
                                                 # rather than direction.
 
     zq = h.groupby(["security", "yq"], observed=True).agg(
-        n_holders=("fund", "size"),
+        # NOTE: no n_holders here -- it was identical to n_funds (verified on every
+        # row). Coverage is n_funds; the rate denominator is n_active.
+        _n_hold=("fund", "size"),
         # ---- FRACTION: share of holders for whom the tilt is conspicuous ------
         frac_zaw_hi=("z_aw_hi", "mean"),
         frac_zw_hi=("z_w_hi", "mean"),
@@ -560,7 +562,7 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
         # ---- COUNT: how MANY funds, not what share --------------------------
         # These inherit the coverage problem that made n_buy ~= n_funds: a widely
         # held name has more funds above any threshold simply because it has more
-        # holders. Compare each against n_holders before believing it.
+        # holders. Compare each against n_funds before believing it.
         n_zaw_hi=("z_aw_hi", "sum"),
         n_zw_hi=("z_w_hi", "sum"),
         n_ts_aw_hi=("z_ts_aw_hi", "sum"),
@@ -589,7 +591,7 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
               "n_zaw_abs_hi", "n_ts_aw_abs_hi"):
         zq[c] = zq[c].astype("int64")
     # count signals with coverage projected out, the same control n_buy_resid gets
-    zq["log_nh"] = np.log(zq["n_holders"].clip(lower=1))
+    zq["log_nh"] = np.log(zq["_n_hold"].clip(lower=1))
 
     def _resid_z(gg, col):
         x, y = gg["log_nh"], gg[col]
@@ -609,7 +611,7 @@ def build_stock_quarter(panel: pd.DataFrame, returns: pd.DataFrame,
                 "n_ts_aw_abs_hi_resid"):
         if col in zq.columns:
             zq[f"{col}_abs"] = zq[col].abs()
-    zq = zq.drop(columns=["log_nh"])
+    zq = zq.drop(columns=["log_nh", "_n_hold"])
     print(f"[signal] z-scores: cross-sectional defined on "
           f"{h['z_aw'].notna().mean():.1%} of held rows, time-series on "
           f"{h['z_ts_aw'].notna().mean():.1%} (needs >{cfg.ts_min_history}q history)")
@@ -845,8 +847,14 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
         print("    the returned .perf also holds 'discovery' and 'validation' rows;"
               "\n    filter it, e.g. perf[perf['sample'] == 'all']")
         show = perf[perf["sample"] == "all"].set_index(["signal", "horizon"])
-        print(show[["n_quarters", "mean_q", "t_nw", "sharpe_ann", "hit",
-                    "ann_return"]].round(4).to_string())
+        want = ["n_quarters", "mean_q", "t_nw", "sharpe_ann", "hit", "ann_return"]
+        have = [c for c in want if c in show.columns]
+        if len(have) <= 1:
+            # every cell fell through performance()'s n < 8 early return
+            print("  no statistics: no (signal, horizon, sample) cell has >= 8 "
+                  "quarters. Widen the sample or lower the horizon.")
+        else:
+            print(show[have].round(4).to_string())
     return Result(stock_q=sq, perf=perf, spreads=spreads, corr=corr)
 
 
