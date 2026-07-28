@@ -61,6 +61,33 @@ RETURNS_NAME_CANDIDATES = ("return_data_v2.csv", "returns_data_v2.csv",
                            "return_data.csv")
 
 
+# Every signal build_stock_quarter() emits. Kept as an explicit tuple so that
+# `for sig in cfg.signals` always works; evaluate() unions it with whatever it
+# actually finds in the frame, so this list going stale is not fatal.
+ALL_SIGNALS = (
+    # counts and rates of trading / holding
+    "n_funds", "n_active", "n_holders", "n_buy", "n_sell", "frac_buy", "net_buy",
+    "n_buy_resid",
+    # what counts as a "buy": active weight / weight / market weight / shares
+    "n_buy_aw", "n_buy_w", "n_buy_mw", "n_buy_sh",
+    # what counts as "holding": weight > 0 vs active_weight > 0
+    "n_funds_w", "n_funds_aw",
+    # intensity, z > k : fraction / count / coverage-stripped count
+    "frac_zaw_hi", "frac_zw_hi", "frac_ts_aw_hi", "frac_ts_w_hi",
+    "n_zaw_hi", "n_zw_hi", "n_ts_aw_hi", "n_ts_w_hi",
+    "n_zaw_hi_resid", "n_ts_aw_hi_resid",
+    # intensity, |z| > k : conspicuous either way (attention, not direction)
+    "frac_zaw_abs_hi", "frac_ts_aw_abs_hi", "n_zaw_abs_hi", "n_ts_aw_abs_hi",
+    "n_zaw_abs_hi_resid", "n_ts_aw_abs_hi_resid",
+    # |residual| : abnormally MANY OR FEW relative to coverage
+    "n_zaw_hi_resid_abs", "n_ts_aw_hi_resid_abs",
+    "n_zaw_abs_hi_resid_abs", "n_ts_aw_abs_hi_resid_abs",
+    # continuous: no threshold, no ties
+    "mean_z_aw", "mean_z_w", "mean_z_ts_aw", "mean_z_ts_w",
+    "mean_abs_z_aw", "mean_abs_z_ts_aw", "sum_z_aw", "sum_z_ts_aw",
+)
+
+
 # ================================================================= CONFIG
 @dataclass
 class Config:
@@ -115,10 +142,11 @@ class Config:
     ann: int = 4                          # quarters per year (annualisation)
     chunksize: int = 5_000_000            # rows per read_csv chunk
 
-    # None (default) = evaluate EVERY signal column found in the frame. Pass an
-    # explicit tuple only to restrict. A hand-maintained list silently drops newly
-    # added signals, which is exactly how this went wrong before.
-    signals: tuple | None = None
+    # Always a real tuple, so `for sig in cfg.signals` works. Consumers skip any
+    # name not present in the frame, and evaluate() additionally unions in
+    # all_signals(sq), so a signal added to build_stock_quarter is still picked up
+    # even if it is missing from this list.
+    signals: tuple = ALL_SIGNALS
 
     @property
     def panels_dir(self) -> str:
@@ -744,7 +772,16 @@ def evaluate(sq: pd.DataFrame, cfg: Config = Config(),
     parquet files each time.
     """
     split = pd.Period(cfg.split, freq="Q")
-    signals = list(cfg.signals) if cfg.signals else all_signals(sq)
+    declared = list(cfg.signals) if cfg.signals else []
+    if tuple(declared) == ALL_SIGNALS or not declared:
+        # the DEFAULT: evaluate everything, and union in anything the frame has
+        # that ALL_SIGNALS forgot, so a new signal is never silently dropped
+        found = all_signals(sq)
+        signals = [c for c in declared if c in sq.columns] + \
+                  [c for c in found if c not in declared]
+    else:
+        # an EXPLICIT restriction -- honour it exactly, add nothing
+        signals = [c for c in declared if c in sq.columns]
     rows: List[dict] = []
     spreads: Dict[str, pd.Series] = {}
     for sig in signals:
