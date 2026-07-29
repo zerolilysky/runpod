@@ -356,6 +356,58 @@ def print_double_sort(res: Dict[str, pd.DataFrame], own="inst_own",
         print(res["disp_ls"].round(4).to_string(index=False))
 
 
+def strategy_spread(sq: pd.DataFrame, signal: str = "inst_own",
+                    condition: str = "sum_abs_aw", bucket: int = 0,
+                    n_buckets: int = 5, cfg: Config = None, horizon: int = 1,
+                    n_bins: int = None) -> pd.Series:
+    """Per-quarter long-short return of `signal` INSIDE one `condition` bucket.
+
+    bucket=0 is the LOWEST bucket of `condition` (buckets run 0..n_buckets-1).
+    Long the top `n_bins` bucket of `signal`, short the bottom, equal weighted.
+
+    Returns the raw quarterly series so it can be compounded, plotted, or
+    combined -- conditional_sort() reports the same thing already summarised.
+    """
+    cfg = cfg or Config()
+    nb = n_bins or cfg.n_bins
+    ret = RET_COL[horizon]
+    d = sq[["yq", "security", signal, condition, ret]].dropna()
+
+    def _one(q):
+        cb = _bucket(q[condition], n_buckets, cfg.tie_break)
+        if cb is None:
+            return np.nan
+        sub = q[cb == bucket]
+        if len(sub) < cfg.min_names:
+            return np.nan
+        b = _bucket(sub[signal], nb, cfg.tie_break)
+        if b is None or b.nunique() < 2:
+            return np.nan
+        return sub.loc[b == b.max(), ret].mean() - sub.loc[b == b.min(), ret].mean()
+
+    return d.groupby("yq").apply(_one, include_groups=False).dropna()
+
+
+def report_strategy(sp: pd.Series, cfg: Config = None, horizon: int = 1,
+                    label: str = "strategy") -> pd.DataFrame:
+    """discovery / validation / full-sample performance of one spread series."""
+    cfg = cfg or Config()
+    split = pd.Period(cfg.split, freq="Q")
+    rows = []
+    for sample in ("discovery", "validation", "all"):
+        s = sp[_sample_mask(sp.index, sample, split)]
+        r = performance(s, horizon, cfg)
+        r.update(strategy=label, sample=sample,
+                 first=str(s.index.min()) if len(s) else None,
+                 last=str(s.index.max()) if len(s) else None)
+        rows.append(r)
+    out = pd.DataFrame(rows)
+    front = ["strategy", "sample", "first", "last", "n_quarters", "mean_q",
+             "t_nw", "hit", "ann_return", "sharpe_ann", "cum_return",
+             "max_drawdown"]
+    return out[[c for c in front if c in out.columns]]
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="ownership + disagreement signals")
