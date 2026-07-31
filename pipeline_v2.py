@@ -92,8 +92,8 @@ warnings.filterwarnings("ignore")
 @dataclass
 class Config:
     # ---- data ----
-    data_path: str = ("manager_holdings/master_batches_returnfiltered/"
-                      "panel_holdings_All_Funds_filter_rank.parquet")
+    data_path: str = ("manager_holdings/master_batches_return_filtered/"
+                      "panel_holdings_All_Funds_add_filter_ivy_rank_active_rank.parquet")
     out_dir: str = "outputs_v2"
     col_map: dict = field(default_factory=lambda: {
         "fund": "fund", "date": "date", "security": "security", "shares": "shares",

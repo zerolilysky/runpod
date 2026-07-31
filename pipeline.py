@@ -38,8 +38,8 @@ warnings.filterwarnings("ignore")
 @dataclass
 class Config:
     # ---- data ----
-    data_path: str = ("manager_holdings/master_batches_returnfiltered/"
-                      "panel_holdings_All_Funds_2002_master.parquet")
+    data_path: str = ("manager_holdings/master_batches_return_filtered/"
+                      "panel_holdings_All_Funds_add_filter_ivy_rank_active_rank.parquet")
     out_dir: str = "outputs"
     # column mapping: {your_column: internal_name}. Adjust only if your names differ.
     col_map: dict = field(default_factory=lambda: {
@@ -154,7 +154,11 @@ class Config:
     # bucket gets its own LSTM trained + tested only on that bucket -- never pooled training.
     bucket_by: str = None
     n_buckets: int = 5
-    min_train_bucket: int = 500    # skip a (window,bucket) with fewer train sequences
+    # Minimum train sequences for ONE (window, bucket) cell. None (default) = adaptive:
+    # the per-model minimum divided by n_buckets, because bucketing splits each window's
+    # training rows n_buckets ways. A FIXED value that ignores n_buckets (e.g. 500 while
+    # min_seq_per_fund=120) silently starves every bucket -> "no predictions produced".
+    min_train_bucket: int = None
     device: str = "auto"           # "auto" | "cpu" | "cuda"
     seed: int = 42
     # ---- CPU performance / memory ----
@@ -683,6 +687,19 @@ def _fund_task(fund, fp, feat, cfg, dev="cpu"):
     return outs
 
 
+_BSKIP = {"seen": 0, "thin_train": 0, "no_test": 0, "model_none": 0, "max_seen": 0}
+
+
+def _min_train_bucket(cfg):
+    """Train-sequence floor for ONE (window, bucket). Bucketing splits a window's training
+    rows n_buckets ways, so the floor must scale with n_buckets -- otherwise every bucket
+    is starved and nothing trains."""
+    if cfg.min_train_bucket is not None:
+        return int(cfg.min_train_bucket)
+    base = cfg.min_train_global if cfg.model_mode == "global" else cfg.min_seq_per_fund
+    return max(30, int(base) // max(1, int(cfg.n_buckets)))
+
+
 def _fit_bucketed(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev):
     """Train ONE model on (tr,te) -- or, when cfg.bucket_by is set, a SEPARATE model per
     bucket: for each bucket b, restrict BOTH train and test to samples whose label-quarter
@@ -692,16 +709,25 @@ def _fit_bucketed(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev):
         o = _train_predict(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev)
         return [o] if o is not None else []
     bk = meta["_bkt"].to_numpy()
+    thr = _min_train_bucket(cfg)
     outs = []
     for b in range(cfg.n_buckets):
         mb = bk == b
         trb, teb = tr & mb, te & mb
-        if int(trb.sum()) < cfg.min_train_bucket or int(teb.sum()) == 0:
+        _BSKIP["seen"] += 1
+        if int(trb.sum()) < thr:
+            _BSKIP["thin_train"] += 1
+            _BSKIP["max_seen"] = max(_BSKIP["max_seen"], int(trb.sum()))
+            continue
+        if int(teb.sum()) == 0:
+            _BSKIP["no_test"] += 1
             continue
         o = _train_predict(X, mask, y, feas, meta, trb, teb, F, hidden, cfg, dev)
         if o is not None:
             o["bucket"] = int(b)
             outs.append(o)
+        else:
+            _BSKIP["model_none"] += 1
     return outs
 
 
@@ -714,6 +740,8 @@ def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
     carry a `bucket` column) -- never one pooled model."""
     import os as _os
     import torch
+    for _k in _BSKIP:                      # fresh bucket accounting each run
+        _BSKIP[_k] = 0
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
     dev = _device(cfg)
     feat = [f for f in cfg.features if f in panel.columns]
@@ -789,7 +817,24 @@ def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
                                pre_dispatch="2*n_jobs", verbose=(5 if verbose else 0))(gen)
             preds = [o for r in results for o in r]
     if not preds:
+        if cfg.bucket_by and _BSKIP["seen"]:
+            thr = _min_train_bucket(cfg)
+            raise RuntimeError(
+                f"no predictions produced: every (window, bucket) cell was skipped.\n"
+                f"  cells seen           : {_BSKIP['seen']}\n"
+                f"  skipped, thin train  : {_BSKIP['thin_train']}  "
+                f"(largest cell had {_BSKIP['max_seen']} train seqs, need >= {thr})\n"
+                f"  skipped, empty test  : {_BSKIP['no_test']}\n"
+                f"  model returned None  : {_BSKIP['model_none']}\n"
+                f"Bucketing splits each window's training rows {cfg.n_buckets} ways, so each "
+                f"cell holds ~1/{cfg.n_buckets} of them. Fix by LOWERING min_train_bucket "
+                f"(currently {'auto=' if cfg.min_train_bucket is None else ''}{thr}), lowering "
+                f"n_buckets, or using model_mode='global' (pools funds -> far more rows per cell).")
         raise RuntimeError("no predictions produced -- check filters / window sizes")
+    if cfg.bucket_by and verbose:
+        print(f"[model] bucket cells: {_BSKIP['seen']} seen, "
+              f"{_BSKIP['thin_train']} skipped (thin train, need >= {_min_train_bucket(cfg)}), "
+              f"{_BSKIP['no_test']} skipped (empty test)")
     return pd.concat(preds, ignore_index=True)
 
 
