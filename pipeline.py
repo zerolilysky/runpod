@@ -92,18 +92,40 @@ class Config:
     # (captures full exits). "shares" = force the old shares[t+1]-shares[t] label (exact
     # t+1, drops exits). Use it to A/B whether the target change moved a result.
     target_source: str = "auto"
+    # PREFILTER: `future_1q_shares_change_pct == -100%` (fraction -1.0) does NOT mean a real
+    # full exit in this dataset -- it means the position simply is not in the file next
+    # quarter, i.e. the position info is MISSING. Labelling those "sell" fabricates the
+    # class, so drop them BEFORE any feature / weight / peer-rate / active-weight
+    # aggregation, so the removed rows never influence the panel at all.
+    # Matched on the NORMALISED fraction, so it is correct whether the column is stored in
+    # fraction (-1.0) or percent (-100.0) units.
+    drop_missing_position: bool = True
+    missing_position_value: float = -1.0    # fraction units: -1.0 == -100%
+    # Strict next-quarter target. The chg_pct column is TRUSTED to be a t->t+1 change; a
+    # diagnostic always reports whether that holds. With this True, ENFORCE it: any position
+    # absent at the exact next quarter is treated as a full exit -> "sell" (a gap-spanning
+    # chg_pct is overridden). Sound only when the panel is NOT rank-filtered (a rank drop
+    # also looks "absent"); leave False if you filter by max_rank and trust your column.
+    target_strict_next: bool = False
     # How to fill a lag feature (sh_lag*, w_lag1, pdsh, pdsh_lag1) when the prior quarter
     # is missing (a gap). "ffill" (default) = forward-fill the last-known level across the
     # gap (a level should persist, not reset); a gap then produces no fake trade. "zero" =
     # old behaviour: exact-quarter -> NaN -> 0 in the tensor, which makes a gap look like a
     # jump from an empty position and distorts the panel. Use "zero" only to A/B the old result.
     lag_fill: str = "ffill"
-    # Feasibility (a security held in ALL seq_len quarters, so "sell" is a feasible action).
-    # ONE switch, applied CONSISTENTLY to every accuracy quantity:
-    #   True  -> _train_predict zeroes the sell prob for infeasible rows, AND precision /
-    #            Table X prec / Table XI / Table XII all restrict to feasible rows.
-    #   False -> no sell-zeroing, and ALL tables use every labelled row.
-    # Never feasible in some tables and not others.
+    # Feasibility = a security held in ALL seq_len quarters, so "sell" is a feasible action.
+    # TWO INDEPENDENT switches (they used to be coupled, which was wrong):
+    #
+    #   enforce_sell_feasibility (default TRUE): _train_predict zeroes the sell probability
+    #     for infeasible rows and renormalises over {hold, buy}. This is a PREDICTION
+    #     constraint applied on the FULL sample -- it never drops any row. Empirically very
+    #     useful (a security you have not held for the whole window cannot be "sold"), so it
+    #     is on by default and independent of any sample restriction.
+    #
+    #   feasible_only (default FALSE): an EVALUATION sample restriction only. False -> every
+    #     table (precision, Table X prec, Table XI, Table XII) uses ALL labelled rows. True
+    #     -> those tables restrict to feasible rows. It does NOT touch the sell-zeroing.
+    enforce_sell_feasibility: bool = True
     feasible_only: bool = False
     # ---- rolling design (paper Fig 2) ----
     window_q: int = 28          # observation window
@@ -122,6 +144,17 @@ class Config:
     batch: int = 4096
     min_seq_per_fund: int = 120    # skip a fund-window with fewer train sequences
     min_train_global: int = 2000
+    # ---- per-bucket models (train + test a SEPARATE model per bucket) ----
+    # bucket_by: column to split samples on before training. None = one model (default).
+    #   "sum_abs_aw" -> collective active tilt on the security that quarter,
+    #   sum_abs_aw = sum_funds |w_fund - w_capweight|, aggregated per (security, quarter)
+    #   (mirrors wrds_pull/own_disp). Computed here if absent; look-ahead-safe (uses only
+    #   quarter-t holdings). Any other PRESENT column is used as-is.
+    # Samples are bucketed by PER-QUARTER quantile of bucket_by (n_buckets), then each
+    # bucket gets its own LSTM trained + tested only on that bucket -- never pooled training.
+    bucket_by: str = None
+    n_buckets: int = 5
+    min_train_bucket: int = 500    # skip a (window,bucket) with fewer train sequences
     device: str = "auto"           # "auto" | "cpu" | "cuda"
     seed: int = 42
     # ---- CPU performance / memory ----
@@ -171,6 +204,42 @@ def _dense_ffill(agg, keycol, allq):
     keys_u = agg.index.get_level_values(keycol).unique()
     idx = pd.MultiIndex.from_product([keys_u, allq], names=[keycol, "yq"])
     return agg.reindex(idx).groupby(level=keycol).ffill()
+
+
+def _chg_scale(chg, cfg):
+    """Units of the raw chg_pct column: 'fraction' (0.05) vs 'percent' (5.0).
+    Detected from the median absolute nonzero value unless cfg pins it."""
+    scale = getattr(cfg, "target_pct_scale", "auto")
+    if scale == "auto":
+        nz = chg[chg.abs() > 1e-9].abs()
+        med = float(nz.median()) if len(nz) else np.nan
+        scale = "percent" if (np.isfinite(med) and med > 1.5) else "fraction"
+    return scale
+
+
+def _sum_abs_aw(df):
+    """sum_abs_aw per (security, yq): collective active tilt on a name that quarter
+    (mirrors wrds_pull/own_disp). active_weight of fund i in security s =
+    w_fund - w_capweight = pv/sum_fund_pv - mc/sum_fund_mc (each normalised over the
+    fund's own book, so it sums to zero within a fund-quarter). sum_abs_aw = sum over
+    holders of |active_weight|. Uses only quarter-t holdings -> observable at t, no
+    look-ahead. Returns a Series aligned to df.index."""
+    pv = df["position_value"].astype("float64")
+    mc = df["market_cap"].astype("float64")
+    gf = df.groupby(["fund", "yq"], observed=True)
+    aw = (pv / gf["position_value"].transform("sum")
+          - mc / gf["market_cap"].transform("sum")).abs()
+    saw = aw.groupby([df["security"].to_numpy(), df["yq"].to_numpy()]).transform("sum")
+    return pd.Series(saw.to_numpy(), index=df.index)
+
+
+def _per_quarter_bucket(val, yq, n):
+    """Look-ahead-safe bucket id 0..n-1: within EACH quarter's cross-section only, rank
+    `val` and cut into n equal-count groups. Each quarter is bucketed on its own data
+    (known at t), so no future information leaks. NaN val -> NaN bucket (excluded)."""
+    r = val.groupby(yq).rank(pct=True, method="first")     # per-quarter percentile in (0,1]
+    b = np.ceil(r * n) - 1.0
+    return b.clip(lower=0, upper=n - 1)
 
 
 # ============================================================ DATA + FEATURES
@@ -227,6 +296,24 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     for c in raw_num:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
             else np.array(np.nan, dtype=F32)
+    # ---- PREFILTER: next-quarter position info MISSING (chg_pct == -100%) --------------
+    # Not a genuine full exit: the position is simply absent from the file next quarter, so
+    # a "sell" label would be fabricated. Dropped HERE -- before sorting, lags, weights,
+    # peer rates and active-weight aggregation -- so these rows never touch the panel.
+    if cfg.drop_missing_position and "chg_pct" in df.columns and df["chg_pct"].notna().any():
+        _chg = pd.to_numeric(df["chg_pct"], errors="coerce").astype("float64")
+        _scale = _chg_scale(_chg, cfg)
+        _frac = _chg / 100.0 if _scale == "percent" else _chg
+        bad = ((_frac - cfg.missing_position_value).abs() < 1e-6).to_numpy()
+        before = len(df)
+        df = df[~bad]
+        print(f"[data] prefilter: dropped {int(bad.sum()):,} rows "
+              f"({bad.mean():.1%}) with chg_pct == {cfg.missing_position_value:.0%} "
+              f"(units detected: {_scale}) -- position info missing next quarter, not a "
+              f"real sell. {before:,} -> {len(df):,} rows")
+        if len(df) == 0:
+            raise ValueError("prefilter removed every row -- check missing_position_value / units")
+
     df = df.sort_values(["fund", "security", "yq"]).reset_index(drop=True)
     keys = ["fund", "security"]
 
@@ -282,14 +369,24 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
                 and "chg_pct" in df.columns and df["chg_pct"].notna().any())
     if _use_chg:
         chg = df["chg_pct"].astype("float64")
-        scale = cfg.target_pct_scale
-        if scale == "auto":
-            med = float(chg[chg.abs() > 1e-9].abs().median())
-            scale = "percent" if (np.isfinite(med) and med > 1.5) else "fraction"
+        scale = _chg_scale(chg, cfg)
         if scale == "percent":
             chg = chg / 100.0                      # -> fraction, so change_band is a fraction
         print(f"[data] target from future_1q_shares_change_pct (units detected: {scale})")
         dsh = chg
+        # strictness check: is chg_pct really a t -> t+1 change (not spanning a gap)?
+        sh_next = _shift_exact(df, keys, "shares", -1)       # shares at EXACT t+1 (else NaN)
+        has_tp1 = sh_next.notna().to_numpy()
+        absent = (~has_tp1) & df["shares"].notna().to_numpy() & df["chg_pct"].notna().to_numpy()
+        exit_like = (float(np.mean(np.abs(dsh.to_numpy()[absent] + 1.0) < 0.05))
+                     if absent.sum() else 1.0)
+        print(f"[data] target strictness: {has_tp1.mean():.1%} of rows have an exact t+1 obs; "
+              f"of {int(absent.sum()):,} absent at t+1, {exit_like:.0%} look like full exits "
+              f"(chg=-100%). Low % => your chg_pct may span gaps (not strictly 1-quarter).")
+        if getattr(cfg, "target_strict_next", False):        # enforce: absent at t+1 -> sell
+            dsh = dsh.copy(); dsh[~has_tp1] = -1.0
+            print("[data] target_strict_next=True -> forced 'sell' where the exact t+1 obs "
+                  "is absent (position exited). Do NOT use with a max_rank filter.")
     else:
         sh_next = _shift_exact(df, keys, "shares", -1)     # exact t+1 only
         dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
@@ -367,11 +464,27 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     df["qi"] = df["yq"].map({q: i for i, q in enumerate(qs)}).astype("int32")
     df["held"] = np.int8(1)
 
+    # per-bucket support: a sample's bucket = per-quarter quantile of `bucket_by` at its
+    # label quarter t (look-ahead-safe). Compute sum_abs_aw here if requested and absent.
+    bcol = cfg.bucket_by
+    if bcol:
+        if bcol in df.columns:
+            bval = df[bcol].astype("float64")
+        elif bcol == "sum_abs_aw":
+            bval = _sum_abs_aw(df)
+        else:
+            raise ValueError(f"bucket_by={bcol!r} not in data and not computable "
+                             "(only 'sum_abs_aw' is auto-computed)")
+        df["_bkt"] = _per_quarter_bucket(bval, df["yq"], cfg.n_buckets).astype("float32")
+        nb = df.loc[df["Y"].notna(), "_bkt"]
+        print(f"[data] bucket_by={bcol} -> {cfg.n_buckets} per-quarter buckets | "
+              f"labelled-row counts: {nb.value_counts(dropna=False).sort_index().to_dict()}")
+
     # (c) PRUNE IN PLACE to only what's needed (no big .copy()). Everything already float32.
     feat = [f for f in cfg.features if f in df.columns]
     df.drop(columns=["qi_tmp"], inplace=True, errors="ignore")
     keep = set(["fund", "security", "yq", "qi", "held", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
-                "inv_type", "weight", "rank"] + feat)
+                "inv_type", "weight", "rank"] + (["_bkt"] if bcol else []) + feat)
     df.drop(columns=[c for c in df.columns if c not in keep], inplace=True)
     if cfg.downcast:
         df["fund"] = df["fund"].astype("category")
@@ -410,7 +523,7 @@ def build_sequences(sub: pd.DataFrame, feat_cols: List[str], seq_len: int):
     feasible = mask.all(axis=1)
     y = (sub["Y"].values[valid] + 1).astype(np.int64)          # {-1,0,1} -> {0,1,2}
     mcols = [c for c in ["fund", "security", "yq", "qi", "Y", "fwd_1q", "fwd_2q", "fwd_3q",
-                         "inv_type", "weight", "rank"] if c in sub.columns]
+                         "inv_type", "weight", "rank", "_bkt"] if c in sub.columns]
     meta = sub.loc[valid, mcols].reset_index(drop=True)
     return X, mask, y, feasible, meta
 
@@ -497,9 +610,11 @@ def _train_predict(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev):
             chunks.append(torch.softmax(model(Xt[bi].to(dev), mt[bi].to(dev)), 1).cpu().numpy())
     P = np.concatenate(chunks) if chunks else np.zeros((0, 3))
     m = meta.iloc[te_i].copy()
-    if cfg.feasible_only:                       # prohibit "sell" for infeasible securities
-        infeas = ~feas[te_i]
-        P[infeas, 0] = 0.0; P = P / P.sum(1, keepdims=True)
+    if cfg.enforce_sell_feasibility:            # prohibit "sell" for infeasible securities
+        infeas = ~feas[te_i]                    # (full sample -- a prediction constraint,
+        P[infeas, 0] = 0.0                      #  NOT a sample drop)
+        s = P.sum(1, keepdims=True); s[s == 0] = 1.0
+        P = P / s
     m["p_sell"], m["p_hold"], m["p_buy"] = P[:, 0], P[:, 1], P[:, 2]
     m["y_pred"] = P.argmax(1) - 1
     m["feasible"] = feas[te_i]
@@ -564,16 +679,39 @@ def _fund_task(fund, fp, feat, cfg, dev="cpu"):
             continue
         n_sec = int(meta.loc[te, "security"].nunique())
         hidden = int(np.clip(n_sec, 16, cfg.hidden_cap))
-        out = _train_predict(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev)
-        if out is not None:
-            outs.append(out)
+        outs += _fit_bucketed(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev)
+    return outs
+
+
+def _fit_bucketed(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev):
+    """Train ONE model on (tr,te) -- or, when cfg.bucket_by is set, a SEPARATE model per
+    bucket: for each bucket b, restrict BOTH train and test to samples whose label-quarter
+    bucket == b, so training and testing never mix buckets. Returns a list of prediction
+    frames (tagged with `bucket`)."""
+    if not cfg.bucket_by or "_bkt" not in meta.columns:
+        o = _train_predict(X, mask, y, feas, meta, tr, te, F, hidden, cfg, dev)
+        return [o] if o is not None else []
+    bk = meta["_bkt"].to_numpy()
+    outs = []
+    for b in range(cfg.n_buckets):
+        mb = bk == b
+        trb, teb = tr & mb, te & mb
+        if int(trb.sum()) < cfg.min_train_bucket or int(teb.sum()) == 0:
+            continue
+        o = _train_predict(X, mask, y, feas, meta, trb, teb, F, hidden, cfg, dev)
+        if o is not None:
+            o["bucket"] = int(b)
+            outs.append(o)
     return outs
 
 
 def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
     """Walk-forward training. `global` = one shared model per window (batched,
     memory-heavier); `per_fund` = one model per fund, funds parallelised across
-    cores (CPU-friendly, low memory). Returns pooled OOS predictions."""
+    cores (CPU-friendly, low memory). Returns pooled OOS predictions.
+
+    When cfg.bucket_by is set, each window trains a SEPARATE model per bucket (predictions
+    carry a `bucket` column) -- never one pooled model."""
     import os as _os
     import torch
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
@@ -599,12 +737,13 @@ def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
             te = ((meta["qi"] >= te_lo) & (meta["qi"] < te_hi)).values
             if tr.sum() < cfg.min_train_global or te.sum() == 0:
                 continue
-            out = _train_predict(X, mask, y, feas, meta, tr, te, F, cfg.hidden, cfg, dev)
-            if out is not None:
+            for out in _fit_bucketed(X, mask, y, feas, meta, tr, te, F, cfg.hidden, cfg, dev):
                 preds.append(out)
                 if verbose:
                     acc = (out.loc[out.feasible, "y_pred"] == out.loc[out.feasible, "Y"]).mean()
-                    print(f"  win {wi+1} test qi[{te_lo},{te_hi}) n_te={int(te.sum()):,} feas_acc={acc:.3f}")
+                    btag = f" b{int(out['bucket'].iloc[0])}" if "bucket" in out.columns else ""
+                    print(f"  win {wi+1}{btag} test qi[{te_lo},{te_hi}) "
+                          f"n_te={int(len(out)):,} feas_acc={acc:.3f}")
     else:  # per_fund  (funds are independent)
         n_funds = int(panel["fund"].nunique())
         njobs = ncore if cfg.n_jobs in (-1, 0) else cfg.n_jobs
@@ -696,8 +835,9 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
            for c in ("fwd_1q", "fwd_2q", "fwd_3q")}
     ret_col, lag = _resolve_eval(cfg, has)
     P["_ret"] = P[ret_col]
-    # ONE feasibility switch -> the row set used for EVERY accuracy quantity (precision,
-    # Table X prec, Table XI, Table XII). Never feasible in some tables and not others.
+    # feasible_only is an EVALUATION sample restriction ONLY (the sell-zeroing prediction
+    # constraint is separate; see enforce_sell_feasibility). False (default) -> every table
+    # uses all labelled rows; True -> restrict to feasible rows. Applied to ALL tables alike.
     E = P[P["feasible"]] if cfg.feasible_only else P
     m = {}
     m["lstm_precision_pooled"] = float((E.y_pred == E.Y).mean())
@@ -710,6 +850,10 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["n_predictions"] = int(len(P)); m["n_used"] = int(len(E))
     m["n_feasible"] = int(P["feasible"].sum()); m["n_funds"] = int(E.fund.nunique())
     m["eval_mode"] = cfg.eval_mode; m["eval_return"] = ret_col; m["eval_sort_lag"] = lag
+    if "bucket" in E.columns:                    # per-bucket precision (samples were trained
+        m["bucket_precision"] = {int(b): float((g.y_pred == g.Y).mean())   # separately)
+                                 for b, g in E.groupby("bucket")}
+        m["enforce_sell_feasibility"] = cfg.enforce_sell_feasibility
 
     def xsq(s):
         v = s.dropna()
@@ -810,6 +954,20 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
     m["_fund_prec"] = fp                              # for the distribution figure
 
     return m, {"tableX": tableX, "tableXI": tableXI, "tableXII": tableXII}
+
+
+def evaluate_by_bucket(preds: pd.DataFrame, cfg: Config):
+    """Run the full evaluation SEPARATELY on each bucket's predictions (each bucket was
+    trained + tested by its own model), plus the pooled result. Returns
+    {'pooled': metrics, 0: metrics_b0, 1: ...}. Use after run() when bucket_by is set."""
+    out = {"pooled": evaluate(preds, cfg)[0]}
+    if "bucket" in preds.columns:
+        for b, g in preds.groupby("bucket"):
+            try:
+                out[int(b)] = evaluate(g, cfg)[0]
+            except Exception as e:
+                out[int(b)] = {"error": str(e), "n": int(len(g))}
+    return out
 
 
 def run_rank_sweep(cfg: Config = None, ranks=(10, 25), verbose=True):

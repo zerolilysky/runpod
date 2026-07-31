@@ -127,12 +127,32 @@ class Config:
     change_band: float = 0.01   # +-1% dead-band around zero share change (FRACTION units)
     target_pct_scale: str = "auto"   # units of future_1q_shares_change_pct: auto|fraction|percent
     # ONE feasibility switch, applied CONSISTENTLY to every accuracy quantity (precision,
-    # Table X prec, Table XI, Table XII) and to the sell-zeroing in prediction.
-    # False -> no sell-zeroing, all tables use every labelled row. True -> feasible-only everywhere.
+    # TWO INDEPENDENT feasibility switches (they used to be coupled):
+    #   enforce_sell_feasibility (default TRUE): zero the sell prob for infeasible securities
+    #     and renormalise -- a PREDICTION constraint on the FULL sample, never drops a row.
+    #   feasible_only (default FALSE): EVALUATION sample restriction only (tables drop
+    #     infeasible rows when True). Does not touch the sell-zeroing.
+    enforce_sell_feasibility: bool = True
     feasible_only: bool = False
+    # ---- per-bucket models (see pipeline.py) ----  v2's joint (T,N,F) panel cannot be
+    # split by security cleanly, so per-bucket training is implemented in pipeline.py (v1).
+    # These fields exist for drop-in config compatibility; bucket_by!=None raises in v2.
+    bucket_by: str = None
+    n_buckets: int = 5
+    min_train_bucket: int = 500
     # "auto"/"chg_pct" = target from future_1q_shares_change_pct if present; "shares" = force
     # the old shares[t+1]-shares[t] label (exact t+1). Use to A/B the target change.
     target_source: str = "auto"
+    # PREFILTER: chg_pct == -100% (fraction -1.0) means the position is simply ABSENT from
+    # the file next quarter (position info missing), NOT a real full exit -- labelling it
+    # "sell" fabricates the class. Dropped before any feature/weight/peer/aw aggregation.
+    # Matched on the normalised fraction, so fraction (-1.0) and percent (-100.0) both work.
+    drop_missing_position: bool = True
+    missing_position_value: float = -1.0    # fraction units: -1.0 == -100%
+    # Strict next-quarter target. chg_pct is trusted to be a t->t+1 change (a diagnostic
+    # always reports whether it is). True -> enforce: a position absent at the exact t+1 is
+    # a full exit -> "sell". Only sound when the panel is NOT rank-filtered.
+    target_strict_next: bool = False
     # Fill for a missing prior quarter in lag features (sh_lag*, w_lag1, pdsh, pdsh_lag1).
     # "ffill" (default) = forward-fill the last-known level across the gap (a level should
     # persist, not reset). "zero" = old exact-quarter -> NaN -> 0-spike (distorts; A/B only).
@@ -205,6 +225,16 @@ def _shift_exact(df, keys, col, k, qcol="yq"):
     return v.where(q == df[qcol] - k)
 
 
+def _chg_scale(chg, cfg):
+    """Units of the raw chg_pct column: 'fraction' (0.05) vs 'percent' (5.0)."""
+    scale = getattr(cfg, "target_pct_scale", "auto")
+    if scale == "auto":
+        nz = chg[chg.abs() > 1e-9].abs()
+        med = float(nz.median()) if len(nz) else np.nan
+        scale = "percent" if (np.isfinite(med) and med > 1.5) else "fraction"
+    return scale
+
+
 def _at_prev_quarter(df, keys, series_by_key_q, k=1):
     """Look up `series_by_key_q` (indexed by keys+quarter) at (keys, yq - k) per row.
     Exact-quarter, gap-safe. Use k<0 to look FORWARD (yq + |k|)."""
@@ -269,6 +299,22 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
     for c in raw_num:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype(F32) if c in df.columns \
             else np.array(np.nan, dtype=F32)
+    # ---- PREFILTER: next-quarter position info MISSING (chg_pct == -100%) --------------
+    # Not a real full exit -- the position is absent from the file next quarter, so a "sell"
+    # label would be fabricated. Dropped BEFORE sorting/lags/weights/peer rates/aw.
+    if cfg.drop_missing_position and "chg_pct" in df.columns and df["chg_pct"].notna().any():
+        _chg = pd.to_numeric(df["chg_pct"], errors="coerce").astype("float64")
+        _scale = _chg_scale(_chg, cfg)
+        _frac = _chg / 100.0 if _scale == "percent" else _chg
+        bad = ((_frac - cfg.missing_position_value).abs() < 1e-6).to_numpy()
+        before = len(df)
+        df = df[~bad]
+        print(f"[data] prefilter: dropped {int(bad.sum()):,} rows ({bad.mean():.1%}) with "
+              f"chg_pct == {cfg.missing_position_value:.0%} (units: {_scale}) -- position "
+              f"info missing next quarter, not a real sell. {before:,} -> {len(df):,} rows")
+        if len(df) == 0:
+            raise ValueError("prefilter removed every row -- check missing_position_value / units")
+
     df = df.sort_values(["fund", "security", "yq"]).reset_index(drop=True)
     keys = ["fund", "security"]
 
@@ -311,14 +357,23 @@ def load_and_prepare(cfg: Config) -> pd.DataFrame:
                 and "chg_pct" in df.columns and df["chg_pct"].notna().any())
     if _use_chg:
         chg = df["chg_pct"].astype("float64")
-        scale = cfg.target_pct_scale
-        if scale == "auto":
-            med = float(chg[chg.abs() > 1e-9].abs().median())
-            scale = "percent" if (np.isfinite(med) and med > 1.5) else "fraction"
+        scale = _chg_scale(chg, cfg)
         if scale == "percent":
             chg = chg / 100.0
         print(f"[data] target from future_1q_shares_change_pct (units detected: {scale})")
         dsh = chg
+        sh_next = _shift_exact(df, keys, "shares", -1)       # shares at EXACT t+1 (else NaN)
+        has_tp1 = sh_next.notna().to_numpy()
+        absent = (~has_tp1) & df["shares"].notna().to_numpy() & df["chg_pct"].notna().to_numpy()
+        exit_like = (float(np.mean(np.abs(dsh.to_numpy()[absent] + 1.0) < 0.05))
+                     if absent.sum() else 1.0)
+        print(f"[data] target strictness: {has_tp1.mean():.1%} of rows have an exact t+1 obs; "
+              f"of {int(absent.sum()):,} absent at t+1, {exit_like:.0%} look like full exits "
+              f"(chg=-100%). Low % => your chg_pct may span gaps (not strictly 1-quarter).")
+        if getattr(cfg, "target_strict_next", False):
+            dsh = dsh.copy(); dsh[~has_tp1] = -1.0
+            print("[data] target_strict_next=True -> forced 'sell' where the exact t+1 obs "
+                  "is absent. Do NOT use with a max_rank filter.")
     else:
         sh_next = _shift_exact(df, keys, "shares", -1)
         dsh = (sh_next - df["shares"]) / (df["shares"].abs() + 1.0)
@@ -584,9 +639,10 @@ def _train_predict(X, hs, step_mask, feas, y, labs, sec_lab, cats, fund_arr, tr,
     rows = []
     for k, s in enumerate(te_i):
         p = P[k].copy()
-        if cfg.feasible_only:                 # prohibit "sell" for infeasible securities
-            p[~feas[s], 0] = 0.0
-            p = p / p.sum(1, keepdims=True)
+        if cfg.enforce_sell_feasibility:      # prohibit "sell" for infeasible securities
+            p[~feas[s], 0] = 0.0              # (full sample -- a prediction constraint)
+            ps = p.sum(1, keepdims=True); ps[ps == 0] = 1.0
+            p = p / ps
         valid = np.where((y[s] >= 0) & (sec_lab[s] >= 0))[0]
         if valid.size == 0:
             continue
@@ -683,6 +739,12 @@ def run_model(panel: pd.DataFrame, cfg: Config, verbose=True):
     fund-window (paper); `global` = one PanelLSTM per window pooled across funds
     (possible because N is fixed at the template width). Returns OOS predictions."""
     import torch
+    if cfg.bucket_by:
+        raise NotImplementedError(
+            "per-bucket training (bucket_by) is not supported in pipeline_v2: its joint "
+            "(T, N, F) panel spans all securities at once and a security's bucket varies by "
+            "quarter, so buckets cannot be separated cleanly. Use pipeline.py (v1) for "
+            "per-bucket models -- it trains a separate weight-shared per-security LSTM per bucket.")
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
     dev = _device(cfg)
     feat = [f for f in cfg.features if f in panel.columns]
@@ -772,7 +834,8 @@ def evaluate(preds: pd.DataFrame, cfg: Config):
            for c in ("fwd_1q", "fwd_2q", "fwd_3q")}
     ret_col, lag = _resolve_eval(cfg, has)
     P["_ret"] = P[ret_col]
-    # ONE feasibility switch -> the row set used for EVERY accuracy quantity.
+    # feasible_only is an EVALUATION sample restriction ONLY (sell-zeroing is separate; see
+    # enforce_sell_feasibility). False (default) -> all labelled rows; True -> feasible rows.
     E = P[P["feasible"]] if cfg.feasible_only else P
     m = {}
     m["lstm_precision_pooled"] = float((E.y_pred == E.Y).mean())
