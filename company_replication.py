@@ -1,56 +1,54 @@
-"""company_replication.py -- Mimicking Finance replication on a single holdings parquet.
+"""company_replication.py -- replication of the fund-manager trade-prediction paper.
 
-No WRDS needed. Produces three sets of results:
+Runs off a single holdings parquet. Three families of results, all out-of-sample:
 
-  1. PRECISION   accuracy on real positions, AND precision after counting the paper's
-                 PADDED template slots (the paper's 0.71 / 0.52 are reproduced only when
-                 padded slots are scored).
-  2. TABLE X     funds sorted into quintiles on predictability -> cumulative abnormal
-                 returns CRET_{0,1..4}.  Paper: Q1 +0.36 / Q5 -0.42 / Q5-Q1 -0.79 (t=-3.05)
-                 Reported under TWO holding conventions:
-                   actual  -- each quarter uses that quarter's reported holdings
-                   frozen  -- weights locked at t, buy-and-hold (isolates stock picking)
-  3. TABLE XII   stocks sorted on cross-fund prediction accuracy -> Q1-Q5.
-                 Paper: +1.06%/qtr (t=5.74)
+  1. PREDICTION ACCURACY
+     How often the model gets a manager's next-quarter trade direction right, on the real
+     positions -- and again after counting the paper's PADDED template slots, which is what
+     the paper's headline 0.71 / naive 0.52 appear to measure.
 
-Every result is reported under all three timing conventions; `Config.eval_timing` picks
-which one the HEADLINE lines use (default "predictive"):
-  contemporaneous  acc(t) x t->t+1     OVERLAPS the measurement window; biased benchmark
-  predictive       acc(t) x t+1->t+2   no overlap; ignores the 13F filing delay  [DEFAULT]
-  tradeable        acc(t) x t+2->t+3   also clears the 45-60 day delay
+  2. FUND-LEVEL SORT   (the paper calls this Table X)
+     `fund_sort_returns` / `fund_sort_returns_frozen`
+     Funds are ranked each quarter by how predictable their trades were, then their future
+     cumulative abnormal returns CRET_{0,1..4} are compared across quintiles.
+     Paper: Q1 +0.36 / Q5 -0.42 / Q5-Q1 -0.79 (t=-3.05), i.e. LESS predictable managers
+     subsequently do better.
 
-KEY SWITCH `use_manager_memory`
--------------------------------
-Manager-memory features (expanding fund / fund-security trade rates) raise accuracy from
-~0.53 to ~0.58, but they quietly redefine "predictable" as "this manager never touches this
-position". Low-turnover funds outperform historically, so Table X FLIPS SIGN.
+  3. STOCK-LEVEL SORT  (the paper calls this Table XII)
+     `stock_sort_stock_returns`   stocks ranked by cross-fund prediction accuracy -> the
+                                  STOCK's own future return.  Paper: Q1-Q5 +1.06 (t=5.74)
+     `stock_sort_holder_returns`  same ranking, but scored by the future returns of the
+                                  FUNDS holding each stock. Not in the paper -- an extension.
 
-    use_manager_memory=False -> Q5-Q1 = -0.66 (t=-3.20)  ~ paper -0.79 (t=-3.05)   OK
-    use_manager_memory=True  -> Q5-Q1 = +0.12 (t=+0.82)  wrong sign                NO
+TWO HOLDING CONVENTIONS (fund-level results are reported both ways)
+  actual  each quarter uses that quarter's reported holdings -> includes the contribution
+          of subsequent rebalancing
+  frozen  weights locked at t, every stock compounds on its own (buy and hold) -> measures
+          only the portfolio held at t
+  The gap between them is the rebalancing contribution.
 
-Use False to replicate the paper. True is kept only to demonstrate that raising accuracy
-can destroy the economic content.
+THREE TIMING CONVENTIONS (everything is reported under all three)
+  accuracy(t) answers "did we predict the t -> t+1 trade right?", which needs shares[t+1]:
+  knowable only at t+1, and public only after the ~45-60 day filing delay.
+    contemporaneous  accuracy(t) x return t   -> t+1   OVERLAPS its own window; biased
+    predictive       accuracy(t) x return t+1 -> t+2   no overlap; ignores the filing delay
+    tradeable        accuracy(t) x return t+2 -> t+3   also clears the delay
+  `Config.eval_timing` picks which one the headline lines print (default "predictive").
 
-Verified on real WRDS data (10.9M rows, 12,321 funds, 2010-2024, InvTypeCode 401):
-    precision real positions   0.5755 (gbm) / 0.5291 (lstm)
-    precision incl. padding    0.7156          [paper 0.71]
-    naive     incl. padding    0.5208          [paper 0.52]
-    Table X Q5-Q1 tradeable    -0.660 (gbm) / -0.657 (lstm)   [paper -0.79]
-                               (measured under "tradeable"; "predictive" is the default here)
-    Table XII Q1-Q5 contemp.   +1.213                          [paper +1.06]
+ABLATION: `use_manager_memory`
+  Adds expanding fund / fund-security historical trade rates. These usually raise accuracy,
+  but they change what "predictable" means -- a manager who never trades becomes trivially
+  predictable. Whether that matters for the return sorts is an empirical question, so both
+  settings are run and compared rather than assumed.
 
-Usage
------
-    import company_replication as R
-    cfg = R.Config(data_path="your.parquet")
-    panel = R.load_and_prepare(cfg)
-    res = R.run_config(panel, cfg, "A")
+t-statistics are Newey-West (lags = h-1) because CRET_{0,h} windows overlap; plain OLS
+values are reported alongside as `t{h}_ols`.
 """
 from __future__ import annotations
 
 # Bump when Config gains/loses a field. A stale copy on another machine then fails with a
 # clear message instead of "unexpected keyword argument".
-__version__ = "2026.08.03.1"
+__version__ = "2026.08.03.3"
 REQUIRED_FIELDS = ("eval_timing", "enforce_sell_feasibility", "feasibility_mode",
                    "feasible_only", "use_manager_memory", "model")
 
@@ -877,7 +875,7 @@ def precision_report(P: pd.DataFrame, cfg: Config):
 _TIMING = {"contemporaneous": 0, "predictive": 1, "tradeable": 2}
 
 
-def table_x_frozen(P: pd.DataFrame, cfg: Config, timing=None, hmax=4,
+def fund_sort_returns_frozen(P: pd.DataFrame, cfg: Config, timing=None, hmax=4,
                    sort_var="precision"):
     """CRET_{0,h} with holdings FROZEN at t (buy and hold), not following the fund's
     actual rebalancing.
@@ -944,7 +942,7 @@ def table_x_frozen(P: pd.DataFrame, cfg: Config, timing=None, hmax=4,
     return pd.DataFrame(rows_out)
 
 
-def table_x(P: pd.DataFrame, cfg: Config, timing=None, hmax=4,
+def fund_sort_returns(P: pd.DataFrame, cfg: Config, timing=None, hmax=4,
             sort_var="precision"):
     """Funds in precision quintiles -> CRET_{0,1..hmax}. `start` is set by the timing.
 
@@ -1001,7 +999,7 @@ def table_x(P: pd.DataFrame, cfg: Config, timing=None, hmax=4,
 
 
 # ============================================================ 3. Table XII
-def table_xii(P: pd.DataFrame, cfg: Config, timing=None):
+def stock_sort_stock_returns(P: pd.DataFrame, cfg: Config, timing=None):
     timing = timing or getattr(cfg, "eval_timing", "predictive")
     col = {"contemporaneous": "fwd_1q", "predictive": "fwd_2q", "tradeable": "fwd_3q"}[timing]
     if col not in P.columns or P[col].notna().sum() == 0:
@@ -1018,6 +1016,80 @@ def table_xii(P: pd.DataFrame, cfg: Config, timing=None):
     ls = (per[per.columns.min()] - per[per.columns.max()]).dropna()
     rows.append({"quintile": "Q1-Q5", "mean_qret": ls.mean() * 100, "t": _t(ls)})
     return pd.DataFrame(rows)
+
+
+def stock_sort_holder_returns(P: pd.DataFrame, cfg: Config, timing=None, hmax=4, frozen=False):
+    """Table XII sorted on stock predictability, but measuring the HOLDERS' returns.
+
+    Table XII proper asks: do hard-to-predict STOCKS earn more? (stock return)
+    This asks instead: are hard-to-predict stocks held by better-performing FUNDS?
+    The paper does neither -- it never links a stock's predictability to the performance of
+    the managers trading it -- so this is an extension, not a replication target.
+
+        acc(s,t)      cross-fund share of correct predictions in stock s at t  [the sort]
+        holder_ret    weighted mean of the CRET_{0,h} of every fund holding s at t,
+                      weighted by that fund's portfolio weight in s
+
+    A positive Q1-Q5 means the stocks whose trades we predict WORST are held by funds that
+    subsequently outperform -- consistent with the paper's fund-level story (unpredictable
+    managers do better) showing up in the securities they trade.
+
+    frozen=False uses each fund's actual rebalanced returns; frozen=True locks weights at t.
+    """
+    timing = timing or getattr(cfg, "eval_timing", "predictive")
+    start = _TIMING[timing]
+    P = P.copy()
+    P["correct"] = (P.y_pred == P.Y).astype(float)
+
+    # ---- fund-quarter CRET_{0,hmax}, same construction as Table X ----
+    if frozen:
+        sret = P.groupby(["security", "qi"], observed=True)["fwd_1q"].mean()
+        sec = P["security"].to_numpy(); qi = P["qi"].to_numpy()
+        comp = np.ones(len(P)); good = np.ones(len(P), bool)
+        for j in range(hmax):
+            r = sret.reindex(pd.MultiIndex.from_arrays([sec, qi + start + j])).to_numpy()
+            m = pd.isna(r); good &= ~m; comp = comp * (1.0 + np.where(m, 0.0, r))
+        P["_c"] = np.where(good, comp - 1.0, np.nan)
+        d = P[P["_c"].notna() & P["weight"].notna()]
+        fq = d.assign(wc=d["weight"] * d["_c"]).groupby(
+            ["fund", "qi"], observed=True).agg(wsum=("weight", "sum"), wc=("wc", "sum")).reset_index()
+        fq["v"] = fq["wc"] / fq["wsum"].where(fq["wsum"] > 0)
+        fq["cabn"] = fq["v"] - fq.groupby("qi")["v"].transform("mean")
+    else:
+        ok = P["fwd_1q"].notna() & P["weight"].notna()
+        fq = P[ok].assign(wc=P["weight"] * P["fwd_1q"]).groupby(
+            ["fund", "qi"], observed=True).agg(wsum=("weight", "sum"), wc=("wc", "sum")).reset_index()
+        fq["fr"] = fq["wc"] / fq["wsum"].where(fq["wsum"] > 0)
+        fq["abn"] = fq["fr"] - fq.groupby("qi")["fr"].transform("mean")
+        lut = fq.set_index(["fund", "qi"])["abn"]
+        tot = np.zeros(len(fq)); good = np.ones(len(fq), bool)
+        for j in range(hmax):
+            a = lut.reindex(pd.MultiIndex.from_arrays(
+                [fq["fund"].to_numpy(), fq["qi"].to_numpy() + start + j])).to_numpy()
+            m = pd.isna(a); good &= ~m; tot = tot + np.where(m, 0.0, a)
+        fq["cabn"] = np.where(good, tot, np.nan)
+
+    # ---- attach each holder's CRET back to its (security, quarter) rows ----
+    Q = P.merge(fq[["fund", "qi", "cabn"]], on=["fund", "qi"], how="left")
+    Q = Q[Q["cabn"].notna() & Q["weight"].notna()]
+    stk = Q.assign(wc=Q["weight"] * Q["cabn"]).groupby(
+        ["security", "qi"], observed=True).agg(
+        acc=("correct", "mean"), wsum=("weight", "sum"), wc=("wc", "sum"),
+        n_holders=("fund", "size")).reset_index()
+    stk["holder_ret"] = stk["wc"] / stk["wsum"].where(stk["wsum"] > 0)
+    stk = stk.dropna(subset=["holder_ret", "acc"])
+    stk["Q"] = stk.groupby("qi")["acc"].transform(_q5)
+    stk = stk.dropna(subset=["Q"])
+    per = stk.groupby(["qi", "Q"])["holder_ret"].mean().unstack()
+    rows = [{"quintile": f"Q{int(q)}", "holder_CRET": per[q].mean() * 100,
+             "t": _t(per[q], lags=hmax - 1), "t_ols": _t(per[q])}
+            for q in sorted(per.columns)]
+    ls = (per[per.columns.min()] - per[per.columns.max()]).dropna()
+    rows.append({"quintile": "Q1-Q5", "holder_CRET": ls.mean() * 100,
+                 "t": _t(ls, lags=hmax - 1), "t_ols": _t(ls)})
+    out = pd.DataFrame(rows)
+    out.attrs["median_holders"] = float(stk["n_holders"].median())
+    return out
 
 
 def predictability_vs_turnover(P: pd.DataFrame, cfg: Config = None):
@@ -1112,6 +1184,13 @@ def fund_sort_var(P: pd.DataFrame, sort_var="precision") -> pd.Series:
     return g.loc[g["n"] >= 5, "v"].rename("prec")      # named `prec` for the table builders
 
 
+# ---- backwards-compatible aliases (older notebooks used the paper's table numbers) ----
+table_x = fund_sort_returns
+table_x_frozen = fund_sort_returns_frozen
+table_xii = stock_sort_stock_returns
+table_xii_holders = stock_sort_holder_returns
+
+
 # ============================================================ ONE CONFIGURATION
 def _restrict(P, cfg):
     """feasible_only: evaluate on the SAME rows the sell-constraint was applied to.
@@ -1135,29 +1214,49 @@ def run_config(panel: pd.DataFrame, cfg: Config, tag: str = "", verbose=True) ->
          # Table X on BOTH holding conventions: `tableX` follows the fund's actual
          # rebalancing, `tableX_frozen` locks weights at t (buy and hold). Their gap is
          # the contribution of subsequent trading.
-         "tableX": {t: table_x(P, cfg, t) for t in _TIMING},
-         "tableX_frozen": {t: table_x_frozen(P, cfg, t) for t in _TIMING},
-         "tableXII": {t: table_xii(P, cfg, t) for t in _TIMING}}
+         "fund_sort_actual": {t: fund_sort_returns(P, cfg, t) for t in _TIMING},
+         "fund_sort_frozen": {t: fund_sort_returns_frozen(P, cfg, t) for t in _TIMING},
+         "stock_sort_stock_ret": {t: stock_sort_stock_returns(P, cfg, t) for t in _TIMING},
+         # extension (not in the paper): stocks sorted on predictability, but scored by
+         # the returns of the FUNDS holding them, actual and frozen
+         "stock_sort_holder_ret_actual": {t: stock_sort_holder_returns(P, cfg, t)
+                                          for t in _TIMING},
+         "stock_sort_holder_ret_frozen": {t: stock_sort_holder_returns(P, cfg, t, frozen=True)
+                                          for t in _TIMING}}
+    # aliases so older cells keep working
+    r["tableX"] = r["fund_sort_actual"]; r["tableX_frozen"] = r["fund_sort_frozen"]
+    r["tableXII"] = r["stock_sort_stock_ret"]
+    r["tableXII_holders"] = r["stock_sort_holder_ret_actual"]
+    r["tableXII_holders_frozen"] = r["stock_sort_holder_ret_frozen"]
     r["turnover"], r["turnover_table"] = predictability_vs_turnover(P, cfg)
     hz = getattr(cfg, "eval_timing", "predictive")
-    tf = r["tableX_frozen"][hz].iloc[-1]
-    tx = r["tableX"][hz].iloc[-1]
-    t12 = r["tableXII"]["contemporaneous"].iloc[-1]
+    tf = r["fund_sort_frozen"][hz].iloc[-1]
+    tx = r["fund_sort_actual"][hz].iloc[-1]
+    t12 = r["stock_sort_stock_ret"]["contemporaneous"].iloc[-1]
     print(f"\n  accuracy (real positions) = {prec_m['accuracy']:.4f}   "
           f"naive = {prec_m['naive_pooled']:.4f}")
     print(f"  incl. padding (N={cfg.template_N}) precision = "
           f"{prec_tbl.iloc[2]['precision']:.4f}   naive = {prec_tbl.iloc[2]['naive']:.4f}"
           f"   [paper 0.71 / 0.52]")
-    print(f"  Table X  Q5-Q1 ({hz}, actual) = {tx.CRET_0_4:+.3f}% (t={tx.t4:+.2f})"
-          f"   [paper -0.79, t=-3.05]")
-    print(f"  Table X  Q5-Q1 ({hz}, frozen) = {tf.CRET_0_4:+.3f}% (t={tf.t4:+.2f})"
-          f"   [gap vs actual = rebalancing contribution]")
-    print(f"  Table XII Q1-Q5 (contemporaneous)= {t12.mean_qret:+.3f}% (t={t12.t:+.2f})"
+    # NOTE the exact cell: last row (Q5-Q1) x the CRET_0_4 column (4-QUARTER cumulation),
+    # under cfg.eval_timing only. The displayed table also carries CRET_0_1..0_3 and the
+    # other two timings, and those differ a lot -- CRET_0_1 and CRET_0_4 can even have
+    # opposite signs. Compare like with like.
+    print(f"  FUND sort  [row Q5-Q1, col CRET_0_4] ({hz}, actual) = {tx.CRET_0_4:+.3f}% "
+          f"(t_NW={tx.t4:+.2f}, t_OLS={tx.t4_ols:+.2f})   [paper -0.79, t=-3.05]")
+    print(f"  FUND sort  [row Q5-Q1, col CRET_0_4] ({hz}, frozen) = {tf.CRET_0_4:+.3f}% "
+          f"(t_NW={tf.t4:+.2f})   [gap vs actual = rebalancing contribution]")
+    print(f"           same row, shorter horizons ({hz}, actual): "
+          + "  ".join(f"CRET_0_{h}={tx[f'CRET_0_{h}']:+.3f}" for h in (1, 2, 3)))
+    print(f"  STOCK sort (stock return) Q1-Q5 (contemporaneous) = {t12.mean_qret:+.3f}% (t={t12.t:+.2f})"
           f"   [paper +1.06, t=5.74]")
+    th = r["stock_sort_holder_ret_actual"][hz].iloc[-1]
+    print(f"  STOCK sort (holders return) Q1-Q5 ({hz}) = {th.holder_CRET:+.3f}% (t={th.t:+.2f})"
+          f"   [extension, not in the paper]")
     tv = r["turnover"]
     print(f"  corr(precision, turnover) within-quarter = {tv['corr_within_quarter']:+.3f}"
           f"  (R2 {tv['r2_within_quarter']:.3f})"
-          f"   [strongly negative => precision is largely a turnover proxy]")
+          f"   [near zero => predictability and turnover measure different things]")
     return r
 
 
@@ -1199,24 +1298,24 @@ def summarize(results: dict) -> pd.DataFrame:
                              "accuracy": round(r["precision"]["accuracy"], 4),
                              "precision_with_padding": round(r["precision_table"].iloc[2]["precision"], 4)}
         for tm in _TIMING:
-            x = r["tableX"][tm].iloc[-1]
-            row[f"X_Q5-Q1_{tm[:5]}"] = round(x.CRET_0_4, 3)
-            row[f"X_t_{tm[:5]}"] = round(x.t4, 2)
+            x = r["fund_sort_actual"][tm].iloc[-1]
+            row[f"fund_Q5-Q1_{tm[:5]}"] = round(x.CRET_0_4, 3)
+            row[f"fund_t_{tm[:5]}"] = round(x.t4, 2)
         for tm in _TIMING:                       # frozen (buy-and-hold) basis
-            x = r["tableX_frozen"][tm].iloc[-1]
-            row[f"Xfz_Q5-Q1_{tm[:5]}"] = round(x.CRET_0_4, 3)
-            row[f"Xfz_t_{tm[:5]}"] = round(x.t4, 2)
+            x = r["fund_sort_frozen"][tm].iloc[-1]
+            row[f"fundFZ_Q5-Q1_{tm[:5]}"] = round(x.CRET_0_4, 3)
+            row[f"fundFZ_t_{tm[:5]}"] = round(x.t4, 2)
         for tm in _TIMING:
-            x = r["tableXII"][tm].iloc[-1]
-            row[f"XII_Q1-Q5_{tm[:5]}"] = round(x.mean_qret, 3)
-            row[f"XII_t_{tm[:5]}"] = round(x.t, 2)
+            x = r["stock_sort_stock_ret"][tm].iloc[-1]
+            row[f"stock_Q1-Q5_{tm[:5]}"] = round(x.mean_qret, 3)
+            row[f"stock_t_{tm[:5]}"] = round(x.t, 2)
         rows.append(row)
     out = pd.DataFrame(rows)
     if len(out):
         hz = results[next(iter(results))]["cfg"]
         hz = getattr(hz, "eval_timing", "predictive")[:5]
         out["headline_timing"] = hz
-        out["X_sign_matches_paper"] = np.where(out[f"X_Q5-Q1_{hz}"] < 0, "yes", "no")
+        out["X_sign_matches_paper"] = np.where(out[f"fund_Q5-Q1_{hz}"] < 0, "yes", "no")
     return out
 
 
