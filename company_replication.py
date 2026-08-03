@@ -47,6 +47,13 @@ Usage
     res = R.run_config(panel, cfg, "A")
 """
 from __future__ import annotations
+
+# Bump when Config gains/loses a field. A stale copy on another machine then fails with a
+# clear message instead of "unexpected keyword argument".
+__version__ = "2026.08.03.1"
+REQUIRED_FIELDS = ("eval_timing", "enforce_sell_feasibility", "feasibility_mode",
+                   "feasible_only", "use_manager_memory", "model")
+
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -163,6 +170,26 @@ class Config:
     @property
     def features(self) -> List[str]:
         return self.base_features + (self.memory_features if self.use_manager_memory else [])
+
+
+def check_version(verbose=True):
+    """Verify this copy has the fields the notebook expects. Call it first thing."""
+    import os, time
+    missing = [f for f in REQUIRED_FIELDS if f not in Config.__dataclass_fields__]
+    path = os.path.abspath(__file__)
+    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
+    if verbose:
+        print(f"company_replication {__version__}  |  {path}  |  modified {mtime}")
+    if missing:
+        raise ImportError(
+            f"This copy of company_replication.py is STALE -- missing {missing}.\n"
+            f"  file    : {path}\n"
+            f"  modified: {mtime}\n"
+            "Copy the current mimicking_pipeline/ folder across, then RESTART THE KERNEL "
+            "(%autoreload does not pick up new dataclass fields).")
+    if verbose:
+        print(f"  all {len(REQUIRED_FIELDS)} expected Config fields present")
+    return __version__
 
 
 # ============================================================ HELPERS
