@@ -96,6 +96,29 @@ class Config:
     drop_missing_position: bool = True
 
     # ---- sample filters at the SECURITY level ----
+    # ---- what "buying pressure" means -------------------------------------------------
+    # breadth        share of holders raising SHARE count. One vote per fund: a $10m fund and
+    #                a $10bn fund count the same, and a 1% trim counts like a full exit.
+    # dollar_breadth same vote, weighted by position value -- big holders speak louder.
+    # net_flow       sum of ACTUAL dollars traded, over market cap:
+    #                    sum_f (dS_{f,s,q} * P_{s,q}) / mktcap_{s,q}
+    #                This is the variable price impact actually scales with, it is continuous
+    #                and signed (no +-1% dead band), and it does not carry n_owning in its
+    #                denominator -- so it sidesteps the granularity problem in breadth.
+    # NOTE net_flow uses dS * P_q, the dollars traded. It is deliberately NOT
+    #      position_value(q+1) - position_value(q), which is dominated by the price move and
+    #      would measure returns rather than trading.
+    # weight_change  mean over holders of w(q+1) - w(q). What the manager asked for, but it
+    #                DRIFTS: a stock that rallies gains weight with no decision behind it.
+    # active_weight_change  the same move with that drift removed,
+    #                    dw_active = w(q+1) - w(q) * (1 + r_s) / (1 + r_portfolio)
+    #                so it is the part of the reallocation the manager actually chose. This is
+    #                the honest reading of "how much did its weight change", and it is the same
+    #                construction as `sum_abs_aw` in wrds_pull.
+    pressure_measure: str = "breadth"
+    # breadth | dollar_breadth | net_flow | weight_change | active_weight_change
+    flow_winsor: float = 0.01           # net_flow / weight moves have fat tails; clip per quarter
+
     min_owners: int = 5               # on n_holders, the count known at q -- no selection bias
     # Optional extra floor on n_owning (the LABELLED count). It sharpens the target -- a
     # buy_frac from 2 funds is noise -- but n_owning needs q+1 data, so switching it on builds
@@ -318,16 +341,77 @@ def load_buy_pressure(cfg: Config) -> pd.DataFrame:
                         [-1.0, 1.0], default=0.0)
     df.loc[pd.isna(dsh), "Y"] = np.nan
 
+    # ---- WEIGHT side: how much did the position's weight move, q -> q+1 -----------------
+    # Raw dw mixes two different things. If a stock rallies and the manager does nothing, its
+    # weight rises anyway. dw_active removes that drift by comparing next quarter's weight
+    # against the weight a do-nothing manager would have ended up with:
+    #     w_passive = w_q * (1 + r_s) / (1 + r_portfolio)
+    # so dw_active is the part of the move the manager actually chose. Same idea as
+    # `sum_abs_aw` in wrds_pull.
+    df = df.sort_values(["fund", "security", "yq"])
+    if "weight" in df.columns and df["weight"].notna().any():
+        w = df["weight"].astype("float64")
+        wmed = float(w[w.abs() > 1e-12].abs().median())
+        if np.isfinite(wmed) and wmed > 0.02:            # stored as percent -> to fraction
+            w = w / 100.0
+            print(f"[hold] weight looks like percent (median |w| = {wmed:.3f}) -> /100")
+        df["_w"] = w
+        gfs = df.groupby(["fund", "security"], observed=True)
+        w_next = gfs["_w"].shift(-1).where(gfs["yq"].shift(-1) == df["yq"] + 1)
+        df["dw"] = (w_next - df["_w"]).astype("float32")
+
+        if "future_1q_ret" in df.columns and df["future_1q_ret"].notna().any():
+            rs = df["future_1q_ret"].astype("float64")           # r_s over q -> q+1
+            ok = df["_w"].notna() & rs.notna()
+            gfq = df[ok].groupby(["fund", "yq"], observed=True)
+            num = gfq.apply(lambda t: float((t["_w"] * rs.loc[t.index]).sum()))
+            den = gfq["_w"].sum()
+            rp = (num / den.where(den != 0)).rename("rp")
+            rp = df.set_index(["fund", "yq"]).index.map(rp).astype("float64")
+            w_pass = df["_w"] * (1.0 + rs) / (1.0 + pd.Series(rp, index=df.index))
+            df["dw_active"] = (w_next - w_pass).astype("float32")
+        else:
+            df["dw_active"] = np.nan
+        df = df.drop(columns=["_w"])
+    else:
+        df["dw"] = np.nan; df["dw_active"] = np.nan
+
     lab = df[df["Y"].notna()].copy()
     lab["is_buy"] = (lab["Y"] > 0).astype("float32")
     lab["is_sell"] = (lab["Y"] < 0).astype("float32")
+
+    # ---- DOLLAR side. dsh is the fractional SHARE change and position_value is S_q * P_q,
+    #      so their product is dS * P_q: the dollars actually traded, with the price move
+    #      stripped out. (position_value(q+1) - position_value(q) would be mostly return.)
+    lab["_dsh"] = pd.to_numeric(dsh, errors="coerce").reindex(lab.index).astype("float64")
+    if "position_value" in lab.columns:
+        pv = lab["position_value"].astype("float64")
+        lab["dollar_chg"] = lab["_dsh"] * pv
+        lab["_pv_buy"] = lab["is_buy"] * pv
+        lab["_pv"] = pv
+    else:
+        lab["dollar_chg"] = np.nan; lab["_pv_buy"] = np.nan; lab["_pv"] = np.nan
+
     pres = lab.groupby(["security", "yq"], observed=True).agg(
         n_owning=("fund", "size"),          # denominator of buy_frac; I_{q+1}-measurable
         buy_frac=("is_buy", "mean"),
         sell_frac=("is_sell", "mean"),
+        net_dollar=("dollar_chg", "sum"),   # signed dollars traded by the funds we observe
+        gross_dollar=("dollar_chg", lambda s: float(np.abs(s).sum())),
+        _pv_buy=("_pv_buy", "sum"),
+        _pv=("_pv", "sum"),
+        weight_chg=("dw", "mean"),          # mean weight move across holders
+        active_weight_chg=("dw_active", "mean"),   # same, price drift removed
     ).reset_index()
+    # value-weighted breadth: same vote, weighted by how much each holder actually owns
+    pres["dollar_buy_frac"] = (pres["_pv_buy"] / pres["_pv"].where(pres["_pv"] > 0)
+                               ).astype("float32")
+    pres = pres.drop(columns=["_pv_buy", "_pv"])
 
     sq = base.merge(pres, on=["security", "yq"], how="inner")
+    # dollars traded as a fraction of the company -- the price-impact scaling
+    sq["flow_pct_cap"] = (sq["net_dollar"] / sq["mktcap"].abs().where(sq["mktcap"].abs() > 0)
+                          ).astype("float32")
     sq["n_buying"] = (sq["buy_frac"] * sq["n_owning"]).round()
 
     # Universe filter on the KNOWN-AT-q count. Filtering on `n_owning` instead would build the
@@ -339,7 +423,25 @@ def load_buy_pressure(cfg: Config) -> pd.DataFrame:
     ratio = float((sq["n_owning"] / sq["n_holders"]).mean())
     print(f"[hold] {len(sq):,} security-quarters | {sq.security.nunique():,} securities | "
           f"{sq.yq.nunique()} quarters | median holders {sq.n_holders.median():.0f}")
-    print(f"[hold] buy_frac  mean {sq.buy_frac.mean():.3f}  sd {sq.buy_frac.std():.3f}")
+    print(f"[hold] buy_frac        mean {sq.buy_frac.mean():+.4f}  sd {sq.buy_frac.std():.4f}")
+    print(f"[hold] dollar_buy_frac mean {sq.dollar_buy_frac.mean():+.4f}  "
+          f"sd {sq.dollar_buy_frac.std():.4f}")
+    print(f"[hold] flow_pct_cap    mean {sq.flow_pct_cap.mean():+.5f}  "
+          f"sd {sq.flow_pct_cap.std():.5f}  (dollars traded / market cap)")
+    print(f"[hold] weight_chg      mean {sq.weight_chg.mean():+.5f}  "
+          f"sd {sq.weight_chg.std():.5f}  (raw dw, DRIFTS with price)")
+    print(f"[hold] active_wgt_chg  mean {sq.active_weight_chg.mean():+.5f}  "
+          f"sd {sq.active_weight_chg.std():.5f}  (drift removed = the decision)")
+    _m = ["buy_frac", "dollar_buy_frac", "flow_pct_cap", "weight_chg", "active_weight_chg"]
+    _r = sq[[c for c in _m if c in sq.columns]].corr(method="spearman").round(3)
+    print("[hold] rank correlations between the measures "
+          "(far below 1 => they ask different questions):")
+    print(_r.to_string())
+    if {"weight_chg", "active_weight_chg"} <= set(sq.columns):
+        rho = float(sq["weight_chg"].corr(sq["active_weight_chg"], method="spearman"))
+        print(f"[hold] raw dw vs active dw  rank corr {rho:+.3f}"
+              + ("" if rho < 0.95 else
+                 "  <- near 1: price drift is small here, the two are interchangeable"))
     print(f"[hold] labelled/holders ratio {ratio:.3f}"
           + ("" if ratio > 0.9 else
              "  <- well below 1: many positions vanish next quarter, so anything built on "
@@ -411,12 +513,27 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
 
     # ---- buying-pressure history. buy_frac(q) covers q -> q+1 and is known only at q+1,
     #      so ONLY ITS LAGS may be used to predict a later window. ----
+    # net_flow has fat tails -- one index reconstitution can dwarf a quarter. Clip per quarter
+    # BEFORE lagging, so the feature and the target see the same treatment.
+    for _c in ("flow_pct_cap", "weight_chg", "active_weight_chg"):
+        if cfg.flow_winsor and _c in df.columns and df[_c].notna().any():
+            lo = df.groupby("yq")[_c].transform(lambda s: s.quantile(cfg.flow_winsor))
+            hi = df.groupby("yq")[_c].transform(lambda s: s.quantile(1 - cfg.flow_winsor))
+            df[_c] = df[_c].clip(lo, hi).astype("float32")
+
+    _PRESSURE = ("buy_frac", "sell_frac", "n_owning", "dollar_buy_frac", "flow_pct_cap",
+                 "weight_chg", "active_weight_chg")
     for k in (1, 2, 3, 4):
-        for col in ("buy_frac", "sell_frac", "n_owning"):
+        for col in _PRESSURE:
+            if col not in df.columns:
+                continue
             v, qq = g[col].shift(k), g["qi"].shift(k)
             df[f"{col}_lag{k}"] = v.where(qq == qi - k).astype("float32")
     df["buy_frac_ma4"] = df[[f"buy_frac_lag{k}" for k in (1, 2, 3, 4)]].mean(axis=1)
     df["buy_frac_chg"] = df["buy_frac_lag1"] - df["buy_frac_lag2"]
+    if "flow_pct_cap_lag1" in df.columns:
+        df["flow_ma4"] = df[[f"flow_pct_cap_lag{k}" for k in (1, 2, 3, 4)]].mean(axis=1)
+        df["flow_chg"] = df["flow_pct_cap_lag1"] - df["flow_pct_cap_lag2"]
     # breadth from the KNOWN-AT-q holder count. `n_owning` is buy_frac's own denominator and
     # is I_{q+1}-measurable, so it may enter only through its lags, never as a level.
     df["log_owners"] = np.log(df["n_holders"].astype("float64") + 1.0).astype("float32")
@@ -450,7 +567,15 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     # strictly in the future of the features -- no look-ahead, and no quarter thrown away.
     # (An extra .shift(-1) here would predict q+1 -> q+2 instead, skipping a full quarter and
     # dropping the attainable IC from rho_1 to rho_2 without buying any extra validity.)
-    df["target_buy_frac"] = df["buy_frac"].astype("float32")
+    # `target_buy_frac` keeps its name for backwards compatibility; it holds whichever
+    # pressure measure `cfg.pressure_measure` selects, alongside the plain alias
+    # `pressure_now` and the fair naive benchmark `pressure_lag1`. Every measure and every
+    # measure's lags are already on the frame, so `set_pressure(panel, other)` switches the
+    # target later without rebuilding -- no second Barra join, no second copy in memory.
+    df = set_pressure(df, cfg.pressure_measure)
+    print(f"[panel] pressure_measure={cfg.pressure_measure!r} -> target is "
+          f"{_TARGET_COL[cfg.pressure_measure]!r}   "
+          f"(switch later with B.set_pressure(panel, ...) -- no rebuild needed)")
 
     # History requirement, EXPANDING rather than full-sample. `transform("size")` counts a
     # security's entire life including quarters after q, so it keeps only names that turn out
@@ -466,20 +591,76 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
 def feature_list(df: pd.DataFrame, cfg: Config) -> List[str]:
     """Everything dated at or before the start of the target window."""
     gem = [c for c in df.columns if str(c).startswith(cfg.barra_prefix)]
+    # Lags of ALL THREE pressure measures are offered regardless of which one is the target.
+    # They answer different questions -- breadth is agreement, net_flow is dollars -- so the
+    # model (and the SHAP report) can tell you which history actually carries the signal.
     hist = [c for c in df.columns
-            if c.startswith(("buy_frac_lag", "sell_frac_lag", "n_owning_lag"))]
+            if c.startswith(("buy_frac_lag", "sell_frac_lag", "n_owning_lag",
+                             "dollar_buy_frac_lag", "flow_pct_cap_lag",
+                             "weight_chg_lag", "active_weight_chg_lag"))]
     # ret_q is the return earned DURING q, so it is known at the q close and is a legitimate
     # feature -- and given that weight-targeting funds ADD shares to names that fell, it is
     # probably the single most informative variable here. It is also the control you need in
     # order to argue any alpha is NOT just that rebalancing mechanic.
     # The convention is verified in build_panel; if that check fails, drop it.
-    other = ["buy_frac_ma4", "buy_frac_chg", "log_owners", "log_mktcap", "w_mean",
+    other = ["buy_frac_ma4", "buy_frac_chg", "flow_ma4", "flow_chg",
+             "log_owners", "log_mktcap", "w_mean",
              "ret_q", "ret_lag1", "ret_lag2", "ret_lag4", "ret_ma4"]
     return gem + hist + [c for c in other if c in df.columns]
 
 
+_TARGET_COL = {"breadth": "buy_frac",
+               "dollar_breadth": "dollar_buy_frac",
+               "net_flow": "flow_pct_cap",
+               "weight_change": "weight_chg",
+               "active_weight_change": "active_weight_chg"}
+
+
+def set_pressure(panel: pd.DataFrame, measure: str) -> pd.DataFrame:
+    """Point the target at a different pressure measure, IN PLACE.
+
+    build_panel already computes every measure and every measure's lags -- only the three
+    target columns depend on `pressure_measure`. So switching measures needs no rebuild, and
+    in particular no second Barra join, which is the slow part. Rebuilding the panel five
+    times to compare five measures would also hold five full copies in memory.
+
+    Returns the same object, so `set_pressure(panel, "net_flow")` reads naturally inline.
+    """
+    tcol = _TARGET_COL.get(measure)
+    if tcol is None:
+        raise ValueError(f"measure must be one of {list(_TARGET_COL)}, got {measure!r}")
+    if tcol not in panel.columns:
+        raise ValueError(f"{measure!r} needs column {tcol!r}, which the panel does not have")
+    panel["target_buy_frac"] = panel[tcol].astype("float32")
+    panel["pressure_now"] = panel["target_buy_frac"]
+    panel["pressure_lag1"] = panel[f"{tcol}_lag1"].astype("float32")
+    return panel
+
+
+def feature_family(name: str, cfg: Config = None) -> str:
+    """Coarse grouping used by the SHAP rollup -- the manager's question is which KIND of
+    information drives the forecast, not which individual column."""
+    cfg = cfg or Config()
+    if str(name).startswith(cfg.barra_prefix):
+        return "barra_style"
+    if name.startswith(("weight_chg_lag", "active_weight_chg_lag")):
+        return "weight_change_history"
+    if name.startswith(("flow_pct_cap_lag", "dollar_buy_frac_lag")) or name in (
+            "flow_ma4", "flow_chg"):
+        return "dollar_flow_history"
+    if name.startswith(("buy_frac_lag", "sell_frac_lag")) or name in (
+            "buy_frac_ma4", "buy_frac_chg"):
+        return "breadth_history"
+    if name.startswith("n_owning_lag") or name in ("log_owners", "log_mktcap", "w_mean"):
+        return "size_breadth"
+    if name.startswith("ret_"):
+        return "past_returns"
+    return "other"
+
+
 # ============================================================ 4. MODELS
-_KEEP = ["security", "qi", "yq", "target_buy_frac", "buy_frac", "buy_frac_lag1", "n_owning",
+_KEEP = ["security", "qi", "yq", "target_buy_frac", "pressure_now", "pressure_lag1",
+         "buy_frac", "buy_frac_lag1", "dollar_buy_frac", "flow_pct_cap", "n_owning",
          "fwd_1q", "fwd_2q", "fwd_3q"]
 
 
@@ -695,10 +876,11 @@ def prediction_quality(P: pd.DataFrame) -> pd.DataFrame:
         "n": len(d)}))
     rows = [{"metric": "rank IC (model)", "mean": per_q["rank_ic"].mean(),
              "t": _t(per_q["rank_ic"]), "n_quarters": int(per_q["n"].size)}]
-    if "buy_frac_lag1" in P.columns:
+    lag_col = "pressure_lag1" if "pressure_lag1" in P.columns else "buy_frac_lag1"
+    if lag_col in P.columns:
         naive = P.groupby("qi").apply(
-            lambda d: d["buy_frac_lag1"].corr(d["target_buy_frac"], method="spearman"))
-        rows.append({"metric": "rank IC (naive: buy_frac_lag1, same information as model)",
+            lambda d: d[lag_col].corr(d["target_buy_frac"], method="spearman"))
+        rows.append({"metric": f"rank IC (naive: {lag_col}, same information as model)",
                      "mean": naive.mean(), "t": _t(naive), "n_quarters": int(naive.size)})
         edge = per_q["rank_ic"] - naive.reindex(per_q.index)
         rows.append({"metric": "  -> model minus naive (the only number that matters)",
@@ -784,6 +966,200 @@ def alpha_sort(P: pd.DataFrame, cfg: Config, timing=None, on="pred_buy_frac") ->
     return pd.DataFrame(rows)
 
 
+# ============================================================ 5b. WHAT DRIVES THE FORECAST
+def _rank_ic(pred, y):
+    s = pd.Series(pred); return float(s.corr(pd.Series(y), method="spearman"))
+
+
+def _permutation_importance(model, X, y, feats, seed=0, repeats=3):
+    """Drop in rank-IC when a column is shuffled. Rank-IC, not MSE, because rank-IC is the
+    quantity the study is judged on -- a feature can cut MSE while adding nothing to the sort.
+    Shuffling breaks the feature's link to y while preserving its marginal distribution."""
+    rng = np.random.default_rng(seed)
+    base = _rank_ic(model.predict(X), y)
+    out = np.zeros(len(feats))
+    Xp = X.copy()
+    for j in range(len(feats)):
+        col = X[:, j].copy()
+        drops = np.empty(repeats)
+        for r in range(repeats):
+            Xp[:, j] = rng.permutation(col)
+            drops[r] = base - _rank_ic(model.predict(Xp), y)
+        Xp[:, j] = col
+        out[j] = drops.mean()
+    return base, out
+
+
+def explain_model(panel: pd.DataFrame, cfg: Config = None, n_explain: int = 4000,
+                  background: int = 200, method: str = "auto", seed: int = 0,
+                  verbose: bool = True) -> dict:
+    """Which information actually drives the forecast?
+
+    Fits the GBM on the LAST rolling training window and explains its predictions on the
+    matching test window -- i.e. explains an out-of-sample model, not one that has seen the
+    rows being explained.
+
+    method
+      "auto"        use SHAP if importable, otherwise permutation importance
+      "shap"        require SHAP (raises if missing)
+      "permutation" skip SHAP entirely; fast and dependency-free
+
+    Returns {"per_feature": df, "by_family": df, "method": str, "base_rank_ic": float}.
+    `mean_abs` is the magnitude of a feature's contribution; `direction` is the within-sample
+    correlation between the feature's value and its own contribution, so +1 means "more of
+    this pushes the prediction up" and -1 the reverse.
+    """
+    cfg = cfg or Config()
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    feats = feature_list(panel, cfg)
+    d = panel[panel["target_buy_frac"].notna()]
+    c = int(d.qi.max()) + 1                                  # last window end
+    tr = d[(d.qi >= c - cfg.window_q) & (d.qi < c - cfg.test_q)]
+    te = d[(d.qi >= c - cfg.test_q) & (d.qi < c)]
+    if len(tr) < 500 or len(te) == 0:
+        raise RuntimeError("last window too small to explain -- lower window_q/test_q")
+
+    m = HistGradientBoostingRegressor(max_iter=cfg.max_iter, learning_rate=cfg.learning_rate,
+                                      max_depth=cfg.max_depth, random_state=cfg.seed)
+    m.fit(tr[feats].to_numpy("float32"), tr["target_buy_frac"].to_numpy("float32"))
+
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(te), min(n_explain, len(te)), replace=False)
+    X = te[feats].to_numpy("float32")[idx]
+    y = te["target_buy_frac"].to_numpy("float32")[idx]
+
+    used, sv = method, None
+    if method in ("auto", "shap"):
+        try:
+            import shap
+            bg = X[rng.choice(len(X), min(background, len(X)), replace=False)]
+            # sklearn's HistGradientBoosting is not a TreeExplainer model, so explain the
+            # predict function directly; shap picks a permutation-based explainer.
+            sv = np.asarray(shap.Explainer(m.predict, bg)(X).values)
+            used = "shap"
+        except ImportError:
+            if method == "shap":
+                raise ImportError("method='shap' needs the shap package: pip install shap")
+            used = "permutation"
+        except Exception as e:                                # explainer failed, not missing
+            if method == "shap":
+                raise
+            print(f"  [warn] SHAP failed ({type(e).__name__}: {e}); using permutation instead")
+            used = "permutation"
+
+    if sv is not None:
+        mean_abs = np.abs(sv).mean(0)
+        direction = np.array([
+            float(pd.Series(X[:, j]).corr(pd.Series(sv[:, j]))) for j in range(len(feats))])
+        base_ic = _rank_ic(m.predict(X), y)
+    else:
+        used = "permutation"
+        base_ic, mean_abs = _permutation_importance(m, X, y, feats, seed=seed)
+        direction = np.array([float(pd.Series(X[:, j]).corr(pd.Series(y)))
+                              for j in range(len(feats))])
+
+    per = pd.DataFrame({"feature": feats, "family": [feature_family(f, cfg) for f in feats],
+                        "mean_abs": mean_abs, "direction": direction})
+    tot = per["mean_abs"].sum()
+    per["share_pct"] = 100.0 * per["mean_abs"] / (tot if tot else 1.0)
+    per = per.sort_values("mean_abs", ascending=False).reset_index(drop=True)
+
+    fam = (per.groupby("family")
+              .agg(share_pct=("share_pct", "sum"), n_features=("feature", "size"),
+                   top_feature=("feature", "first"))
+              .sort_values("share_pct", ascending=False).reset_index())
+
+    if verbose:
+        print(f"\n{'='*70}\nWHAT DRIVES THE FORECAST  [{used}]  "
+              f"target={cfg.pressure_measure}\n{'='*70}")
+        print(f"  explained on {len(X):,} out-of-sample rows, quarters "
+              f"{int(te.qi.min())}-{int(te.qi.max())}, rank-IC there {base_ic:+.4f}\n")
+        print(fam.to_string(index=False, float_format=lambda v: f"{v:7.2f}"))
+        print("\n  top 15 individual features:")
+        print(per.head(15).to_string(index=False, float_format=lambda v: f"{v:8.4f}"))
+        if used == "permutation":
+            print("\n  (permutation importance: drop in rank-IC when the column is shuffled."
+                  "\n   `pip install shap` for per-observation attributions instead.)")
+    return {"per_feature": per, "by_family": fam, "method": used, "base_rank_ic": base_ic}
+
+
+# ============================================================ 5c. SKIP THE INTERMEDIATE
+def predict_returns(panel: pd.DataFrame, cfg: Config = None,
+                    horizons=("fwd_1q", "fwd_2q"), models=("gbm", "ridge"),
+                    verbose: bool = True) -> pd.DataFrame:
+    """Regress the SAME features directly on the security's forward return.
+
+    The buying-pressure study is a two-step bet: features -> buying, buying -> returns. If
+    step two is where it breaks, going straight to returns should do no worse. This runs the
+    identical rolling split with the return as the target, so the two are comparable.
+
+    Timing is unchanged: every feature is I_q-measurable and fwd_1q spans q -> q+1, so the
+    forecast precedes the whole return window. Sorting on the prediction and earning fwd_1q
+    is what a manager could actually have done at the q close.
+
+    Two reference rows are added per horizon:
+      ret_q          last quarter's return -- pure momentum/reversal, the cheapest rival
+      pressure_lag1  lagged buying pressure used raw as a return signal
+
+    Calibration: a cross-sectional return signal with rank-IC above ~0.03 is respectable and
+    above ~0.05 is strong. Do not read a 0.30 here the way you would read it for buying
+    pressure -- returns are far closer to unforecastable.
+    """
+    from dataclasses import replace
+    cfg = cfg or Config()
+    feats = feature_list(panel, cfg)
+    rows = []
+
+    def _sort_stats(d, pred_col, ret_col):
+        d = d.dropna(subset=[pred_col, ret_col])
+        if d.empty:
+            return {}
+        q = d.groupby("qi")[pred_col].transform(lambda s: _qcut(s, cfg.n_quintiles))
+        d = d.assign(Q=q).dropna(subset=["Q"])
+        per = d.groupby(["qi", "Q"])[ret_col].mean().unstack()
+        hi, lo = per.columns.max(), per.columns.min()
+        sp = (per[hi] - per[lo]).dropna()
+        ic = d.groupby("qi").apply(
+            lambda t: t[pred_col].corr(t[ret_col], method="spearman"))
+        return {"rank_IC": ic.mean(), "IC_t": _t(ic),
+                "Q1_pct": per[lo].mean() * 100, "Q5_pct": per[hi].mean() * 100,
+                "Q5_Q1_pct": sp.mean() * 100, "spread_t": _t(sp),
+                "n_quarters": int(sp.size)}
+
+    saved = panel["target_buy_frac"].copy()
+    try:
+        for h in horizons:
+            if h not in panel.columns or panel[h].notna().sum() < 1000:
+                continue
+            panel["target_buy_frac"] = panel[h]          # reuse the rolling-split machinery
+            for m in models:
+                P = run_model(panel, replace(cfg, model=m), verbose=False)
+                st = _sort_stats(P.rename(columns={"pred_buy_frac": "_p"}), "_p", h)
+                if st:
+                    rows.append({"target": h, "predictor": f"model:{m}", **st})
+            # cheap rivals, scored on exactly the same rows the models were scored on
+            base = panel.dropna(subset=[h])
+            for ref in ("ret_q", "pressure_lag1"):
+                if ref in base.columns:
+                    st = _sort_stats(base, ref, h)
+                    if st:
+                        rows.append({"target": h, "predictor": f"ref:{ref}", **st})
+    finally:
+        panel["target_buy_frac"] = saved
+
+    out = pd.DataFrame(rows)
+    if verbose and len(out):
+        print(f"\n{'='*94}\nDIRECT RETURN PREDICTION -- same {len(feats)} features, "
+              f"target = the security's forward return\n{'='*94}")
+        print(out.to_string(index=False, float_format=lambda v: f"{v:8.4f}"))
+        print("\n  rank_IC   cross-sectional; >0.03 respectable, >0.05 strong FOR RETURNS")
+        print("  Q5_Q1_pct quintile spread per quarter, in percent")
+        print("  ref:ret_q is momentum/reversal alone -- a model that cannot beat it has")
+        print("            added nothing beyond the sign of last quarter's move")
+    return out
+
+
 def run_one(panel: pd.DataFrame, cfg: Config, tag: str = "", verbose=True) -> dict:
     """One model on an already-built panel. The panel is passed in so several models can
     share it rather than rebuilding (the Barra join is the slow part)."""
@@ -795,7 +1171,8 @@ def run_one(panel: pd.DataFrame, cfg: Config, tag: str = "", verbose=True) -> di
          "alpha_pred": _TimingDict(
              (t, alpha_sort(P, cfg, t, on="pred_buy_frac")) for t in _TIMING),
          "alpha_actual": _TimingDict(
-             (t, alpha_sort(P, cfg, t, on="buy_frac")) for t in _TIMING)}
+             (t, alpha_sort(P, cfg, t, on=("pressure_now" if "pressure_now" in P.columns
+                                           else "buy_frac"))) for t in _TIMING)}
     hz = cfg.eval_timing
     q = r["quality"]
     sp = r["alpha_pred"][hz].iloc[-1]
