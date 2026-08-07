@@ -42,7 +42,13 @@ from typing import List
 __version__ = "2026.08.07.1"
 
 FEATURES = ["turnover", "log_mktcap", "ret_q", "vol_ret", "log_price"]
-TARGETS = ["turnover_next", "ret_next"]
+TARGETS = ["turnover_next", "ret_next"]          # the default pair
+
+# Longer return horizons, compounded from the forward-return columns already in the file:
+#     ret_next_2q = (1+f1)(1+f2) - 1     ret_next_3q = (1+f1)(1+f2)(1+f3) - 1
+# Quarterly-rebalanced h-quarter returns OVERLAP h-1 times, so their t-stats need a
+# Newey-West correction -- handled in _score, not something the caller has to remember.
+RETURN_TARGETS = {"ret_next": 1, "ret_next_2q": 2, "ret_next_3q": 3}
 
 
 @dataclass
@@ -53,10 +59,19 @@ class Config:
     col_map: dict = field(default_factory=lambda: {
         "security": "security", "date": "date", "close": "close", "volume": "volume",
         "market_cap": "market_cap", "quarterly_ret": "quarterly_ret",
-        "future_1q_ret": "future_1q_ret", "InvTypeCode": "inv_type", "isUs": "isUs",
+        "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
+        "future_3q_ret": "future_3q_ret", "InvTypeCode": "inv_type", "isUs": "isUs",
     })
-    inv_type_codes = (401,)
+    # NOTE the annotation. A dataclass only turns ANNOTATED class attributes into fields, so
+    # `inv_type_codes = (401,)` would be a plain class attribute and Config(inv_type_codes=...)
+    # would raise TypeError: unexpected keyword argument.
+    inv_type_codes: tuple = (401,)
     us_only: bool = True
+
+    # Which return horizons to test as targets, in quarters. (1,) is the q -> q+1 return.
+    # (1, 2, 3) adds the compounded 2- and 3-quarter returns; they need future_2q_ret /
+    # future_3q_ret in the file and their spreads get Newey-West t-stats.
+    return_horizons: tuple = (1, 2)
 
     vol_window: int = 4        # quarters used for vol_ret (current + 3 lags)
     winsorize: float = 0.01    # per-quarter clip on every feature and on turnover targets
@@ -75,12 +90,21 @@ class Config:
 
 
 # ------------------------------------------------------------------ helpers
-def _t(x) -> float:
+def _t(x, lags: int = 0) -> float:
+    """t-stat of a mean. `lags > 0` applies a Newey-West (Bartlett) correction, which is
+    required whenever the series overlaps -- an h-quarter return sampled every quarter shares
+    h-1 quarters with its neighbour, so the naive t-stat is inflated by roughly sqrt(h)."""
     x = np.asarray(pd.Series(x).dropna(), dtype=float)
     n = len(x)
     if n < 3 or x.std(ddof=1) == 0:
         return np.nan
-    return float(x.mean() / (x.std(ddof=1) / np.sqrt(n)))
+    if lags <= 0:
+        return float(x.mean() / (x.std(ddof=1) / np.sqrt(n)))
+    e = x - x.mean()
+    var = float(e @ e) / n
+    for L in range(1, min(lags, n - 1) + 1):
+        var += 2.0 * (1.0 - L / (lags + 1.0)) * float(e[L:] @ e[:-L]) / n
+    return float(x.mean() / np.sqrt(var / n)) if var > 0 else np.nan
 
 
 def _qcut(s, n=5):
@@ -102,7 +126,7 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     cfg = cfg or Config()
     inv = {v: k for k, v in cfg.col_map.items()}
     want = ["security", "date", "close", "volume", "market_cap", "quarterly_ret",
-            "future_1q_ret", "inv_type", "isUs"]
+            "future_1q_ret", "future_2q_ret", "future_3q_ret", "inv_type", "isUs"]
     raw = [inv[c] for c in want if c in inv]
     try:
         import pyarrow.parquet as pq
@@ -123,16 +147,21 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     if cfg.inv_type_codes is not None and "inv_type" in df.columns:
         df = df[df["inv_type"].astype(str).isin({str(c) for c in cfg.inv_type_codes})]
 
-    for c in ("close", "volume", "market_cap", "quarterly_ret", "future_1q_ret"):
+    for c in ("close", "volume", "market_cap", "quarterly_ret",
+              "future_1q_ret", "future_2q_ret", "future_3q_ret"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ("future_2q_ret", "future_3q_ret"):
+        if c not in df.columns:
+            df[c] = np.nan
 
     # the file is a fund-security-quarter panel; these are all security-level, so one row per
     # (security, quarter) is all that is needed
     sq = df.groupby(["security", "yq"], observed=True).agg(
         close=("close", "first"), volume=("volume", "first"),
         mktcap=("market_cap", "first"), ret_q=("quarterly_ret", "first"),
-        ret_next=("future_1q_ret", "first"), n_rows=("security", "size"),
+        ret_next=("future_1q_ret", "first"), _f2=("future_2q_ret", "first"),
+        _f3=("future_3q_ret", "first"), n_rows=("security", "size"),
     ).reset_index()
     print(f"[panel] {len(sq):,} security-quarters | {sq.security.nunique():,} securities | "
           f"{sq.yq.nunique()} quarters")
@@ -176,21 +205,33 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     # target 1: next quarter's turnover, exact
     v, qq = g["turnover"].shift(-1), g["qi"].shift(-1)
     sq["turnover_next"] = v.where(qq == qi + 1)
-    # target 2: the q -> q+1 return, already on this row
+
+    # target 2+: returns. ret_next (q -> q+1) is already on the row; longer horizons compound
+    # the forward columns. Compounding, not summing -- (1+r1)(1+r2)-1 is the return actually
+    # earned by holding through both quarters.
+    sq["ret_next_2q"] = (1 + sq["ret_next"]) * (1 + sq["_f2"]) - 1
+    sq["ret_next_3q"] = (1 + sq["ret_next"]) * (1 + sq["_f2"]) * (1 + sq["_f3"]) - 1
+    sq = sq.drop(columns=["_f2", "_f3"])
 
     sq = _winsor_by_q(sq, FEATURES + ["turnover_next"], cfg.winsorize)
 
     seen = g.cumcount() + 1          # expanding, not full-sample: no survivorship
     sq = sq[seen >= cfg.min_quarters].reset_index(drop=True)
 
-    for c in FEATURES + TARGETS:
+    for c in FEATURES + ["turnover_next"] + list(RETURN_TARGETS):
         sq[c] = sq[c].astype("float32")
-    print(f"[panel] {len(sq):,} rows after history filter | "
-          f"turnover_next available {sq.turnover_next.notna().mean():.1%} | "
-          f"ret_next available {sq.ret_next.notna().mean():.1%}")
+    print(f"[panel] {len(sq):,} rows after history filter")
+    print("[panel] target coverage:  " + "  ".join(
+        f"{c} {sq[c].notna().mean():.0%}" for c in ["turnover_next"] + list(RETURN_TARGETS)))
     print("[panel] feature coverage: " + "  ".join(
         f"{c} {sq[c].notna().mean():.0%}" for c in FEATURES))
     return sq
+
+
+def target_list(cfg: Config) -> List[str]:
+    """turnover plus whichever return horizons the config asks for and the panel can supply."""
+    inv = {v: k for k, v in RETURN_TARGETS.items()}
+    return ["turnover_next"] + [inv[h] for h in cfg.return_horizons if h in inv]
 
 
 # ------------------------------------------------------------------ model
@@ -222,30 +263,45 @@ def _rolling_predict(panel: pd.DataFrame, feats: List[str], target: str,
 
 
 def _score(d: pd.DataFrame, pred_col: str, target: str, cfg: Config) -> dict:
-    """rank-IC against the target, and the quintile spread measured in NEXT-QUARTER RETURN.
+    """rank-IC against the target, plus the quintile spread measured in RETURN.
 
-    The spread is always in return units, whatever the target is -- that is the only way a
-    turnover model and a return model can be put in the same table.
+    Which return? The one that matches the target's own horizon: a 3-quarter target is graded
+    on the 3-quarter return. A turnover target has no horizon of its own, so it is graded on
+    the 1-quarter return. `Q5_Q1_per_q` divides by the horizon so every row is comparable.
+
+    Overlapping horizons get a Newey-West t-stat with h-1 lags: quarterly-rebalanced
+    h-quarter returns share h-1 quarters with their neighbour, and the naive t is inflated by
+    roughly sqrt(h).
     """
+    h = RETURN_TARGETS.get(target, 1)
+    ret_col = target if target in RETURN_TARGETS else "ret_next"
+
     x = d.dropna(subset=[pred_col, target])
     ic = x.groupby("qi").apply(lambda t: t[pred_col].corr(t[target], method="spearman"))
-    r = d.dropna(subset=[pred_col, "ret_next"]).copy()
+    r = d.dropna(subset=[pred_col, ret_col]).copy()
     r["Q"] = r.groupby("qi")[pred_col].transform(lambda s: _qcut(s, cfg.n_quintiles))
     r = r.dropna(subset=["Q"])
-    per = r.groupby(["qi", "Q"])["ret_next"].mean().unstack()
+    per = r.groupby(["qi", "Q"])[ret_col].mean().unstack()
     hi, lo = per.columns.max(), per.columns.min()
     sp = (per[hi] - per[lo]).dropna()
     return {"rank_IC": ic.mean(), "IC_t": _t(ic),
-            "Q1_ret_pct": per[lo].mean() * 100, "Q5_ret_pct": per[hi].mean() * 100,
-            "Q5_Q1_pct": sp.mean() * 100, "spread_t": _t(sp), "n_quarters": int(sp.size)}
+            "ret_h_q": h, "Q1_ret_pct": per[lo].mean() * 100,
+            "Q5_ret_pct": per[hi].mean() * 100, "Q5_Q1_pct": sp.mean() * 100,
+            "Q5_Q1_per_q": sp.mean() * 100 / h,
+            "spread_t": _t(sp, lags=h - 1), "n_quarters": int(sp.size)}
 
 
 def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd.DataFrame:
-    """Six models per target: one per feature, plus one on all five."""
+    """Six models per target: one per feature, plus one on all five.
+
+    Targets are turnover plus every return horizon in `cfg.return_horizons`.
+    """
     cfg = cfg or Config()
     specs = [(f"model:{f}", [f]) for f in FEATURES] + [("model:ALL", FEATURES)]
+    targets = [t for t in target_list(cfg)
+               if t in panel.columns and panel[t].notna().sum() > 500]
     rows = []
-    for target in TARGETS:
+    for target in targets:
         for name, feats in specs:
             P = _rolling_predict(panel, feats, target, cfg)
             rows.append({"target": target, "model": name, **_score(P, "pred", target, cfg)})
@@ -256,17 +312,21 @@ def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd
                          **_score(base, f, target, cfg)})
     out = pd.DataFrame(rows)
     if verbose:
-        for target in TARGETS:
+        for target in targets:
             sub = out[out.target == target].drop(columns="target")
-            print(f"\n{'='*92}\nTARGET = {target}\n{'='*92}")
+            h = RETURN_TARGETS.get(target, 1)
+            grade = target if target in RETURN_TARGETS else "ret_next"
+            print(f"\n{'='*100}\nTARGET = {target}   (spread graded on {grade}, "
+                  f"{h} quarter{'s' if h > 1 else ''})\n{'='*100}")
             print(sub.to_string(index=False, float_format=lambda v: f"{v:8.4f}"))
-        print("\n  rank_IC     against that row's target. For ret_next, >0.03 is respectable")
-        print("              and >0.05 strong -- returns are near-unforecastable, so a large")
-        print("              IC there is a reason to look for leakage.")
-        print("  Q5_Q1_pct   quintile spread in NEXT-QUARTER RETURN, %/quarter, for every row")
-        print("              -- so a turnover model and a return model sit on one scale.")
-        print("  raw:x       sorting on the characteristic itself. model:x should nearly match")
-        print("              it; a big gap means the tree fitted noise.")
+        print("\n  rank_IC      against that row's target. For a RETURN target, >0.03 is")
+        print("               respectable and >0.05 strong -- returns are near-unforecastable,")
+        print("               so a large IC there is a reason to hunt for leakage.")
+        print("  Q5_Q1_pct    quintile spread over the whole horizon, in percent")
+        print("  Q5_Q1_per_q  the same divided by the horizon -- compare ACROSS targets here")
+        print("  spread_t     Newey-West with h-1 lags once the horizon overlaps")
+        print("  raw:x        sorting on the characteristic itself. model:x should nearly")
+        print("               match it; a big gap means the tree fitted noise.")
     return out
 
 
