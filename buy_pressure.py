@@ -728,13 +728,31 @@ _TIMING_ALIAS = {"contemporaneous": "quarter_end",
                  "tradeable": "two_q_delay"}
 
 
-def _ret_col(timing: str) -> str:
-    """Return column for a timing name, accepting the legacy names."""
+def _canon(timing: str) -> str:
+    """Canonical timing name, accepting the legacy ones."""
     t = _TIMING_ALIAS.get(timing, timing)
     if t not in _TIMING:
         raise KeyError(f"unknown timing {timing!r}; use one of {list(_TIMING)} "
-                       f"(or legacy {list(_TIMING_ALIAS)})")
-    return _TIMING[t]
+                       f"(legacy names {list(_TIMING_ALIAS)} also work)")
+    return t
+
+
+def _ret_col(timing: str) -> str:
+    """Return column for a timing name, accepting the legacy names."""
+    return _TIMING[_canon(timing)]
+
+
+class _TimingDict(dict):
+    """Results keyed by canonical timing name, but readable through the legacy names too,
+    so notebooks and configs written against `predictive` / `tradeable` keep working."""
+
+    def __missing__(self, key):
+        alias = _TIMING_ALIAS.get(key)
+        if alias is not None and alias in self:
+            return self[alias]
+        raise KeyError(
+            f"{key!r} is not a timing. Available: {list(self)} "
+            f"(legacy names {list(_TIMING_ALIAS)} map onto them in order).")
 
 
 def alpha_sort(P: pd.DataFrame, cfg: Config, timing=None, on="pred_buy_frac") -> pd.DataFrame:
@@ -774,8 +792,10 @@ def run_one(panel: pd.DataFrame, cfg: Config, tag: str = "", verbose=True) -> di
     P = run_model(panel, cfg, verbose=verbose)
     r = {"tag": tag, "cfg": cfg, "preds": P,
          "quality": prediction_quality(P),
-         "alpha_pred": {t: alpha_sort(P, cfg, t, on="pred_buy_frac") for t in _TIMING},
-         "alpha_actual": {t: alpha_sort(P, cfg, t, on="buy_frac") for t in _TIMING}}
+         "alpha_pred": _TimingDict(
+             (t, alpha_sort(P, cfg, t, on="pred_buy_frac")) for t in _TIMING),
+         "alpha_actual": _TimingDict(
+             (t, alpha_sort(P, cfg, t, on="buy_frac")) for t in _TIMING)}
     hz = cfg.eval_timing
     q = r["quality"]
     sp = r["alpha_pred"][hz].iloc[-1]
