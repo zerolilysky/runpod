@@ -3,26 +3,42 @@
 A security-level study, distinct from the fund-security work in company_replication.py.
 
     unit of observation : (security, quarter)
-    target              : buy_frac(s, t+1) = # funds buying s / # funds owning s, next quarter
+    target              : buy_frac(s, q) = # funds buying s / # funds owning s over q -> q+1
     features            : latest Barra GEMLT exposures as of quarter end
                           past security returns
-                          current buy_frac / sell_frac and their lags, plus ownership breadth
+                          LAGS of buy_frac / sell_frac, plus ownership breadth
     alpha test          : rank securities by PREDICTED buy_frac, then look at forward returns
 
 TIMING -- the thing most easily got wrong here
 ----------------------------------------------
-buy_frac over the window [t, t+1] compares holdings at t against holdings at t+1, so it is
-NOT observable at t. It is known once the t+1 holdings exist, and public only after the
-~45-60 day filing delay. Writing q for the quarter whose buy_frac we are predicting:
+Write I_t for everything knowable once the quarter-t holdings snapshot exists. buy_frac over
+[q, q+1] compares holdings at q against holdings at q+1, so
 
-    features   must be dated at or before the start of q, and buy_frac features must refer
-               to windows that CLOSED before q began
-    target     buy_frac over q
-    returns    "predictive"  starts at the beginning of q      -- no overlap, ignores filing lag
-               "tradeable"   starts one quarter after q begins -- also clears the lag
-               "contemporaneous" overlaps the target window    -- biased, benchmark only
+    buy_frac(s, q)  is I_{q+1}-measurable, NOT I_q-measurable
 
-`Config.eval_timing` selects which one the headline numbers use (default "predictive").
+even though the column sits physically on the q row (exactly like future_1q_ret does). The
+row is dated q, so:
+
+    features   every one I_q-measurable. buy_frac enters ONLY through its lags: buy_frac(q-1)
+               closed at q, so it is I_q-measurable; buy_frac(q) is not and is excluded.
+    target     buy_frac(s, q), the buying over q -> q+1. Strictly after the features, so this
+               is not look-ahead -- and it is the TIGHTEST honest choice. Shifting the target
+               one further quarter would skip a whole quarter for no gain in validity and
+               would cut the attainable IC from rho_1 to rho_2.
+    returns    named by the DECISION POINT, since pred_buy_frac already exists at the q close
+               "quarter_end"  fwd_1q -- trade at the q close, hold q -> q+1. The forecast
+                              precedes the whole window, so this is unbiased AND the headline.
+               "one_q_delay"  fwd_2q -- only if the holdings behind buy_frac_lag1 arrive late
+               "two_q_delay"  fwd_3q -- a full ~45-60 day filing delay plus a quarter
+
+CAUTION, and it is the one asymmetry here: alpha_sort(on="buy_frac") ranks on REALISED
+buying, which is I_{q+1}-measurable. At "quarter_end" that overlaps fwd_1q and IS biased --
+read it as a perfect-foresight ceiling, never as a strategy. alpha_sort(on="pred_buy_frac")
+has no such problem at any horizon.
+
+The label matches company_replication.py -- the q -> q+1 share-change direction -- so the two
+modules stay comparable. What differs is only which horizon is the honest headline, because
+there the sort variable is realised accuracy and here it is a pure forecast.
 
 JOINING BARRA TO HOLDINGS
 -------------------------
@@ -80,11 +96,18 @@ class Config:
     drop_missing_position: bool = True
 
     # ---- sample filters at the SECURITY level ----
-    min_owners: int = 5               # a buy_frac from 2 funds is noise
+    min_owners: int = 5               # on n_holders, the count known at q -- no selection bias
+    # Optional extra floor on n_owning (the LABELLED count). It sharpens the target -- a
+    # buy_frac from 2 funds is noise -- but n_owning needs q+1 data, so switching it on builds
+    # the evaluation universe partly out of forward information. 0 = off.
+    min_labelled_owners: int = 0
     min_quarters: int = 12            # securities need some history to be sortable
 
     # ---- evaluation ----
-    eval_timing: str = "predictive"   # predictive | tradeable | contemporaneous
+    # quarter_end  decide at the close of q and trade immediately -- correct for a forecast,
+    #              because pred_buy_frac is already known then and fwd_1q lies entirely after
+    # one_q_delay / two_q_delay  only if the holdings feeding buy_frac_lag1 arrive late
+    eval_timing: str = "quarter_end"
     n_quintiles: int = 5
 
     # ---- rolling design ----
@@ -257,6 +280,23 @@ def load_buy_pressure(cfg: Config) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
 
+    # ---- SNAPSHOT of what is known at q, taken BEFORE any forward-looking filtering -------
+    # Everything below either needs the q -> q+1 change (the label) or drops rows on the basis
+    # of it (the -100% prefilter). Both shrink `df` to "positions that survive into q+1", so a
+    # count taken afterwards is I_{q+1}-measurable. Since the target is buy_frac(q) and
+    # n_owning is its own denominator, using that count as a feature would hand the model the
+    # target's denominator for the very same quarter.
+    base = df.groupby(["security", "yq"], observed=True).agg(
+        n_holders=("fund", "size"),
+        w_mean=("weight", "mean"),
+        mktcap=("market_cap", "first"),
+        ret_q=("quarterly_ret", "first"),      # return DURING q -> I_q-measurable
+        ret_past=("past_1q_ret", "first"),     # return during q-1, used to verify that
+        fwd_1q=("future_1q_ret", "first"),
+        fwd_2q=("future_2q_ret", "first"),
+        fwd_3q=("future_3q_ret", "first"),
+    ).reset_index()
+
     # ---- trade direction over q -> q+1, same convention as the fund-level module ----
     if "chg_pct" in df.columns and df["chg_pct"].notna().any():
         chg = df["chg_pct"].astype("float64")
@@ -281,22 +321,29 @@ def load_buy_pressure(cfg: Config) -> pd.DataFrame:
     lab = df[df["Y"].notna()].copy()
     lab["is_buy"] = (lab["Y"] > 0).astype("float32")
     lab["is_sell"] = (lab["Y"] < 0).astype("float32")
-    sq = lab.groupby(["security", "yq"], observed=True).agg(
-        n_owning=("fund", "size"),
+    pres = lab.groupby(["security", "yq"], observed=True).agg(
+        n_owning=("fund", "size"),          # denominator of buy_frac; I_{q+1}-measurable
         buy_frac=("is_buy", "mean"),
         sell_frac=("is_sell", "mean"),
-        w_mean=("weight", "mean"),
-        mktcap=("market_cap", "first"),
-        ret_q=("quarterly_ret", "first"),
-        fwd_1q=("future_1q_ret", "first"),
-        fwd_2q=("future_2q_ret", "first"),
-        fwd_3q=("future_3q_ret", "first"),
     ).reset_index()
+
+    sq = base.merge(pres, on=["security", "yq"], how="inner")
     sq["n_buying"] = (sq["buy_frac"] * sq["n_owning"]).round()
-    sq = sq[sq["n_owning"] >= cfg.min_owners]
+
+    # Universe filter on the KNOWN-AT-q count. Filtering on `n_owning` instead would build the
+    # evaluation universe out of forward information: n_owning only counts holders whose
+    # q -> q+1 change is observable, so it silently requires survival into q+1.
+    sq = sq[sq["n_holders"] >= cfg.min_owners]
+    if cfg.min_labelled_owners:            # opt-in: trades label precision for selection bias
+        sq = sq[sq["n_owning"] >= cfg.min_labelled_owners]
+    ratio = float((sq["n_owning"] / sq["n_holders"]).mean())
     print(f"[hold] {len(sq):,} security-quarters | {sq.security.nunique():,} securities | "
-          f"{sq.yq.nunique()} quarters | median owners {sq.n_owning.median():.0f}")
+          f"{sq.yq.nunique()} quarters | median holders {sq.n_holders.median():.0f}")
     print(f"[hold] buy_frac  mean {sq.buy_frac.mean():.3f}  sd {sq.buy_frac.std():.3f}")
+    print(f"[hold] labelled/holders ratio {ratio:.3f}"
+          + ("" if ratio > 0.9 else
+             "  <- well below 1: many positions vanish next quarter, so anything built on "
+             "n_owning carries survival information"))
 
     return sq
 
@@ -370,21 +417,47 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
             df[f"{col}_lag{k}"] = v.where(qq == qi - k).astype("float32")
     df["buy_frac_ma4"] = df[[f"buy_frac_lag{k}" for k in (1, 2, 3, 4)]].mean(axis=1)
     df["buy_frac_chg"] = df["buy_frac_lag1"] - df["buy_frac_lag2"]
-    df["log_owners"] = np.log(df["n_owning"].astype("float64") + 1.0).astype("float32")
+    # breadth from the KNOWN-AT-q holder count. `n_owning` is buy_frac's own denominator and
+    # is I_{q+1}-measurable, so it may enter only through its lags, never as a level.
+    df["log_owners"] = np.log(df["n_holders"].astype("float64") + 1.0).astype("float32")
     df["log_mktcap"] = np.log(df["mktcap"].abs() + 1.0).astype("float32")
 
-    # ---- past returns, exact-quarter aligned ----
+    # ---- returns, exact-quarter aligned ----
     for k in (1, 2, 4):
         v, qq = g["ret_q"].shift(k), g["qi"].shift(k)
         df[f"ret_lag{k}"] = v.where(qq == qi - k).astype("float32")
     df["ret_ma4"] = df[["ret_lag1", "ret_lag2", "ret_lag4"]].mean(axis=1)
 
-    # ---- TARGET: buy_frac of the NEXT quarter, exact ----
-    v, qq = g["buy_frac"].shift(-1), g["qi"].shift(-1)
-    df["target_buy_frac"] = v.where(qq == qi + 1).astype("float32")
+    # VERIFY the return convention rather than assuming it. If quarterly_ret(q) is the return
+    # earned DURING q -- the reading that makes it I_q-measurable and usable as a feature --
+    # then past_1q_ret(q) must equal quarterly_ret(q-1) = ret_lag1(q). A correlation near 1
+    # confirms it; anything else means ret_q is shifted and must NOT be used as a feature.
+    if "ret_past" in df.columns:
+        ok = df["ret_past"].notna() & df["ret_lag1"].notna()
+        rho = float(df.loc[ok, "ret_past"].corr(df.loc[ok, "ret_lag1"])) if ok.sum() > 100 else np.nan
+        rho_f = float(df.loc[df["ret_q"].notna() & df["fwd_1q"].notna(), "ret_q"]
+                      .corr(df["fwd_1q"])) if df["fwd_1q"].notna().any() else np.nan
+        print(f"[check] corr(past_1q_ret, ret_lag1) = {rho:+.3f}  "
+              f"(near +1 => quarterly_ret is the return DURING q, so it is I_q-measurable)")
+        print(f"[check] corr(ret_q, fwd_1q)         = {rho_f:+.3f}  "
+              f"(should be small; near +1 would mean ret_q is actually a FORWARD return)")
+        if np.isfinite(rho) and rho < 0.9:
+            print("  [warn] convention NOT confirmed -- drop 'ret_q' from feature_list until "
+                  "you know which window quarterly_ret spans")
 
-    nq = g["qi"].transform("size")
-    df = df[nq >= cfg.min_quarters]
+    # ---- TARGET: buy_frac over q -> q+1, i.e. THIS row's own buy_frac ----
+    # It is I_{q+1}-measurable while every feature is I_q-measurable, so the target is
+    # strictly in the future of the features -- no look-ahead, and no quarter thrown away.
+    # (An extra .shift(-1) here would predict q+1 -> q+2 instead, skipping a full quarter and
+    # dropping the attainable IC from rho_1 to rho_2 without buying any extra validity.)
+    df["target_buy_frac"] = df["buy_frac"].astype("float32")
+
+    # History requirement, EXPANDING rather than full-sample. `transform("size")` counts a
+    # security's entire life including quarters after q, so it keeps only names that turn out
+    # to survive -- survivorship bias baked into the evaluation universe. cumcount() asks the
+    # I_q-measurable question instead: has this security been observed long enough BY q?
+    seen = g.cumcount() + 1
+    df = df[seen >= cfg.min_quarters]
     print(f"[panel] {len(df):,} rows | {df.security.nunique():,} securities | "
           f"{df.qi.max()+1} quarters | target available {df.target_buy_frac.notna().mean():.1%}")
     return df
@@ -395,13 +468,18 @@ def feature_list(df: pd.DataFrame, cfg: Config) -> List[str]:
     gem = [c for c in df.columns if str(c).startswith(cfg.barra_prefix)]
     hist = [c for c in df.columns
             if c.startswith(("buy_frac_lag", "sell_frac_lag", "n_owning_lag"))]
+    # ret_q is the return earned DURING q, so it is known at the q close and is a legitimate
+    # feature -- and given that weight-targeting funds ADD shares to names that fell, it is
+    # probably the single most informative variable here. It is also the control you need in
+    # order to argue any alpha is NOT just that rebalancing mechanic.
+    # The convention is verified in build_panel; if that check fails, drop it.
     other = ["buy_frac_ma4", "buy_frac_chg", "log_owners", "log_mktcap", "w_mean",
-             "ret_lag1", "ret_lag2", "ret_lag4", "ret_ma4"]
+             "ret_q", "ret_lag1", "ret_lag2", "ret_lag4", "ret_ma4"]
     return gem + hist + [c for c in other if c in df.columns]
 
 
 # ============================================================ 4. MODELS
-_KEEP = ["security", "qi", "yq", "target_buy_frac", "buy_frac", "n_owning",
+_KEEP = ["security", "qi", "yq", "target_buy_frac", "buy_frac", "buy_frac_lag1", "n_owning",
          "fwd_1q", "fwd_2q", "fwd_3q"]
 
 
@@ -602,35 +680,75 @@ def run_model(df: pd.DataFrame, cfg: Config, verbose=True) -> pd.DataFrame:
 
 # ============================================================ 5. EVALUATION
 def prediction_quality(P: pd.DataFrame) -> pd.DataFrame:
-    """How well is next-quarter buying pressure predicted at all?"""
+    """How well is buying pressure over q -> q+1 predicted from information known at q?
+
+    The naive benchmark is buy_frac_lag1 = buy_frac(q-1), i.e. "assume this quarter looks
+    like last quarter". It is I_q-measurable, so it sits on EXACTLY the information set the
+    model is given -- a fair hurdle. Under the old target convention the benchmark used
+    buy_frac(q) itself, which is I_{q+1}-measurable and therefore one lag closer to the
+    target than anything the model could see; that comparison was rigged against the model
+    and is gone.
+    """
     per_q = P.groupby("qi").apply(lambda d: pd.Series({
         "rank_ic": d["pred_buy_frac"].corr(d["target_buy_frac"], method="spearman"),
         "pearson": d["pred_buy_frac"].corr(d["target_buy_frac"]),
         "n": len(d)}))
-    naive = P.groupby("qi").apply(
-        lambda d: d["buy_frac"].corr(d["target_buy_frac"], method="spearman"))
-    return pd.DataFrame([
-        {"metric": "rank IC (model)", "mean": per_q["rank_ic"].mean(),
-         "t": _t(per_q["rank_ic"]), "n_quarters": int(per_q["n"].size)},
-        {"metric": "rank IC (naive: this quarter's buy_frac)", "mean": naive.mean(),
-         "t": _t(naive), "n_quarters": int(naive.size)},
-        {"metric": "pearson (model)", "mean": per_q["pearson"].mean(),
-         "t": _t(per_q["pearson"]), "n_quarters": int(per_q["n"].size)},
-    ])
+    rows = [{"metric": "rank IC (model)", "mean": per_q["rank_ic"].mean(),
+             "t": _t(per_q["rank_ic"]), "n_quarters": int(per_q["n"].size)}]
+    if "buy_frac_lag1" in P.columns:
+        naive = P.groupby("qi").apply(
+            lambda d: d["buy_frac_lag1"].corr(d["target_buy_frac"], method="spearman"))
+        rows.append({"metric": "rank IC (naive: buy_frac_lag1, same information as model)",
+                     "mean": naive.mean(), "t": _t(naive), "n_quarters": int(naive.size)})
+        edge = per_q["rank_ic"] - naive.reindex(per_q.index)
+        rows.append({"metric": "  -> model minus naive (the only number that matters)",
+                     "mean": edge.mean(), "t": _t(edge.dropna()),
+                     "n_quarters": int(edge.notna().sum())})
+    rows.append({"metric": "pearson (model)", "mean": per_q["pearson"].mean(),
+                 "t": _t(per_q["pearson"]), "n_quarters": int(per_q["n"].size)})
+    return pd.DataFrame(rows)
 
 
-_TIMING = {"contemporaneous": "fwd_1q", "predictive": "fwd_2q", "tradeable": "fwd_3q"}
+# Timing is named by the DECISION POINT, not by the return window, because what makes a
+# horizon honest here is when the sort variable became knowable.
+#
+#   pred_buy_frac is I_q-measurable -- it exists the moment quarter q closes. Trading on it
+#   at the q close and holding through q+1 earns fwd_1q, and the whole return window lies
+#   AFTER the forecast. There is no overlap and no bias: "quarter_end" is the headline.
+#
+#   The old name for this was "contemporaneous", carried over from company_replication.py
+#   where the sort variable is realised accuracy (I_{q+1}-measurable) and therefore DOES
+#   overlap fwd_1q. That warning applies to alpha_sort(on="buy_frac") here, never to
+#   alpha_sort(on="pred_buy_frac"). Old names still work.
+_TIMING = {"quarter_end": "fwd_1q",    # decide at the close of q, hold q -> q+1
+           "one_q_delay": "fwd_2q",    # decide at the close of q, wait a quarter, hold q+1 -> q+2
+           "two_q_delay": "fwd_3q"}    # wait two quarters -- only needed if holdings arrive late
+_TIMING_ALIAS = {"contemporaneous": "quarter_end",
+                 "predictive": "one_q_delay",
+                 "tradeable": "two_q_delay"}
+
+
+def _ret_col(timing: str) -> str:
+    """Return column for a timing name, accepting the legacy names."""
+    t = _TIMING_ALIAS.get(timing, timing)
+    if t not in _TIMING:
+        raise KeyError(f"unknown timing {timing!r}; use one of {list(_TIMING)} "
+                       f"(or legacy {list(_TIMING_ALIAS)})")
+    return _TIMING[t]
 
 
 def alpha_sort(P: pd.DataFrame, cfg: Config, timing=None, on="pred_buy_frac") -> pd.DataFrame:
     """Rank securities on predicted buying pressure -> forward returns by quintile.
 
-    `on="pred_buy_frac"` is the question asked; `on="buy_frac"` sorts on the CURRENT window
-    instead, which is the naive comparison -- it needs the same t+1 holdings the target does,
-    so it is not tradeable, only a reference.
+    `on="pred_buy_frac"` is the question asked.
+    `on="buy_frac"` sorts on the REALISED buying, which under this target convention is the
+    target itself -- a perfect-foresight sort. Not a strategy (it is I_{q+1}-measurable), but
+    the ceiling: if even knowing the answer exactly earns nothing at `tradeable` timing, then
+    no forecast of buying pressure can, and the sign on the predicted sort is coming from
+    somewhere other than buying pressure.
     """
     timing = timing or cfg.eval_timing
-    col = _TIMING[timing]
+    col = _ret_col(timing)
     d = P.dropna(subset=[on, col]).copy()
     if d.empty:
         return pd.DataFrame([{"quintile": "n/a", "mean_ret_pct_per_quarter": np.nan, "t": np.nan}])
