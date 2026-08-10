@@ -112,6 +112,22 @@ class Config:
     #           training window taught. If hgb barely beats it, the relationship is linear and
     #           the trees are adding nothing.
     model: str = "hgb"
+
+    # ---- what the model is trained to fit ------------------------------------------------
+    # Squared-error loss is dominated by extreme returns: a +300% name contributes (3.0)^2 = 9
+    # against (0.15)^2 = 0.02 for a typical quarter -- 400x the weight, so a few dozen names
+    # decide the fit. Transforming the TRAINING target fixes that. Evaluation always uses the
+    # raw target, so nothing here flatters the reported numbers.
+    #   "none"    fit the target as it is
+    #   "winsor"  clip the target inside each TRAINING quarter's cross-section
+    #   "rank"    fit the cross-sectional percentile rank instead of the level. The most
+    #             robust option, and it matches how the result is graded -- rank-IC and a
+    #             quintile sort both use ordering only, so nothing of value is discarded.
+    # The transform is computed on the training rows ALONE, so no test-period information
+    # reaches it.
+    train_target_transform: str = "none"
+    train_winsor: float = 0.01
+
     max_iter: int = 300
     learning_rate: float = 0.06
     max_depth: int = 4         # shallow: five features do not need more
@@ -280,6 +296,30 @@ def target_list(cfg: Config) -> List[str]:
 
 
 # ------------------------------------------------------------------ model
+def _train_y(tr: pd.DataFrame, target: str, cfg: Config) -> np.ndarray:
+    """The training label, optionally made robust to extreme values.
+
+    Everything is computed WITHIN each training quarter and from the training rows only, so
+    no test-period value influences the transform. Both options preserve the ordering inside
+    a quarter, which is all that rank-IC and a quintile sort ever look at -- the fit stops
+    chasing a handful of huge returns without giving up the cross-sectional signal.
+    """
+    how = str(getattr(cfg, "train_target_transform", "none")).lower()
+    y = tr[target]
+    if how in ("none", "", "raw"):
+        pass
+    elif how == "rank":
+        y = tr.groupby("qi")[target].rank(pct=True)
+    elif how == "winsor":
+        p = cfg.train_winsor
+        lo = tr.groupby("qi")[target].transform(lambda s: s.quantile(p))
+        hi = tr.groupby("qi")[target].transform(lambda s: s.quantile(1 - p))
+        y = y.clip(lo, hi)
+    else:
+        raise ValueError(f"train_target_transform must be none|winsor|rank, got {how!r}")
+    return y.to_numpy("float32")
+
+
 def _make_estimator(cfg: Config):
     """`cfg.model` picks the learner; everything else about the run is unchanged, so the two
     are directly comparable on the same folds and the same evaluation sample.
@@ -337,7 +377,7 @@ def _rolling_predict(panel: pd.DataFrame, feats: List[str], target: str,
         if len(tr) < 500 or len(te) == 0:
             continue
         m = _make_estimator(cfg)
-        m.fit(tr[feats].to_numpy("float32"), tr[target].to_numpy("float32"))
+        m.fit(tr[feats].to_numpy("float32"), _train_y(tr, target, cfg))
         # dict.fromkeys de-duplicates while keeping order: when target IS "ret_next" a plain
         # list would carry it twice and every later `d[target]` would be a 2-column frame
         keep = list(dict.fromkeys(["security", "qi", target, "ret_next"]))
@@ -467,6 +507,7 @@ def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd
                          **_score(base, f, target, cfg)})
     out = pd.DataFrame(rows)
     out.insert(1, "learner", cfg.model)
+    out.insert(2, "train_y", cfg.train_target_transform)
 
     # ---- ALIGNMENT AUDIT -----------------------------------------------------------------
     # Not a formality. `_qcut` returns NaN for a quarter with fewer distinct values than
@@ -494,10 +535,11 @@ def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd
 
     if verbose:
         for target in targets:
-            sub = out[out.target == target].drop(columns=["target", "learner"])
+            sub = out[out.target == target].drop(columns=["target", "learner", "train_y"])
             h = RETURN_TARGETS.get(target, 1)
             grade = target if target in RETURN_TARGETS else "ret_next"
             print(f"\n{'='*100}\nTARGET = {target}   learner = {cfg.model}   "
+                  f"train_y = {cfg.train_target_transform}   "
                   f"(spread graded on {grade}, {h} quarter{'s' if h > 1 else ''})\n{'='*100}")
             print(sub.to_string(index=False, float_format=lambda v: f"{v:8.4f}"))
         print("\n  rank_IC      against that row's target. For a RETURN target, >0.03 is")
