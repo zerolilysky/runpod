@@ -1,21 +1,24 @@
-"""turnover_study.py -- five security characteristics, two questions, six models.
+"""turnover_study.py -- six security characteristics, two questions, seven models.
 
-Deliberately small and independent of the rest of the pipeline. No funds, no holdings, no
-Barra: one row is one (security, quarter), and every number comes from price/volume/size.
+Small and independent of the rest of the pipeline. One row is one (security, quarter); every
+number comes from price, volume and size, apart from one optional fund-derived feature.
 
     features (all known at the close of q)
-        turnover     volume / shares outstanding, over quarter q
-        log_mktcap   log market cap at q
-        ret_q        the security's return DURING q
-        vol_ret      dispersion of its last `vol_window` quarterly returns, q included
-        log_price    log close at q
+        turnover         volume / shares outstanding, over quarter q
+        log_mktcap       log market cap at q
+        ret_q            the security's return DURING q
+        vol_ret          dispersion of its last `vol_window` quarterly returns, q included
+        log_price        log close at q
+        weight_chg_lag1  mean change in portfolio weight across holders, over q-1 -> q.
+                         The only feature that needs the fund dimension; dropped
+                         automatically when the file carries no `fund`/`weight`.
 
     targets (both strictly after every feature)
         turnover_next  turnover over q+1
         ret_next       the return over q -> q+1
 
     models
-        five univariate GBMs, one per feature, plus one on all five together
+        one univariate GBM per feature, plus one on all of them together
 
 TIMING. Write I_t for what is knowable once quarter t has closed. Every feature is
 I_q-measurable: turnover, mktcap, price and ret_q are all realised within q, and vol_ret uses
@@ -41,7 +44,11 @@ from typing import List
 
 __version__ = "2026.08.07.1"
 
-FEATURES = ["turnover", "log_mktcap", "ret_q", "vol_ret", "log_price"]
+# `weight_chg_lag1` is the only feature that needs the fund dimension: it is the mean change
+# in portfolio weight across the holders of a security over q-1 -> q. That window closes at
+# q, so it is I_q-measurable and legal here -- the CONTEMPORANEOUS weight change would not be.
+# It is dropped automatically if the file has no `fund`/`weight` columns.
+FEATURES = ["turnover", "log_mktcap", "ret_q", "vol_ret", "log_price", "weight_chg_lag1"]
 TARGETS = ["turnover_next", "ret_next"]          # the default pair
 
 # Longer return horizons, compounded from the forward-return columns already in the file:
@@ -61,6 +68,8 @@ class Config:
         "market_cap": "market_cap", "quarterly_ret": "quarterly_ret",
         "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
         "future_3q_ret": "future_3q_ret", "InvTypeCode": "inv_type", "isUs": "isUs",
+        # only needed for weight_chg_lag1; absent is fine
+        "fund": "fund", "weight": "weight",
     })
     # NOTE the annotation. A dataclass only turns ANNOTATED class attributes into fields, so
     # `inv_type_codes = (401,)` would be a plain class attribute and Config(inv_type_codes=...)
@@ -171,7 +180,8 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     cfg = cfg or Config()
     inv = {v: k for k, v in cfg.col_map.items()}
     want = ["security", "date", "close", "volume", "market_cap", "quarterly_ret",
-            "future_1q_ret", "future_2q_ret", "future_3q_ret", "inv_type", "isUs"]
+            "future_1q_ret", "future_2q_ret", "future_3q_ret", "inv_type", "isUs",
+            "fund", "weight"]
     raw = [inv[c] for c in want if c in inv]
     try:
         import pyarrow.parquet as pq
@@ -200,14 +210,38 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
 
+    # ---- the one fund-level quantity: mean change in portfolio weight across the holders.
+    # dw on the (fund, security) row dated q covers q -> q+1, so it is I_{q+1}-measurable and
+    # may only be used LAGGED. The exact-quarter guard stops a gap pulling a value from two
+    # quarters on. Raw dw, note, drifts with price: a stock that rallies gains weight with no
+    # decision behind it. `ret_q` is already a feature, so the tree can net that out, but if
+    # you want the drift removed at source use the active-weight construction in
+    # buy_pressure.py instead.
+    have_w = {"fund", "weight"} <= set(df.columns) and df["weight"].notna().any()
+    if have_w:
+        w = pd.to_numeric(df["weight"], errors="coerce")
+        wmed = float(w[w.abs() > 1e-12].abs().median())
+        if np.isfinite(wmed) and wmed > 0.02:
+            w = w / 100.0
+            print(f"[hold] weight looks like percent (median |w| = {wmed:.3f}) -> /100")
+        df = df.assign(_w=w).sort_values(["fund", "security", "yq"])
+        gfs = df.groupby(["fund", "security"], observed=True)
+        w_next = gfs["_w"].shift(-1).where(gfs["yq"].shift(-1) == df["yq"] + 1)
+        df["_dw"] = w_next - df["_w"]
+
     # the file is a fund-security-quarter panel; these are all security-level, so one row per
     # (security, quarter) is all that is needed
+    if have_w:
+        wagg = df.groupby(["security", "yq"], observed=True).agg(
+            weight_chg=("_dw", "mean"), n_holders=("fund", "size")).reset_index()
     sq = df.groupby(["security", "yq"], observed=True).agg(
         close=("close", "first"), volume=("volume", "first"),
         mktcap=("market_cap", "first"), ret_q=("quarterly_ret", "first"),
         ret_next=("future_1q_ret", "first"), _f2=("future_2q_ret", "first"),
         _f3=("future_3q_ret", "first"), n_rows=("security", "size"),
     ).reset_index()
+    if have_w:
+        sq = sq.merge(wagg, on=["security", "yq"], how="left")
     print(f"[panel] {len(sq):,} security-quarters | {sq.security.nunique():,} securities | "
           f"{sq.yq.nunique()} quarters")
 
@@ -247,6 +281,15 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     sq["vol_ret"] = sq[["ret_q"] + lag_cols].std(axis=1, ddof=1)
     sq = sq.drop(columns=lag_cols)
 
+    # weight_chg(q-1) closes at q -> I_q-measurable. The contemporaneous one is not, and is
+    # never put on the frame under a feature name.
+    if have_w:
+        v, qq = g["weight_chg"].shift(1), g["qi"].shift(1)
+        sq["weight_chg_lag1"] = v.where(qq == qi - 1)
+        sq = sq.drop(columns=["weight_chg"])
+    else:
+        print("[panel] no fund/weight columns -> weight_chg_lag1 unavailable, dropped")
+
     # target 1: next quarter's turnover, exact quarter only.
     # NOTE `g` was built before `sq = sq.drop(columns=lag_cols)` above, and .drop() returns a
     # NEW frame, so `g` still refers to the pre-drop object. That is harmless here only
@@ -262,7 +305,8 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     sq["ret_next_3q"] = (1 + sq["ret_next"]) * (1 + sq["_f2"]) * (1 + sq["_f3"]) - 1
     sq = sq.drop(columns=["_f2", "_f3"])
 
-    sq = _winsor_by_q(sq, FEATURES + ["turnover_next"], cfg.winsorize)
+    _feats = [f for f in FEATURES if f in sq.columns]
+    sq = _winsor_by_q(sq, _feats + ["turnover_next"], cfg.winsorize)
 
     # History filter. cumcount() counts OBSERVED rows for the security in (security, qi)
     # order, so gaps are simply skipped -- it is "the n-th quarter we have seen", not "n
@@ -279,14 +323,21 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
           f"(min_quarters={cfg.min_quarters}, "
           f"{'consecutive' if cfg.require_consecutive else 'observed, gaps allowed'})")
 
-    for c in FEATURES + ["turnover_next"] + list(RETURN_TARGETS):
+    for c in _feats + ["turnover_next"] + list(RETURN_TARGETS):
         sq[c] = sq[c].astype("float32")
     print(f"[panel] {len(sq):,} rows after history filter")
     print("[panel] target coverage:  " + "  ".join(
         f"{c} {sq[c].notna().mean():.0%}" for c in ["turnover_next"] + list(RETURN_TARGETS)))
     print("[panel] feature coverage: " + "  ".join(
-        f"{c} {sq[c].notna().mean():.0%}" for c in FEATURES))
+        f"{c} {sq[c].notna().mean():.0%}" for c in _feats))
     return sq
+
+
+def feature_list(panel: pd.DataFrame) -> List[str]:
+    """The features this panel can actually supply. weight_chg_lag1 is absent when the file
+    carries no fund-level weights, and a feature that is entirely NaN would otherwise empty
+    the common evaluation sample."""
+    return [f for f in FEATURES if f in panel.columns and panel[f].notna().any()]
 
 
 def target_list(cfg: Config) -> List[str]:
@@ -448,7 +499,8 @@ def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd
     Targets are turnover plus every return horizon in `cfg.return_horizons`.
     """
     cfg = cfg or Config()
-    specs = [(f"model:{f}", [f]) for f in FEATURES] + [("model:ALL", FEATURES)]
+    feats_all = feature_list(panel)
+    specs = [(f"model:{f}", [f]) for f in feats_all] + [("model:ALL", feats_all)]
     targets = [t for t in target_list(cfg)
                if t in panel.columns and panel[t].notna().sum() > 500]
 
@@ -463,7 +515,7 @@ def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd
     # restricted -- each model still fits on all the data its own target allows.
     if cfg.align_eval_sample:
         ok = np.ones(len(panel), bool)
-        for c in targets + FEATURES:
+        for c in targets + feats_all:
             ok &= panel[c].notna().to_numpy()
         eval_keys = panel.loc[ok, ["security", "qi"]]
         print(f"[eval] common sample: {int(ok.sum()):,} of {len(panel):,} rows carry every "
@@ -502,7 +554,7 @@ def run_all(panel: pd.DataFrame, cfg: Config = None, verbose: bool = True) -> pd
         # scored on THE SAME test quarters, otherwise the comparison mixes a model difference
         # with a sample difference (the models cannot score the first `window_q` quarters).
         base = _restrict(panel[panel.qi.isin(test_qi)]).dropna(subset=[target])
-        for f in FEATURES:
+        for f in feats_all:
             rows.append({"target": target, "model": f"raw:{f}", "dir_vs_x": 1.0,
                          **_score(base, f, target, cfg)})
     out = pd.DataFrame(rows)
