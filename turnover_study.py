@@ -9,9 +9,12 @@ number comes from price, volume and size, apart from one optional fund-derived f
         ret_q            the security's return DURING q
         vol_ret          dispersion of its last `vol_window` quarterly returns, q included
         log_price        log close at q
-        weight_chg_lag1  mean change in portfolio weight across holders, over q-1 -> q.
-                         The only feature that needs the fund dimension; dropped
-                         automatically when the file carries no `fund`/`weight`.
+        weight_chg_lag1  mean change in portfolio weight across holders, over q-1 -> q
+        buy_frac_lag1    share of holders that RAISED their share count, over q-1 -> q
+
+    The last two need the fund dimension and are dropped automatically when the file carries
+    no `fund`/`weight` / `chg_pct`. Both describe the window q-1 -> q, which closes at q, so
+    they are I_q-measurable. Their CONTEMPORANEOUS versions are not and never appear here.
 
     targets (both strictly after every feature)
         turnover_next  turnover over q+1
@@ -48,7 +51,8 @@ __version__ = "2026.08.07.1"
 # in portfolio weight across the holders of a security over q-1 -> q. That window closes at
 # q, so it is I_q-measurable and legal here -- the CONTEMPORANEOUS weight change would not be.
 # It is dropped automatically if the file has no `fund`/`weight` columns.
-FEATURES = ["turnover", "log_mktcap", "ret_q", "vol_ret", "log_price", "weight_chg_lag1"]
+FEATURES = ["turnover", "log_mktcap", "ret_q", "vol_ret", "log_price",
+            "weight_chg_lag1", "buy_frac_lag1"]
 TARGETS = ["turnover_next", "ret_next"]          # the default pair
 
 # Longer return horizons, compounded from the forward-return columns already in the file:
@@ -68,9 +72,16 @@ class Config:
         "market_cap": "market_cap", "quarterly_ret": "quarterly_ret",
         "future_1q_ret": "future_1q_ret", "future_2q_ret": "future_2q_ret",
         "future_3q_ret": "future_3q_ret", "InvTypeCode": "inv_type", "isUs": "isUs",
-        # only needed for weight_chg_lag1; absent is fine
+        # only needed for weight_chg_lag1 / buy_frac_lag1; absent is fine
         "fund": "fund", "weight": "weight",
+        "future_1q_shares_change_pct": "chg_pct",
     })
+    # A share change of +-`change_band` or less counts as no trade, so a 0.3% rounding
+    # difference is not recorded as a purchase.
+    change_band: float = 0.01
+    # chg_pct == -100% is a sentinel for "no position information next quarter", not a real
+    # exit. Left in, it would manufacture a sale and inflate the denominator's churn.
+    drop_missing_position: bool = True
     # NOTE the annotation. A dataclass only turns ANNOTATED class attributes into fields, so
     # `inv_type_codes = (401,)` would be a plain class attribute and Config(inv_type_codes=...)
     # would raise TypeError: unexpected keyword argument.
@@ -181,7 +192,7 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     inv = {v: k for k, v in cfg.col_map.items()}
     want = ["security", "date", "close", "volume", "market_cap", "quarterly_ret",
             "future_1q_ret", "future_2q_ret", "future_3q_ret", "inv_type", "isUs",
-            "fund", "weight"]
+            "fund", "weight", "chg_pct"]
     raw = [inv[c] for c in want if c in inv]
     try:
         import pyarrow.parquet as pq
@@ -229,6 +240,30 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
         w_next = gfs["_w"].shift(-1).where(gfs["yq"].shift(-1) == df["yq"] + 1)
         df["_dw"] = w_next - df["_w"]
 
+    # ---- buying breadth: share of holders that RAISED their share count over q -> q+1.
+    # I_{q+1}-measurable, so like weight_chg it may only enter lagged. Computed on a filtered
+    # COPY: dropping the sentinel rows from `df` itself would change n_holders and, if a
+    # security-quarter lost every row, delete it from the panel entirely.
+    have_b = "chg_pct" in df.columns and df["chg_pct"].notna().any()
+    if have_b:
+        chg = pd.to_numeric(df["chg_pct"], errors="coerce").astype("float64")
+        nz = chg[chg.abs() > 1e-9].abs()
+        med = float(nz.median()) if len(nz) else np.nan
+        dsh = chg / 100.0 if (np.isfinite(med) and med > 1.5) else chg
+        if np.isfinite(med):
+            print(f"[hold] chg_pct median |x| = {med:.4f} -> treated as "
+                  f"{'percent' if med > 1.5 else 'fraction'}")
+        keep = dsh.notna()
+        if cfg.drop_missing_position:
+            sentinel = (dsh + 1.0).abs() < 1e-6      # -100% = missing, not a sale
+            print(f"[hold] dropping {int(sentinel.sum()):,} rows ({sentinel.mean():.1%}) with "
+                  "chg_pct = -100% from the buy_frac denominator only")
+            keep &= ~sentinel
+        lab = df.loc[keep, ["security", "yq"]].assign(
+            _buy=(dsh[keep] >= cfg.change_band).astype("float32"))
+        bagg = lab.groupby(["security", "yq"], observed=True).agg(
+            buy_frac=("_buy", "mean"), n_labelled=("_buy", "size")).reset_index()
+
     # the file is a fund-security-quarter panel; these are all security-level, so one row per
     # (security, quarter) is all that is needed
     if have_w:
@@ -242,6 +277,8 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
     ).reset_index()
     if have_w:
         sq = sq.merge(wagg, on=["security", "yq"], how="left")
+    if have_b:
+        sq = sq.merge(bagg, on=["security", "yq"], how="left")
     print(f"[panel] {len(sq):,} security-quarters | {sq.security.nunique():,} securities | "
           f"{sq.yq.nunique()} quarters")
 
@@ -289,6 +326,12 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
         sq = sq.drop(columns=["weight_chg"])
     else:
         print("[panel] no fund/weight columns -> weight_chg_lag1 unavailable, dropped")
+    if have_b:
+        v, qq = g["buy_frac"].shift(1), g["qi"].shift(1)
+        sq["buy_frac_lag1"] = v.where(qq == qi - 1)
+        sq = sq.drop(columns=["buy_frac"])
+    else:
+        print("[panel] no chg_pct column -> buy_frac_lag1 unavailable, dropped")
 
     # target 1: next quarter's turnover, exact quarter only.
     # NOTE `g` was built before `sq = sq.drop(columns=lag_cols)` above, and .drop() returns a
