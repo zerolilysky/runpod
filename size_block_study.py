@@ -10,11 +10,8 @@ quarter; holder-derived variables are recomputed using only funds in that row's 
 bucket.  Every model, training-target rank, prediction sort, and score is then computed
 separately inside one security-size x fund-size block.
 
-The matching fund-turnover feature is used in each block:
-
-    small-fund block -> security_small_fund_turnover
-    mid-fund block   -> security_mid_fund_turnover
-    large-fund block -> security_large_fund_turnover
+The feature set is exactly the same 14-characteristic set as ``stratified_study.py``.
+Only the panel grouping changes from security size alone to security size x fund size.
 
 This file owns the different panel construction.  It deliberately reuses the estimator,
 rolling split, and scoring functions from ``stratified_study.py`` so the old three-bucket
@@ -35,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -44,13 +42,12 @@ import stratified_study as base
 __version__ = "2026.08.17.1"
 
 SIZE_LABEL = {0: "small", 1: "mid", 2: "large"}
-FUND_TURNOVER = {0: "turn_small", 1: "turn_mid", 2: "turn_large"}
 
-# ``fund_turnover`` is the matching security_*_fund_turnover column for this fund-size block.
-# Forward holder decisions enter only through their exact one-quarter lags.
+# Identical to stratified_study.FEATURES.  The nine-block study changes grouping, not features.
 FEATURES = [
     "turnover", "log_mktcap", "ret_q", "vol_ret", "log_price",
-    "active_weight_mean", "active_weight_absmean", "fund_turnover",
+    "active_weight_mean", "active_weight_absmean",
+    "turn_small", "turn_mid", "turn_large", "turn_large_share",
     "weight_chg_lag1", "buy_frac_lag1", "buy_weight_ratio_lag1",
 ]
 
@@ -263,6 +260,11 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
 
     market["log_mktcap"] = np.log(market["mktcap"].abs() + 1.0)
     market["log_price"] = np.log(market["close"].abs() + 1e-6)
+    turnover_features = [c for c in ("turn_small", "turn_mid", "turn_large")
+                         if c in market.columns]
+    if len(turnover_features) == 3:
+        total = market[turnover_features].sum(axis=1)
+        market["turn_large_share"] = market["turn_large"] / total.where(total > 0)
     quarters = pd.PeriodIndex(sorted(market["yq"].unique()), freq="Q")
     market["qi"] = market["yq"].map({q: i for i, q in enumerate(quarters)}).astype("int32")
     market = market.sort_values(["security", "qi"]).reset_index(drop=True)
@@ -337,13 +339,6 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
         panel["buy_weight_ratio"] = panel["buy_dw"] / panel["gross_dw"].where(
             panel["gross_dw"] > 0)
 
-    # Select only the fund-turnover feature belonging to this block's fund-size bucket.
-    panel["fund_turnover"] = np.nan
-    for size, source in FUND_TURNOVER.items():
-        if source in panel.columns:
-            panel.loc[panel["fund_size"] == size, "fund_turnover"] = panel.loc[
-                panel["fund_size"] == size, source]
-
     panel = panel.sort_values(["security", "fund_size", "qi"]).reset_index(drop=True)
     gb = panel.groupby(["security", "fund_size"], observed=True)
     qi = panel["qi"]
@@ -354,10 +349,12 @@ def build_panel(cfg: Config = None) -> pd.DataFrame:
             value, q_lag = gb[source].shift(1), gb["qi"].shift(1)
             panel[lagged] = value.where(q_lag == qi - 1)
 
-    if not cfg.assume_fund_turnover_backward and "fund_turnover" in panel.columns:
-        value, q_lag = gb["fund_turnover"].shift(1), gb["qi"].shift(1)
-        panel["fund_turnover"] = value.where(q_lag == qi - 1)
-        print("[panel] fund_turnover lagged one quarter "
+    if not cfg.assume_fund_turnover_backward:
+        for source in turnover_features + (["turn_large_share"]
+                                           if "turn_large_share" in panel.columns else []):
+            value, q_lag = gb[source].shift(1), gb["qi"].shift(1)
+            panel[source] = value.where(q_lag == qi - 1)
+        print("[panel] *_fund_turnover lagged one quarter "
               "(assume_fund_turnover_backward=False)")
 
     present_features = [f for f in FEATURES if f in panel.columns]
@@ -405,6 +402,13 @@ def block_counts(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ models and scores
+def _score(values: pd.DataFrame, pred_col: str, target: str, cfg: Config) -> dict:
+    """Score as in the source study; a constant cross-section has undefined IC, recorded NaN."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="An input array is constant;.*")
+        return base._score(values, pred_col, target, cfg)
+
+
 def _run_block(panel: pd.DataFrame, cfg: Config, targets: List[str], security_size,
                fund_size, folds=None, verbose: bool = True) -> pd.DataFrame:
     """Run all-feature, one-feature, and raw-feature specifications in one block."""
@@ -442,7 +446,7 @@ def _run_block(panel: pd.DataFrame, cfg: Config, targets: List[str], security_si
                          "fund_label": _size_name(fund_size),
                          "block": _block_name(security_size, fund_size),
                          "target": target, "model": model_name,
-                         **base._score(pred, "pred", target, cfg)})
+                         **_score(pred, "pred", target, cfg)})
         if test_qi:
             raw = _restrict(panel[panel["qi"].isin(test_qi)]).dropna(subset=[target])
             for feature in features:
@@ -451,7 +455,7 @@ def _run_block(panel: pd.DataFrame, cfg: Config, targets: List[str], security_si
                              "fund_label": _size_name(fund_size),
                              "block": _block_name(security_size, fund_size),
                              "target": target, "model": f"raw:{feature}",
-                             **base._score(raw, feature, target, cfg)})
+                             **_score(raw, feature, target, cfg)})
 
     out = pd.DataFrame(rows)
     if verbose and not out.empty:
