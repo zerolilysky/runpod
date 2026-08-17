@@ -32,7 +32,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -402,11 +401,19 @@ def block_counts(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ models and scores
-def _score(values: pd.DataFrame, pred_col: str, target: str, cfg: Config) -> dict:
-    """Score as in the source study; a constant cross-section has undefined IC, recorded NaN."""
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="An input array is constant;.*")
-        return base._score(values, pred_col, target, cfg)
+def _score_checked(values: pd.DataFrame, pred_col: str, target: str, cfg: Config,
+                   context: str) -> dict:
+    """Reject an undefined rank-IC with its exact block, specification, and quarter."""
+    scored = values.dropna(subset=[pred_col, target])
+    problems = []
+    for column, role in ((pred_col, "prediction/input"), (target, "target")):
+        variation = scored.groupby("qi", observed=True)[column].agg(["count", "nunique"])
+        bad = variation.index[(variation["count"] < 2) | (variation["nunique"] < 2)].tolist()
+        if bad:
+            problems.append(f"{role} {column!r} is constant or has <2 rows in qi={bad}")
+    if problems:
+        raise ValueError(f"constant rank-IC input | {context} | " + " | ".join(problems))
+    return base._score(values, pred_col, target, cfg)
 
 
 def _run_block(panel: pd.DataFrame, cfg: Config, targets: List[str], security_size,
@@ -441,21 +448,27 @@ def _run_block(panel: pd.DataFrame, cfg: Config, targets: List[str], security_si
             pred = _restrict(base._rolling_predict(panel, model_features, target, cfg, folds))
             if test_qi is None and not pred.empty:
                 test_qi = set(pred["qi"].unique())
+            context = (f"security_size={_size_name(security_size)}, "
+                       f"fund_size={_size_name(fund_size)}, target={target}, "
+                       f"model={model_name}")
             rows.append({"security_size": security_size, "fund_size": fund_size,
                          "security_label": _size_name(security_size),
                          "fund_label": _size_name(fund_size),
                          "block": _block_name(security_size, fund_size),
                          "target": target, "model": model_name,
-                         **_score(pred, "pred", target, cfg)})
+                         **_score_checked(pred, "pred", target, cfg, context)})
         if test_qi:
             raw = _restrict(panel[panel["qi"].isin(test_qi)]).dropna(subset=[target])
             for feature in features:
+                context = (f"security_size={_size_name(security_size)}, "
+                           f"fund_size={_size_name(fund_size)}, target={target}, "
+                           f"model=raw:{feature}")
                 rows.append({"security_size": security_size, "fund_size": fund_size,
                              "security_label": _size_name(security_size),
                              "fund_label": _size_name(fund_size),
                              "block": _block_name(security_size, fund_size),
                              "target": target, "model": f"raw:{feature}",
-                             **_score(raw, feature, target, cfg)})
+                             **_score_checked(raw, feature, target, cfg, context)})
 
     out = pd.DataFrame(rows)
     if verbose and not out.empty:
