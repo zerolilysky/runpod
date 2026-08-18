@@ -30,6 +30,7 @@ Usage
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -38,7 +39,7 @@ import pandas as pd
 
 import stratified_study as base
 
-__version__ = "2026.08.17.1"
+__version__ = "2026.08.17.2"
 
 SIZE_LABEL = {0: "small", 1: "mid", 2: "large"}
 
@@ -398,12 +399,12 @@ def block_counts(panel: pd.DataFrame) -> pd.DataFrame:
     return (panel.groupby(["security_label", "fund_label"], observed=True).size()
             .unstack(fill_value=0).reindex(index=list(SIZE_LABEL.values()),
                                           columns=list(SIZE_LABEL.values()), fill_value=0))
-
+ 
 
 # ------------------------------------------------------------------ models and scores
 def _score_checked(values: pd.DataFrame, pred_col: str, target: str, cfg: Config,
                    context: str) -> dict:
-    """Reject an undefined rank-IC with its exact block, specification, and quarter."""
+    """Warn about undefined quarter-level rank-ICs, then score all usable quarters."""
     scored = values.dropna(subset=[pred_col, target])
     problems = []
     for column, role in ((pred_col, "prediction/input"), (target, "target")):
@@ -412,8 +413,18 @@ def _score_checked(values: pd.DataFrame, pred_col: str, target: str, cfg: Config
         if bad:
             problems.append(f"{role} {column!r} is constant or has <2 rows in qi={bad}")
     if problems:
-        raise ValueError(f"constant rank-IC input | {context} | " + " | ".join(problems))
-    return base._score(values, pred_col, target, cfg)
+        warnings.warn(
+            f"constant rank-IC input | {context} | " + " | ".join(problems)
+            + " | affected quarter IC is NaN; remaining quarters continue",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # pandas/scipy otherwise emits a second, context-free ConstantInputWarning.
+    # The warning above identifies the exact block, model, target, and quarter.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="An input array is constant;.*")
+        return base._score(values, pred_col, target, cfg)
 
 
 def _run_block(panel: pd.DataFrame, cfg: Config, targets: List[str], security_size,
